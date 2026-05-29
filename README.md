@@ -164,8 +164,6 @@ On Windows:
 copy elite_daynight.db elite_daynight_BACKUP.db
 ```
 
-The current stack is designed for small-to-medium community use. SQLite should be fine for the expected traffic, but the project should move to PostgreSQL if write volume grows significantly.
-
 ---
 
 ## How observations work
@@ -244,8 +242,6 @@ For each imported body, the database stores compact model-relevant fields such a
 - axial tilt when available
 - landable / tidally locked flags
 
-The full raw JSON is intentionally not stored in the compact database.
-
 ### 2. Surface observation conversion
 
 Each observation gives the model:
@@ -322,43 +318,6 @@ Reviewers can:
 - refit reviewed or provisional models
 
 The audit log records important reviewer/admin actions.
-
----
-
-## Suggested GitHub repository structure
-
-```text
-.
-├── elite_daynight_api.py
-├── elite_daynight_website.py
-├── elite_daynight_model_v15.py
-├── elite_daynight_db.py
-├── elite_daynight_template.db
-├── schema.sql
-├── requirements.txt
-├── run_private_api.sh
-├── run_website.sh
-├── README.md
-├── CHANGELOG.md
-├── templates/
-├── static/
-└── deploy/
-```
-
-Do **not** commit your live production database if it contains real submissions, reviewer data, or password hashes. The repository should include `elite_daynight_template.db`; users copy it to `elite_daynight.db` for local use.
-
-Recommended `.gitignore` entries:
-
-```gitignore
-*.db
-*.db-wal
-*.db-shm
-.env
-__pycache__/
-venv/
-*.log
-!elite_daynight_template.db
-```
 
 ---
 
