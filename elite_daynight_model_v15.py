@@ -1,0 +1,1402 @@
+#!/usr/bin/env python3
+"""
+Elite Dangerous day/night calculation core - v15 separated model module.
+
+This file intentionally contains no tkinter GUI code. It can be imported by:
+  * the desktop GUI wrapper
+  * a CLI wrapper
+  * a future website/backend API
+
+The model is based on v15 compact output: moon-safe distant-star handling for
+non-star parents, direct orbital vectors for direct star-orbiting planets,
+and compact sunrise/sunset/day-period prediction helpers.
+"""
+
+from __future__ import annotations
+
+import csv
+import json
+import math
+import os
+import random
+from dataclasses import dataclass
+from datetime import datetime, timezone, timedelta
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+try:
+    import numpy as np
+except Exception as exc:
+    raise SystemExit("This module needs numpy. Install with: pip install numpy") from exc
+
+try:
+    from scipy.optimize import differential_evolution, minimize
+except Exception:
+    differential_evolution = None
+    minimize = None
+
+# ------------------------------ basic helpers ------------------------------
+
+
+def parse_utc(value: str) -> datetime:
+    s = str(value).strip()
+    if not s:
+        raise ValueError("empty UTC timestamp")
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    if "T" not in s and " " in s:
+        s = s.replace(" ", "T", 1)
+    dt = datetime.fromisoformat(s)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def format_utc(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def fmt_dur(seconds: float) -> str:
+    sign = "-" if seconds < 0 else ""
+    seconds = abs(int(round(seconds)))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{sign}{h:02d}:{m:02d}:{s:02d}"
+
+
+def wrap180(x: float) -> float:
+    return (x + 180.0) % 360.0 - 180.0
+
+
+def norm(v: np.ndarray) -> np.ndarray:
+    n = float(np.linalg.norm(v))
+    if n == 0:
+        return v
+    return v / n
+
+
+def deg(x: float) -> float:
+    return math.degrees(x)
+
+
+def rad(x: float) -> float:
+    return math.radians(x)
+
+
+def safe_asin(x: float) -> float:
+    return math.asin(max(-1.0, min(1.0, x)))
+
+
+LIGHT_SECOND_METRES = 299_792_458.0
+SOLAR_RADIUS_METRES = 695_700_000.0
+# Below this apparent radius, the visual disc edge crossing is practically
+# indistinguishable from the centre-horizon crossing, so keep the report clean.
+VISUAL_DISC_MIN_RADIUS_DEG = 1.0
+
+
+def rotz(a: float) -> np.ndarray:
+    c, s = math.cos(a), math.sin(a)
+    return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+
+
+def rotx(a: float) -> np.ndarray:
+    c, s = math.cos(a), math.sin(a)
+    return np.array([[1.0, 0.0, 0.0], [0.0, c, -s], [0.0, s, c]])
+
+
+def quality_weight(q: str) -> float:
+    q = (q or "").strip().lower()
+    if q in ("high", "h", "good", "1"):
+        return 1.0
+    if q in ("medium", "med", "m", "2"):
+        return 0.55
+    if q in ("low", "l", "rough", "3"):
+        return 0.25
+    return 0.7
+
+
+def observation_time_reference(observations: List["Observation"], explicit_ref: Optional[datetime] = None) -> Optional[datetime]:
+    """Return the time used as the center of time weighting.
+
+    If the user supplies an explicit reference, use it. Otherwise use the newest
+    calibration observation. This makes the latest observation most influential,
+    which is useful when the model has small unmodelled drift over days.
+    """
+    if explicit_ref is not None:
+        return explicit_ref
+    if not observations:
+        return None
+    return max(o.timestamp_utc for o in observations)
+
+
+def recency_time_weight(
+    obs_time: datetime,
+    ref_time: Optional[datetime],
+    half_life_hours: float = 24.0,
+    minimum: float = 0.05,
+) -> float:
+    """Exponential time weight around ref_time.
+
+    A half-life of 24 h means an observation 24 h away from the reference counts
+    50% as much, 48 h away counts 25% as much, etc., before the minimum floor.
+    """
+    if ref_time is None or half_life_hours <= 0:
+        return 1.0
+    age_hours = abs((ref_time - obs_time).total_seconds()) / 3600.0
+    w = math.exp(-math.log(2.0) * age_hours / half_life_hours)
+    return max(float(minimum), float(w))
+
+
+def combined_observation_weight(
+    obs: "Observation",
+    time_weighting: bool = False,
+    time_ref: Optional[datetime] = None,
+    time_half_life_hours: float = 24.0,
+    time_min_weight: float = 0.05,
+) -> float:
+    w = quality_weight(obs.quality)
+    if time_weighting:
+        w *= recency_time_weight(obs.timestamp_utc, time_ref, time_half_life_hours, time_min_weight)
+    return w
+
+
+# ------------------------------ data loading ------------------------------
+
+
+@dataclass
+class Observation:
+    timestamp_utc: datetime
+    lat: float
+    lon: float
+    observation: str
+    elevation: Optional[float]
+    heading: Optional[float]
+    quality: str = "medium"
+    note: str = ""
+
+    @property
+    def target_altitude(self) -> Optional[float]:
+        o = self.observation.lower().strip()
+        if o in {"sunrise", "sunset", "horizon", "rise", "set"}:
+            return 0.0
+        if o in {"elevation", "altitude", "sun_altitude", "alt"}:
+            return float(self.elevation if self.elevation is not None else 0.0)
+        return None
+
+
+def load_system_json(path: str) -> Dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def bodies(system: Dict[str, Any]) -> List[Dict[str, Any]]:
+    if isinstance(system.get("bodies"), list):
+        return system["bodies"]
+    if isinstance(system.get("Bodies"), list):
+        return system["Bodies"]
+    return []
+
+
+def body_name(body: Dict[str, Any]) -> str:
+    return str(body.get("BodyName") or body.get("bodyName") or body.get("Name") or body.get("name") or "")
+
+
+def body_id(body: Dict[str, Any]) -> Optional[int]:
+    v = body.get("BodyID", body.get("bodyId"))
+    try:
+        return int(v)
+    except Exception:
+        return None
+
+
+def body_display_name(body: Dict[str, Any]) -> str:
+    typ = body.get("BodyType") or body.get("type") or ""
+    sub = body.get("PlanetClass") or body.get("StarType") or body.get("SubType") or body.get("subType") or ""
+    nm = body_name(body)
+    extra = " / ".join([x for x in [typ, sub] if x])
+    return f"{nm} [{extra}]" if extra else nm
+
+
+def find_body(system: Dict[str, Any], name: Optional[str]) -> Dict[str, Any]:
+    bs = bodies(system)
+    if not bs:
+        raise ValueError("No bodies found in system JSON")
+    if not name:
+        # Prefer currently selected body/status body if present, else first planet.
+        status_body = (system.get("status") or {}).get("BodyName")
+        if status_body:
+            try:
+                return find_body(system, status_body)
+            except Exception:
+                pass
+        for b in bs:
+            if str(b.get("BodyType") or b.get("type") or "").lower() == "planet":
+                return b
+        return bs[0]
+    lname = name.strip().lower()
+    for b in bs:
+        if body_name(b).lower() == lname:
+            return b
+    for b in bs:
+        if lname in body_name(b).lower():
+            return b
+    raise ValueError(f"Body not found: {name}")
+
+
+def load_observations_csv(path: str) -> List[Observation]:
+    out: List[Observation] = []
+    with open(path, "r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        for i, row in enumerate(reader, start=2):
+            try:
+                ts = parse_utc(row.get("timestamp_utc") or row.get("time") or row.get("timestamp") or "")
+                lat = float(row.get("lat") or row.get("latitude") or 0.0)
+                lon = float(row.get("lon") or row.get("longitude") or 0.0)
+                obs = (row.get("observation") or row.get("obs") or "horizon").strip().lower()
+                elev_raw = row.get("elevation")
+                if elev_raw in (None, ""):
+                    elev_raw = row.get("altitude_deg")
+                if elev_raw in (None, ""):
+                    elev_raw = row.get("sun_altitude")
+                elevation = float(elev_raw) if elev_raw not in (None, "") else None
+                heading_raw = row.get("heading")
+                heading = float(heading_raw) % 360.0 if heading_raw not in (None, "") else None
+                q = row.get("quality") or "medium"
+                note = row.get("note") or ""
+                out.append(Observation(ts, lat, lon, obs, elevation, heading, q, note))
+            except Exception as exc:
+                raise ValueError(f"Bad observation CSV row {i}: {exc}\nRow: {row}") from exc
+    if not out:
+        raise ValueError("No observations found in CSV")
+    return out
+
+
+# ------------------------------ orbital model ------------------------------
+
+
+def get_required_float(body: Dict[str, Any], key: str) -> float:
+    if key not in body:
+        raise ValueError(f"Body {body_name(body)} is missing required field {key}")
+    return float(body[key])
+
+
+def scan_epoch(body: Dict[str, Any]) -> datetime:
+    return parse_utc(str(body.get("timestamp") or body.get("Timestamp") or "1970-01-01T00:00:00Z"))
+
+
+def kepler_eccentric_anomaly(mean_anomaly_rad: float, eccentricity: float) -> float:
+    M = (mean_anomaly_rad + math.pi) % (2.0 * math.pi) - math.pi
+    e = eccentricity
+    E = M if e < 0.8 else math.pi
+    for _ in range(50):
+        f = E - e * math.sin(E) - M
+        fp = 1.0 - e * math.cos(E)
+        if fp == 0:
+            break
+        d = f / fp
+        E -= d
+        if abs(d) < 1e-13:
+            break
+    return E
+
+
+def orbital_position_parent_to_body(body: Dict[str, Any], t: datetime) -> np.ndarray:
+    """Approximate parent->body inertial vector from journal orbital elements."""
+    epoch = scan_epoch(body)
+    dt = (t - epoch).total_seconds()
+    a = get_required_float(body, "SemiMajorAxis")
+    e = float(body.get("Eccentricity", 0.0))
+    P = get_required_float(body, "OrbitalPeriod")
+    M0 = rad(float(body.get("MeanAnomaly", 0.0)))
+    M = M0 + (2.0 * math.pi / P) * dt
+    E = kepler_eccentric_anomaly(M, e)
+    true_anom = 2.0 * math.atan2(math.sqrt(1 + e) * math.sin(E / 2.0), math.sqrt(1 - e) * math.cos(E / 2.0))
+    r = a * (1.0 - e * math.cos(E))
+    perifocal = np.array([r * math.cos(true_anom), r * math.sin(true_anom), 0.0])
+    Om = rad(float(body.get("AscendingNode", 0.0)))
+    inc = rad(float(body.get("OrbitalInclination", 0.0)))
+    argp = rad(float(body.get("Periapsis", 0.0)))
+    # Standard perifocal -> inertial transform. The global inertial axes are arbitrary;
+    # the fitted body frame absorbs the unknown ED orientation convention.
+    return rotz(Om) @ rotx(inc) @ rotz(argp) @ perifocal
+
+
+def parent_entries(body: Dict[str, Any]) -> List[Dict[str, Any]]:
+    parents = body.get("Parents") or body.get("parents") or []
+    return [p for p in parents if isinstance(p, dict)]
+
+
+def direct_parent_kind(body: Dict[str, Any]) -> str:
+    """Return the direct parent kind: star, planet, null, or unknown.
+
+    Journal exports often use keys like {"Star": 0} or {"Planet": 17}.
+    Spansh-derived records often use {"type": "Star", "id64": ...}.
+    """
+    parents = parent_entries(body)
+    if not parents:
+        return "unknown"
+    p = parents[0]
+    if "Star" in p:
+        return "star"
+    if "Planet" in p:
+        return "planet"
+    if "Null" in p:
+        return "null"
+    typ = str(p.get("type") or p.get("BodyType") or "").strip().lower()
+    if typ in {"star", "planet", "null"}:
+        return typ
+    return "unknown"
+
+
+def body_orbits_star_directly(body: Dict[str, Any]) -> bool:
+    return direct_parent_kind(body) == "star"
+
+
+def sun_vector_source_label(body: Dict[str, Any]) -> str:
+    kind = direct_parent_kind(body)
+    if kind == "star":
+        return "direct parent-star orbital vector"
+    if kind == "planet":
+        return "fitted distant-star vector (moon/non-star parent)"
+    if kind == "null":
+        return "fitted distant-star vector (unknown/null barycentre parent)"
+    return "fitted distant-star vector (unknown parent)"
+
+
+def find_parent_star(system: Dict[str, Any], body: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    parents = parent_entries(body)
+    star_ref: Any = None
+    for p in parents:
+        if "Star" in p:
+            star_ref = p.get("Star")
+            break
+        if str(p.get("type") or "").strip().lower() == "star":
+            star_ref = p.get("BodyID", p.get("bodyId", p.get("id64")))
+            break
+    if star_ref is None:
+        return None
+    for b in bodies(system):
+        refs = {body_id(b), b.get("bodyId64"), b.get("id64"), b.get("SystemAddress")}
+        try:
+            if int(star_ref) in {int(x) for x in refs if x is not None}:
+                return b
+        except Exception:
+            pass
+        if str(star_ref) in {str(x) for x in refs if x is not None}:
+            return b
+    return None
+
+
+def find_main_star(system: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    for b in bodies(system):
+        if str(b.get("BodyType") or b.get("type") or "").lower() == "star" and bool((b.get("rawSpanshBody") or {}).get("is_main_star")):
+            return b
+    for b in bodies(system):
+        if str(b.get("BodyType") or b.get("type") or "").lower() == "star":
+            return b
+    return None
+
+
+def star_radius_metres(star: Dict[str, Any]) -> Optional[float]:
+    for key in ("Radius", "radius"):
+        try:
+            value = star.get(key)
+            if value not in (None, "") and float(value) > 0:
+                return float(value)
+        except Exception:
+            pass
+    try:
+        solar_r = (star.get("rawSpanshBody") or {}).get("solar_radius")
+        if solar_r not in (None, "") and float(solar_r) > 0:
+            return float(solar_r) * SOLAR_RADIUS_METRES
+    except Exception:
+        pass
+    return None
+
+
+def star_distance_metres(system: Dict[str, Any], body: Dict[str, Any], t: datetime) -> Optional[float]:
+    # For direct star-orbiting bodies, the orbital vector gives a time-dependent distance.
+    if find_parent_star(system, body) is not None:
+        try:
+            d = float(np.linalg.norm(orbital_position_parent_to_body(body, t)))
+            if d > 0:
+                return d
+        except Exception:
+            pass
+
+    # For moons and barycentre-parent bodies, the moon's own orbital vector points to
+    # the local parent planet, not the star. DistanceFromArrivalLS is the useful
+    # approximation for apparent stellar disc size.
+    for key in ("DistanceFromArrivalLS", "distanceToArrival", "distance_to_arrival"):
+        try:
+            value = body.get(key)
+            if value not in (None, "") and float(value) > 0:
+                return float(value) * LIGHT_SECOND_METRES
+        except Exception:
+            pass
+    try:
+        raw = body.get("rawSpanshBody") or {}
+        value = raw.get("distance_to_arrival")
+        if value not in (None, "") and float(value) > 0:
+            return float(value) * LIGHT_SECOND_METRES
+    except Exception:
+        pass
+    return None
+
+
+def star_angular_radius_deg(system: Optional[Dict[str, Any]], body: Dict[str, Any], t: datetime) -> Optional[float]:
+    if not system:
+        return None
+    star = find_parent_star(system, body) or find_main_star(system)
+    if not star:
+        return None
+    R = star_radius_metres(star)
+    d = star_distance_metres(system, body, t)
+    if R is None or d is None or d <= 0 or R <= 0:
+        return None
+    return deg(safe_asin(min(0.999999, R / d)))
+
+
+@dataclass
+class FittedModel:
+    body: Dict[str, Any]
+    params: Tuple[float, float, float, float]
+    spin_sign: int
+    lon_sign: int
+    orbit_flip: int
+    score: float
+    rms_altitude: float
+    rms_heading: Optional[float]
+    observations: List[Observation]
+    time_weighting: bool = False
+    time_ref: Optional[datetime] = None
+    time_half_life_hours: float = 24.0
+    time_min_weight: float = 0.05
+    def predict(self, t: datetime, lat_deg: float, lon_deg: float) -> Tuple[float, float]:
+        return predict_alt_az(self, t, lat_deg, lon_deg)
+
+
+def body_frame_matrix(alpha: float, beta: float, gamma: float) -> np.ndarray:
+    # Euler-like orientation. Gamma and phase are partly degenerate, but this makes
+    # fitting stable and absorbs ED's unknown body-axis convention.
+    return rotz(alpha) @ rotx(beta) @ rotz(gamma)
+
+
+def sun_vector_body(model: FittedModel, t: datetime) -> np.ndarray:
+    alpha, beta, gamma, phase = model.params
+    if body_orbits_star_directly(model.body):
+        r_parent_to_body = orbital_position_parent_to_body(model.body, t)
+        # Body -> parent star. orbit_flip absorbs sign/convention ambiguity.
+        s_inertial = norm(-float(model.orbit_flip) * r_parent_to_body)
+    else:
+        # For moons and bodies whose direct parent is a planet/null barycentre,
+        # orbital_position_parent_to_body() points to the local parent, not the
+        # star. A distant star has almost constant inertial direction over a
+        # short calibration window; the free body-frame angles fit that unknown
+        # direction. This avoids the old bug where a tidally locked moon used
+        # its gas-giant direction as the sun direction.
+        s_inertial = np.array([float(model.orbit_flip), 0.0, 0.0])
+    epoch = scan_epoch(model.body)
+    dt = (t - epoch).total_seconds()
+    rot_period = abs(get_required_float(model.body, "RotationPeriod"))
+    spin = float(model.spin_sign) * (2.0 * math.pi / rot_period) * dt + phase
+    R0 = body_frame_matrix(alpha, beta, gamma)
+    return norm(rotz(-spin) @ (R0.T @ s_inertial))
+
+
+def local_vectors(lat_deg: float, lon_deg: float, lon_sign: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    lat = rad(lat_deg)
+    lon = rad(float(lon_sign) * lon_deg)
+    up = np.array([math.cos(lat) * math.cos(lon), math.cos(lat) * math.sin(lon), math.sin(lat)])
+    east = np.array([-math.sin(lon), math.cos(lon), 0.0])
+    north = np.array([-math.sin(lat) * math.cos(lon), -math.sin(lat) * math.sin(lon), math.cos(lat)])
+    return norm(up), norm(north), norm(east)
+
+
+def predict_alt_az(model: FittedModel, t: datetime, lat_deg: float, lon_deg: float) -> Tuple[float, float]:
+    s = sun_vector_body(model, t)
+    up, north, east = local_vectors(lat_deg, lon_deg, model.lon_sign)
+    alt = deg(safe_asin(float(np.dot(up, s))))
+    az = deg(math.atan2(float(np.dot(s, east)), float(np.dot(s, north)))) % 360.0
+    return alt, az
+
+
+def make_model(
+    body: Dict[str, Any],
+    params: Tuple[float, float, float, float],
+    spin_sign: int,
+    lon_sign: int,
+    orbit_flip: int,
+    observations: List[Observation],
+    score: float = 0.0,
+    time_weighting: bool = False,
+    time_ref: Optional[datetime] = None,
+    time_half_life_hours: float = 24.0,
+    time_min_weight: float = 0.05,
+) -> FittedModel:
+    return FittedModel(
+        body, params, spin_sign, lon_sign, orbit_flip, score, 0.0, None, observations,
+        time_weighting, time_ref, time_half_life_hours, time_min_weight
+    )
+
+
+def model_loss(model: FittedModel, use_heading: bool = True, horizon_for_night_deg: float = 0.0) -> Tuple[float, float, Optional[float]]:
+    alt_ss = 0.0
+    alt_w = 0.0
+    head_ss = 0.0
+    head_w = 0.0
+    total = 0.0
+    total_w = 0.0
+    for obs in model.observations:
+        w = combined_observation_weight(
+            obs,
+            time_weighting=model.time_weighting,
+            time_ref=model.time_ref,
+            time_half_life_hours=model.time_half_life_hours,
+            time_min_weight=model.time_min_weight,
+        )
+        alt, az = model.predict(obs.timestamp_utc, obs.lat, obs.lon)
+        target = obs.target_altitude
+        o = obs.observation.lower().strip()
+        if target is not None:
+            # Elevation observations are compared directly to calculated sun-centre altitude.
+            err = alt - target
+            alt_ss += w * err * err
+            alt_w += w
+            total += w * err * err
+            total_w += w
+        elif o == "night":
+            # Weak inequality. Night usually means the sun centre is below horizon.
+            if alt > horizon_for_night_deg:
+                err = alt - horizon_for_night_deg + 2.0
+                total += w * err * err
+                total_w += w
+        elif o == "day":
+            if alt < horizon_for_night_deg:
+                err = alt - horizon_for_night_deg - 2.0
+                total += w * err * err
+                total_w += w
+        if use_heading and obs.heading is not None:
+            # Heading readings are useful, but softer than altitude/horizon observations.
+            # A 9 degree heading error counts roughly like a 3 degree altitude error.
+            herr = wrap180(az - obs.heading)
+            scaled = herr / 3.0
+            head_ss += w * herr * herr
+            head_w += w
+            total += w * scaled * scaled
+            total_w += w
+    score = math.sqrt(total / max(total_w, 1e-9))
+    rms_alt = math.sqrt(alt_ss / alt_w) if alt_w > 0 else 0.0
+    rms_head = math.sqrt(head_ss / head_w) if head_w > 0 else None
+    return score, rms_alt, rms_head
+
+
+
+def fit_model(
+    body: Dict[str, Any],
+    observations: List[Observation],
+    use_heading: bool = True,
+    seed: int = 42,
+    time_weighting: bool = False,
+    time_half_life_hours: float = 24.0,
+    time_ref: Optional[datetime] = None,
+    time_min_weight: float = 0.05,
+) -> FittedModel:
+    # Validate required fields early.
+    for key in ("timestamp", "RotationPeriod", "OrbitalPeriod", "SemiMajorAxis"):
+        get_required_float(body, key) if key != "timestamp" else scan_epoch(body)
+
+    best_model: Optional[FittedModel] = None
+    rng = random.Random(seed)
+    effective_time_ref = observation_time_reference(observations, time_ref) if time_weighting else None
+
+    def split_candidate(x: Iterable[float]) -> Tuple[float, float, float, float]:
+        vals = [float(v) for v in x]
+        return tuple(vals[:4])  # type: ignore[return-value]
+
+    def evaluate_tuple(x: Iterable[float], spin_sign: int, lon_sign: int, orbit_flip: int) -> float:
+        params = split_candidate(x)
+        m = make_model(
+            body, params, spin_sign, lon_sign, orbit_flip, observations,
+            time_weighting=time_weighting,
+            time_ref=effective_time_ref,
+            time_half_life_hours=time_half_life_hours,
+            time_min_weight=time_min_weight,
+        )
+        return model_loss(m, use_heading=use_heading)[0]
+
+    combos = [(sp, lo, of) for sp in (1, -1) for lo in (1, -1) for of in (1, -1)]
+    bounds = [(-math.pi, math.pi), (-math.pi, math.pi), (-math.pi, math.pi), (-math.pi, math.pi)]
+
+    if differential_evolution is not None:
+        for spin_sign, lon_sign, orbit_flip in combos:
+            result = differential_evolution(
+                lambda x, sp=spin_sign, lo=lon_sign, of=orbit_flip: evaluate_tuple(x, sp, lo, of),
+                bounds,
+                seed=seed,
+                tol=1e-7,
+                popsize=8,
+                maxiter=220,
+                polish=True,
+                workers=1,
+            )
+            params = split_candidate(result.x)
+            model = make_model(
+                body, params, spin_sign, lon_sign, orbit_flip, observations,
+                time_weighting=time_weighting,
+                time_ref=effective_time_ref,
+                time_half_life_hours=time_half_life_hours,
+                time_min_weight=time_min_weight,
+            )
+            score, rms_alt, rms_head = model_loss(model, use_heading=use_heading)
+            model.score = score
+            model.rms_altitude = rms_alt
+            model.rms_heading = rms_head
+            if best_model is None or model.score < best_model.score:
+                best_model = model
+    else:
+        # Pure-Python fallback: random global search + simple coordinate pattern search.
+        for spin_sign, lon_sign, orbit_flip in combos:
+            candidates: List[Tuple[float, Tuple[float, float, float, float]]] = []
+            ndim = len(bounds)
+            for _ in range(2500):
+                x = tuple(rng.uniform(bounds[i][0], bounds[i][1]) for i in range(ndim))
+                candidates.append((evaluate_tuple(x, spin_sign, lon_sign, orbit_flip), x))
+            candidates.sort(key=lambda p: p[0])
+            for _, start in candidates[:20]:
+                x = list(start)
+                step = math.pi / 3.0
+                best = evaluate_tuple(x, spin_sign, lon_sign, orbit_flip)
+                while step > 1e-5:
+                    improved = False
+                    for j in range(len(bounds)):
+                        for direction in (-1.0, 1.0):
+                            y = x[:]
+                            y[j] += direction * step
+                            if j < 4:
+                                y[j] = (y[j] + math.pi) % (2.0 * math.pi) - math.pi
+                            else:
+                                y[j] = max(bounds[j][0], min(bounds[j][1], y[j]))
+                            val = evaluate_tuple(y, spin_sign, lon_sign, orbit_flip)
+                            if val < best:
+                                x, best, improved = y, val, True
+                    if not improved:
+                        step *= 0.55
+                params = split_candidate(x)
+                model = make_model(
+                    body, params, spin_sign, lon_sign, orbit_flip, observations,
+                    time_weighting=time_weighting,
+                    time_ref=effective_time_ref,
+                    time_half_life_hours=time_half_life_hours,
+                    time_min_weight=time_min_weight,
+                )
+                score, rms_alt, rms_head = model_loss(model, use_heading=use_heading)
+                model.score = score
+                model.rms_altitude = rms_alt
+                model.rms_heading = rms_head
+                if best_model is None or model.score < best_model.score:
+                    best_model = model
+
+    if best_model is None:
+        raise RuntimeError("Fit failed")
+    return best_model
+
+
+# ------------------------------ reporting / prediction ------------------------------
+
+
+def apparent_mean_periods(body: Dict[str, Any]) -> Tuple[float, float]:
+    rot = abs(float(body.get("RotationPeriod", 0.0)))
+    orb = abs(float(body.get("OrbitalPeriod", 0.0)))
+    if rot <= 0 or orb <= 0:
+        return (0.0, 0.0)
+    diff = abs(1.0 / rot - 1.0 / orb)
+    summ = abs(1.0 / rot + 1.0 / orb)
+    return (1.0 / diff if diff > 0 else float("inf"), 1.0 / summ if summ > 0 else float("inf"))
+
+
+def residual_rows(model: FittedModel) -> List[Tuple[Observation, float, float, Optional[float], Optional[float], float]]:
+    rows = []
+    for obs in model.observations:
+        alt, az = model.predict(obs.timestamp_utc, obs.lat, obs.lon)
+        alt_err = alt - obs.target_altitude if obs.target_altitude is not None else None
+        # Only show heading residuals when headings were actually used in the fit.
+        head_err = wrap180(az - obs.heading) if (obs.heading is not None and model.rms_heading is not None) else None
+        eff_w = combined_observation_weight(
+            obs, model.time_weighting, model.time_ref, model.time_half_life_hours, model.time_min_weight
+        )
+        rows.append((obs, alt, az, alt_err, head_err, eff_w))
+    return rows
+
+
+def crossing_type(model: FittedModel, t: datetime, lat: float, lon: float, threshold: float) -> str:
+    before = model.predict(t - timedelta(seconds=10), lat, lon)[0] - threshold
+    after = model.predict(t + timedelta(seconds=10), lat, lon)[0] - threshold
+    if after > before:
+        return "rise"
+    return "set"
+
+
+def find_crossings(
+    model: FittedModel,
+    start: datetime,
+    lat: float,
+    lon: float,
+    threshold: float = 0.0,
+    hours: float = 16.0,
+    max_crossings: int = 8,
+) -> List[Tuple[datetime, str]]:
+    out: List[Tuple[datetime, str]] = []
+    step = 30.0
+    end = start + timedelta(hours=hours)
+    t0 = start
+    f0 = model.predict(t0, lat, lon)[0] - threshold
+    t = start + timedelta(seconds=step)
+    while t <= end and len(out) < max_crossings:
+        f1 = model.predict(t, lat, lon)[0] - threshold
+        if f0 == 0.0 or f0 * f1 < 0.0:
+            lo = t - timedelta(seconds=step)
+            hi = t
+            flo = f0
+            for _ in range(32):
+                mid = lo + (hi - lo) / 2
+                fm = model.predict(mid, lat, lon)[0] - threshold
+                if flo == 0.0 or flo * fm <= 0.0:
+                    hi = mid
+                    f1 = fm
+                else:
+                    lo = mid
+                    flo = fm
+            ct = crossing_type(model, hi, lat, lon, threshold)
+            out.append((hi, ct))
+        t0, f0 = t, f1
+        t = t + timedelta(seconds=step)
+    return out
+
+
+def find_crossings_adaptive(
+    model: FittedModel,
+    start: datetime,
+    lat: float,
+    lon: float,
+    threshold: float = 0.0,
+    hours: float = 16.0,
+    max_crossings: int = 8,
+    max_steps: int = 30000,
+) -> List[Tuple[datetime, str]]:
+    """Find crossings over long windows without doing millions of 30 s samples.
+
+    The normal 30 s scanner is still used for the visible prediction window.
+    This adaptive scanner is used only when we need to look farther ahead to
+    find the next sun passes or a complete daylight/day-period summary.
+    """
+    out: List[Tuple[datetime, str]] = []
+    total_seconds = max(1.0, float(hours) * 3600.0)
+    step = max(30.0, total_seconds / max(1000, int(max_steps)))
+    end = start + timedelta(seconds=total_seconds)
+    t0 = start
+    f0 = model.predict(t0, lat, lon)[0] - threshold
+    t = start + timedelta(seconds=step)
+    while t <= end and len(out) < max_crossings:
+        f1 = model.predict(t, lat, lon)[0] - threshold
+        if f0 == 0.0 or f0 * f1 < 0.0:
+            lo = t - timedelta(seconds=step)
+            hi = t
+            flo = f0
+            for _ in range(40):
+                mid = lo + (hi - lo) / 2
+                fm = model.predict(mid, lat, lon)[0] - threshold
+                if flo == 0.0 or flo * fm <= 0.0:
+                    hi = mid
+                    f1 = fm
+                else:
+                    lo = mid
+                    flo = fm
+            ct = crossing_type(model, hi, lat, lon, threshold)
+            # Avoid duplicates where the extended scan overlaps the normal scan.
+            if not out or abs((hi - out[-1][0]).total_seconds()) > 2.0:
+                out.append((hi, ct))
+        t0, f0 = t, f1
+        t = t + timedelta(seconds=step)
+    return out
+
+
+def unique_crossings(crossings: List[Tuple[datetime, str]]) -> List[Tuple[datetime, str]]:
+    out: List[Tuple[datetime, str]] = []
+    for t, kind in sorted(crossings, key=lambda x: x[0]):
+        if out and abs((t - out[-1][0]).total_seconds()) <= 2.0 and kind == out[-1][1]:
+            continue
+        out.append((t, kind))
+    return out
+
+
+def find_crossings_for_prediction(
+    model: FittedModel,
+    start: datetime,
+    lat: float,
+    lon: float,
+    threshold: float = 0.0,
+    prediction_hours: float = 72.0,
+    max_crossings: int = 24,
+) -> Tuple[List[Tuple[datetime, str]], List[Tuple[datetime, str]], float, bool]:
+    """Return window crossings plus enough future crossings for display/summary.
+
+    The public website has two needs:
+      * show the configured prediction window, usually 72 h
+      * still show at least the next two sun passes and try to compute daylight
+        duration/day period even when the passes are just outside that window
+
+    Return value: all_crossings, window_crossings, search_hours, extended.
+    """
+    window_crossings = find_crossings(
+        model, start, lat, lon, threshold=threshold,
+        hours=prediction_hours, max_crossings=max_crossings,
+    )
+
+    # Two future passes are useful for the timer/list. Four are often needed to
+    # derive a complete sunrise->sunset and sunrise->sunrise period when the
+    # current time is already between sunrise and sunset.
+    need_more = len(window_crossings) < 4 or daylight_cycle_summary(window_crossings) is None
+    if not need_more:
+        return window_crossings, window_crossings, float(prediction_hours), False
+
+    # Search a wider model period. For normal fast cycles the first window is
+    # enough; this fallback is mostly for polar/seasonal cases or very long days.
+    check_hours = model_horizon_check_hours(model, prediction_hours)
+    extended_hours = min(max(float(prediction_hours), check_hours * 2.0), 365.0 * 24.0)
+    if extended_hours <= float(prediction_hours) + 1e-6:
+        return window_crossings, window_crossings, float(prediction_hours), False
+
+    extended = find_crossings_adaptive(
+        model, start, lat, lon, threshold=threshold,
+        hours=extended_hours, max_crossings=max_crossings,
+    )
+    all_crossings = unique_crossings(window_crossings + extended)
+    return all_crossings, window_crossings, float(extended_hours), True
+
+
+def daylight_cycle_rows(crossings: List[Tuple[datetime, str]]) -> List[Tuple[datetime, Optional[datetime], Optional[float], Optional[datetime], Optional[float]]]:
+    """Return sunrise-based daylight/day-cycle summaries.
+
+    Each row is:
+      sunrise_time, next_sunset_time, daylight_seconds, next_sunrise_time, total_day_seconds
+
+    Daylight time is sunrise -> following sunset.
+    Total day period is sunrise -> following sunrise.
+    """
+    rows: List[Tuple[datetime, Optional[datetime], Optional[float], Optional[datetime], Optional[float]]] = []
+    for i, (rise_time, kind) in enumerate(crossings):
+        if kind != "rise":
+            continue
+        next_set: Optional[datetime] = None
+        next_rise: Optional[datetime] = None
+        for later_time, later_kind in crossings[i + 1:]:
+            if next_set is None and later_kind == "set":
+                next_set = later_time
+            if later_kind == "rise":
+                next_rise = later_time
+                break
+        daylight_seconds = (next_set - rise_time).total_seconds() if next_set else None
+        total_day_seconds = (next_rise - rise_time).total_seconds() if next_rise else None
+        rows.append((rise_time, next_set, daylight_seconds, next_rise, total_day_seconds))
+    return rows
+
+
+def daylight_cycle_summary(crossings: List[Tuple[datetime, str]]) -> Optional[Tuple[float, float]]:
+    """Return first complete daylight duration and sunrise-to-sunrise period."""
+    for _rise_time, _set_time, daylight_seconds, _next_rise, total_day_seconds in daylight_cycle_rows(crossings):
+        if daylight_seconds is not None and total_day_seconds is not None:
+            return daylight_seconds, total_day_seconds
+    return None
+
+
+def calibration_source_label(calibration_path: Optional[str]) -> str:
+    if calibration_path:
+        return os.path.basename(calibration_path)
+    return "manual observation table / unsaved CSV"
+
+
+def make_report(
+    model: FittedModel,
+    system: Optional[Dict[str, Any]] = None,
+    target_time: Optional[datetime] = None,
+    target_lat: Optional[float] = None,
+    target_lon: Optional[float] = None,
+    calibration_path: Optional[str] = None,
+    prediction_hours: float = 72.0,
+) -> str:
+    body = model.body
+    lines: List[str] = []
+    lines.append("Elite Dangerous orbital day/night model v15")
+    lines.append("============================================")
+    lines.append(f"Body: {body_name(body)}")
+    lines.append(f"Calibration CSV: {calibration_source_label(calibration_path)}")
+    lines.append(f"Scan/orbit epoch: {format_utc(scan_epoch(body))}")
+    rot = abs(float(body.get("RotationPeriod", 0.0)))
+    orb = abs(float(body.get("OrbitalPeriod", 0.0)))
+    lines.append(f"Rotation period: {rot:.3f} s ({rot/3600.0:.4f} h)")
+    lines.append(f"Orbital period:  {orb:.3f} s ({orb/3600.0:.4f} h)")
+    lines.append(f"Sun-vector source: {sun_vector_source_label(body)}")
+    diff_p, sum_p = apparent_mean_periods(body)
+    lines.append(f"Mean rotation-orbit beat period: {diff_p:.1f} s ({diff_p/3600.0:.4f} h)")
+    lines.append(f"Mean rotation+orbit period:     {sum_p:.1f} s ({sum_p/3600.0:.4f} h)")
+    lines.append(f"Fit signs: spin {model.spin_sign:+d}, longitude {model.lon_sign:+d}, orbit-vector {model.orbit_flip:+d}")
+    a, b, g, p = model.params
+    lines.append(f"Fitted frame angles: alpha {deg(a):+.3f}°, beta {deg(b):+.3f}°, gamma {deg(g):+.3f}°, phase {deg(p):+.3f}°")
+    lines.append(f"RMS altitude residual: {model.rms_altitude:.3f}°")
+    if model.time_weighting:
+        ref_s = format_utc(model.time_ref) if model.time_ref else "latest observation"
+        lines.append(f"Time weighting: ON, reference {ref_s}, half-life {model.time_half_life_hours:.2f} h, minimum multiplier {model.time_min_weight:.2f}")
+    else:
+        lines.append("Time weighting: OFF; all observation ages use only quality weights.")
+    if model.rms_heading is not None:
+        lines.append(f"RMS heading residual:  {model.rms_heading:.3f}°")
+    lines.append(f"Fit score: {model.score:.3f}")
+    lines.append("")
+    lines.append("Observation residuals")
+    lines.append("---------------------")
+    lines.append("time UTC              obs          lat        lon       target  sun_alt  alt_err  pred_head  head_err  eff_w")
+    for obs, alt, az, alt_err, head_err, eff_w in residual_rows(model):
+        target = obs.target_altitude
+        target_s = "" if target is None else f"{target:7.2f}"
+        alt_err_s = "" if alt_err is None else f"{alt_err:7.2f}"
+        head_err_s = "" if head_err is None else f"{head_err:8.2f}"
+        lines.append(
+            f"{format_utc(obs.timestamp_utc):20s} {obs.observation[:10]:10s} "
+            f"{obs.lat:9.4f} {obs.lon:9.4f} {target_s:>7s} {alt:8.2f} {alt_err_s:>8s} {az:10.2f} {head_err_s:>9s} {eff_w:6.3f}"
+        )
+
+    if target_time is not None and target_lat is not None and target_lon is not None:
+        alt, az = model.predict(target_time, target_lat, target_lon)
+        radius = star_angular_radius_deg(system, body, target_time) if system else None
+        centre_crossings = find_crossings(
+            model,
+            target_time,
+            target_lat,
+            target_lon,
+            threshold=0.0,
+            hours=prediction_hours,
+            max_crossings=24,
+        )
+        daylight_summary = daylight_cycle_summary(centre_crossings)
+
+        lines.append("")
+        lines.append("Target prediction")
+        lines.append("-----------------")
+        lines.append(f"Time: {format_utc(target_time)}")
+        lines.append(f"Latitude / longitude: {target_lat:.6f}, {target_lon:.6f}")
+        lines.append(f"Sun centre altitude: {alt:.2f}°")
+        lines.append(f"Sun centre heading:  {az:.2f}°")
+        lines.append(f"Centre state: {'DAY' if alt > 0 else 'NIGHT'}")
+        if daylight_summary is not None:
+            daylight_seconds, total_day_seconds = daylight_summary
+            lines.append(f"Sunlight duration: {fmt_dur(daylight_seconds)} | Day period: {fmt_dur(total_day_seconds)}")
+
+        lines.append(f"Next centre-horizon crossings ({prediction_hours/24.0:.1f} days):")
+        if centre_crossings:
+            for ct, kind in centre_crossings:
+                lines.append(f"  {kind:4s} {format_utc(ct)}  in {fmt_dur((ct-target_time).total_seconds())}")
+        else:
+            lines.append("  no centre-horizon crossing found in this window")
+
+        if radius is not None and radius >= VISUAL_DISC_MIN_RADIUS_DEG:
+            lines.append(f"Approx parent-star angular radius: {radius:.2f}°")
+            lines.append(f"Disc visibility: {'VISIBLE' if alt > -radius else 'HIDDEN'}  (disc visible if centre altitude > {-radius:.2f}°)")
+            disc_crossings = find_crossings(
+                model,
+                target_time,
+                target_lat,
+                target_lon,
+                threshold=-radius,
+                hours=prediction_hours,
+                max_crossings=24,
+            )
+            lines.append("Next visual-disc edge crossings:")
+            if disc_crossings:
+                for ct, kind in disc_crossings:
+                    lines.append(f"  disc-{kind:4s} {format_utc(ct)}  in {fmt_dur((ct-target_time).total_seconds())}")
+            else:
+                lines.append("  no visual-disc edge crossing found in this window")
+    return "\n".join(lines)
+
+
+# ------------------------------ structured API helpers ------------------------------
+
+
+def model_summary_dict(model: FittedModel) -> Dict[str, Any]:
+    """Return a JSON-serialisable summary of a fitted model.
+
+    This is intended for the future web/API layer. It does not include the full
+    body JSON or observation rows, only the active fit metadata and parameters.
+    """
+    a, b, g, p = model.params
+    return {
+        "body_name": body_name(model.body),
+        "model_version": "v15",
+        "score": float(model.score),
+        "rms_altitude_deg": float(model.rms_altitude),
+        "rms_heading_deg": None if model.rms_heading is None else float(model.rms_heading),
+        "spin_sign": int(model.spin_sign),
+        "lon_sign": int(model.lon_sign),
+        "orbit_flip": int(model.orbit_flip),
+        "params": {
+            "alpha_rad": float(a),
+            "beta_rad": float(b),
+            "gamma_rad": float(g),
+            "phase_rad": float(p),
+            "alpha_deg": float(deg(a)),
+            "beta_deg": float(deg(b)),
+            "gamma_deg": float(deg(g)),
+            "phase_deg": float(deg(p)),
+        },
+        "time_weighting": bool(model.time_weighting),
+        "time_ref_utc": None if model.time_ref is None else format_utc(model.time_ref),
+        "time_half_life_hours": float(model.time_half_life_hours),
+        "time_min_weight": float(model.time_min_weight),
+        "sun_vector_source": sun_vector_source_label(model.body),
+    }
+
+
+def residuals_as_dicts(model: FittedModel) -> List[Dict[str, Any]]:
+    """Return fit residuals as JSON-serialisable dictionaries."""
+    out: List[Dict[str, Any]] = []
+    for obs, alt, az, alt_err, head_err, eff_w in residual_rows(model):
+        out.append({
+            "timestamp_utc": format_utc(obs.timestamp_utc),
+            "lat": float(obs.lat),
+            "lon": float(obs.lon),
+            "observation": obs.observation,
+            "target_altitude_deg": None if obs.target_altitude is None else float(obs.target_altitude),
+            "predicted_sun_altitude_deg": float(alt),
+            "predicted_sun_heading_deg": float(az),
+            "altitude_error_deg": None if alt_err is None else float(alt_err),
+            "heading_error_deg": None if head_err is None else float(head_err),
+            "effective_weight": float(eff_w),
+            "quality": obs.quality,
+            "note": obs.note,
+        })
+    return out
+
+
+
+def model_horizon_check_hours(model: FittedModel, prediction_hours: float = 72.0) -> float:
+    """Return the period to sample when no sunrise/sunset is found.
+
+    This is intentionally a checked model period, not a promise that a body
+    literally never has a transition. For moons/non-star parents v15 uses a
+    fitted distant-star direction, so one rotation is the relevant cycle. For
+    direct star-orbiting bodies we include the apparent beat period and, when
+    reasonable, the orbital period so polar-season cases can be detected.
+    """
+    rot = abs(float(model.body.get("RotationPeriod", 0.0) or 0.0))
+    orb = abs(float(model.body.get("OrbitalPeriod", 0.0) or 0.0))
+    max_seconds = 365.0 * 24.0 * 3600.0
+    candidates = [max(float(prediction_hours) * 3600.0, 3600.0)]
+
+    if rot > 0:
+        candidates.append(rot)
+
+    if body_orbits_star_directly(model.body):
+        diff_p, sum_p = apparent_mean_periods(model.body)
+        for p in (diff_p, sum_p, orb):
+            if p and math.isfinite(p) and p > 0:
+                candidates.append(min(float(p), max_seconds))
+
+    # Check at least the visible prediction window, but cap the background
+    # analysis so one request cannot become expensive for century-long orbits.
+    seconds = min(max(candidates), max_seconds)
+    return float(seconds / 3600.0)
+
+
+def horizon_status_analysis(
+    model: FittedModel,
+    target_time: datetime,
+    lat: float,
+    lon: float,
+    centre_crossings: List[Tuple[datetime, str]],
+    current_altitude_deg: float,
+    prediction_hours: float = 72.0,
+) -> Dict[str, Any]:
+    """Classify no-crossing cases as continuous day/night or outside-window.
+
+    The result is suitable for website/API display. It avoids saying "never"
+    and instead reports what was found inside the checked model period.
+    """
+    if centre_crossings:
+        return {
+            "horizon_mode": "normal",
+            "horizon_message": "Horizon transitions found in the prediction window.",
+            "horizon_check_hours": float(prediction_hours),
+            "cycle_min_sun_altitude_deg": None,
+            "cycle_max_sun_altitude_deg": None,
+            "has_transition_in_checked_period": True,
+        }
+
+    check_hours = model_horizon_check_hours(model, prediction_hours)
+    check_seconds = max(3600.0, check_hours * 3600.0)
+    # Enough samples to detect broad seasonal/polar behaviour without making
+    # very long orbital periods expensive.
+    samples = 1440
+    min_alt = float("inf")
+    max_alt = -float("inf")
+    for i in range(samples + 1):
+        t = target_time + timedelta(seconds=check_seconds * i / samples)
+        a = model.predict(t, lat, lon)[0]
+        min_alt = min(min_alt, float(a))
+        max_alt = max(max_alt, float(a))
+
+    state = "day" if current_altitude_deg > 0 else "night"
+    window = f"the next {float(prediction_hours):.0f} hours"
+    checked = f"the checked model period ({check_hours:.1f} hours)"
+
+    eps = 0.02
+    if min_alt > eps:
+        return {
+            "horizon_mode": "continuous_day_checked",
+            "horizon_message": f"Continuous daylight in {checked}; no sunset was found.",
+            "horizon_check_hours": float(check_hours),
+            "cycle_min_sun_altitude_deg": float(min_alt),
+            "cycle_max_sun_altitude_deg": float(max_alt),
+            "has_transition_in_checked_period": False,
+        }
+    if max_alt < -eps:
+        return {
+            "horizon_mode": "continuous_night_checked",
+            "horizon_message": f"Continuous night in {checked}; no sunrise was found.",
+            "horizon_check_hours": float(check_hours),
+            "cycle_min_sun_altitude_deg": float(min_alt),
+            "cycle_max_sun_altitude_deg": float(max_alt),
+            "has_transition_in_checked_period": False,
+        }
+
+    wanted = "sunset" if state == "day" else "sunrise"
+    return {
+        "horizon_mode": f"no_{wanted}_in_window",
+        "horizon_message": f"No {wanted} was found in {window}, but the checked model period does cross the horizon later.",
+        "horizon_check_hours": float(check_hours),
+        "cycle_min_sun_altitude_deg": float(min_alt),
+        "cycle_max_sun_altitude_deg": float(max_alt),
+        "has_transition_in_checked_period": True,
+    }
+
+def calculate_prediction(
+    model: FittedModel,
+    system: Optional[Dict[str, Any]],
+    target_time: datetime,
+    lat: float,
+    lon: float,
+    prediction_hours: float = 72.0,
+) -> Dict[str, Any]:
+    """Return a JSON-serialisable prediction for a body/lat/lon/time.
+
+    This is the main non-GUI API entry point for a future web backend.
+    """
+    alt, az = model.predict(target_time, lat, lon)
+    # Local sun trend for the website elevation view.  A centred 120-second
+    # sample is stable enough for display without changing the fit itself.
+    trend_sample_seconds = 60.0
+    alt_before = model.predict(target_time - timedelta(seconds=trend_sample_seconds), lat, lon)[0]
+    alt_after = model.predict(target_time + timedelta(seconds=trend_sample_seconds), lat, lon)[0]
+    sun_altitude_rate_deg_per_min = (alt_after - alt_before) / (2.0 * trend_sample_seconds / 60.0)
+    if sun_altitude_rate_deg_per_min > 0.002:
+        sun_altitude_trend = "rising"
+    elif sun_altitude_rate_deg_per_min < -0.002:
+        sun_altitude_trend = "falling"
+    else:
+        sun_altitude_trend = "nearly level"
+
+    centre_crossings, window_crossings, crossing_search_hours, crossings_extended = find_crossings_for_prediction(
+        model,
+        target_time,
+        lat,
+        lon,
+        threshold=0.0,
+        prediction_hours=prediction_hours,
+        max_crossings=24,
+    )
+    daylight_summary = daylight_cycle_summary(centre_crossings)
+    next_sunrise = next((t for t, kind in centre_crossings if kind == "rise"), None)
+    next_sunset = next((t for t, kind in centre_crossings if kind == "set"), None)
+
+    radius = star_angular_radius_deg(system, model.body, target_time) if system else None
+    visual_disc_crossings: List[Dict[str, Any]] = []
+    disc_visible: Optional[bool] = None
+    if radius is not None and radius >= VISUAL_DISC_MIN_RADIUS_DEG:
+        disc_visible = bool(alt > -radius)
+        for ct, kind in find_crossings(
+            model,
+            target_time,
+            lat,
+            lon,
+            threshold=-radius,
+            hours=prediction_hours,
+            max_crossings=24,
+        ):
+            visual_disc_crossings.append({
+                "time_utc": format_utc(ct),
+                "kind": kind,
+                "seconds_from_target": float((ct - target_time).total_seconds()),
+            })
+
+    horizon_info = horizon_status_analysis(
+        model,
+        target_time,
+        lat,
+        lon,
+        window_crossings,
+        alt,
+        prediction_hours=prediction_hours,
+    )
+
+    result = {
+        "body_name": body_name(model.body),
+        "target_time_utc": format_utc(target_time),
+        "lat": float(lat),
+        "lon": float(lon),
+        "sun_altitude_deg": float(alt),
+        "sun_heading_deg": float(az),
+        "sun_altitude_trend": sun_altitude_trend,
+        "sun_altitude_rate_deg_per_min": float(sun_altitude_rate_deg_per_min),
+        "centre_state": "DAY" if alt > 0 else "NIGHT",
+        "next_sunrise_utc": None if next_sunrise is None else format_utc(next_sunrise),
+        "next_sunrise_seconds": None if next_sunrise is None else float((next_sunrise - target_time).total_seconds()),
+        "next_sunset_utc": None if next_sunset is None else format_utc(next_sunset),
+        "next_sunset_seconds": None if next_sunset is None else float((next_sunset - target_time).total_seconds()),
+        "sunlight_duration_sec": None if daylight_summary is None else float(daylight_summary[0]),
+        "day_period_sec": None if daylight_summary is None else float(daylight_summary[1]),
+        "prediction_window_hours": float(prediction_hours),
+        "crossing_search_hours": float(crossing_search_hours),
+        "crossings_extended_beyond_window": bool(crossings_extended),
+        "centre_horizon_crossings": [
+            {
+                "time_utc": format_utc(ct),
+                "kind": kind,
+                "seconds_from_target": float((ct - target_time).total_seconds()),
+                "inside_prediction_window": bool((ct - target_time).total_seconds() <= float(prediction_hours) * 3600.0 + 1.0),
+            }
+            for ct, kind in centre_crossings
+        ],
+        "star_angular_radius_deg": None if radius is None else float(radius),
+        "visual_disc_threshold_deg": float(VISUAL_DISC_MIN_RADIUS_DEG),
+        "disc_visible": disc_visible,
+        "visual_disc_crossings": visual_disc_crossings,
+    }
+    result.update(horizon_info)
+    return result
+
+
+def fit_model_from_files(
+    system_path: str,
+    observations_path: str,
+    body_name_value: Optional[str] = None,
+    use_heading: bool = False,
+    time_weighting: bool = False,
+    time_half_life_hours: float = 24.0,
+    time_ref: Optional[datetime] = None,
+) -> Tuple[Dict[str, Any], Dict[str, Any], List[Observation], FittedModel]:
+    """Load files and fit a model. Useful for CLI tests and backend prototypes."""
+    system = load_system_json(system_path)
+    body = find_body(system, body_name_value)
+    observations = load_observations_csv(observations_path)
+    model = fit_model(
+        body,
+        observations,
+        use_heading=use_heading,
+        time_weighting=time_weighting,
+        time_half_life_hours=time_half_life_hours,
+        time_ref=time_ref,
+    )
+    return system, body, observations, model
+
+
+# ------------------------------ live Status.json ------------------------------
+
+
+def candidate_status_paths() -> List[str]:
+    r"""Return likely Elite Dangerous Status.json locations.
+
+    Main Windows path:
+      C:\Users\<user>\Saved Games\Frontier Developments\Elite Dangerous\Status.json
+
+    A few Linux/Wine/Proton-style locations are included as fallbacks.
+    """
+    out: List[str] = []
+    userprofile = os.environ.get("USERPROFILE")
+    if userprofile:
+        out.append(os.path.join(userprofile, "Saved Games", "Frontier Developments", "Elite Dangerous", "Status.json"))
+
+    home = os.path.expanduser("~")
+    out.append(os.path.join(home, "Saved Games", "Frontier Developments", "Elite Dangerous", "Status.json"))
+    out.append(os.path.join(home, "saved games", "Frontier Developments", "Elite Dangerous", "Status.json"))
+
+    # Common Steam Proton prefixes. We keep this conservative to avoid slow disk walks.
+    steam_roots = [
+        os.path.join(home, ".steam", "steam", "steamapps", "compatdata"),
+        os.path.join(home, ".local", "share", "Steam", "steamapps", "compatdata"),
+    ]
+    suffix = os.path.join(
+        "pfx", "drive_c", "users", "steamuser", "Saved Games", "Frontier Developments", "Elite Dangerous", "Status.json"
+    )
+    for root in steam_roots:
+        try:
+            if os.path.isdir(root):
+                for appid in os.listdir(root):
+                    out.append(os.path.join(root, appid, suffix))
+        except Exception:
+            pass
+
+    # Deduplicate preserving order.
+    seen = set()
+    uniq: List[str] = []
+    for item in out:
+        if item not in seen:
+            uniq.append(item)
+            seen.add(item)
+    return uniq
+
+
+def find_status_json() -> Optional[str]:
+    for path in candidate_status_paths():
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def read_status_json(path: Optional[str] = None) -> Tuple[Dict[str, Any], str]:
+    if not path:
+        path = find_status_json()
+    if not path:
+        raise FileNotFoundError(
+            "Could not find Status.json automatically. Expected Windows path like:\n"
+            r"C:\Users\<you>\Saved Games\Frontier Developments\Elite Dangerous\Status.json"
+        )
+    with open(path, "r", encoding="utf-8-sig") as f:
+        raw = f.read().strip()
+    if not raw:
+        raise ValueError(f"Status.json is empty: {path}")
+    # Elite writes a single JSON object. If there are accidental extra lines, use the last non-empty one.
+    if "\n" in raw:
+        raw = [line for line in raw.splitlines() if line.strip()][-1]
+    data = json.loads(raw)
+    return data, path
+
+
+def write_observations_csv(path: str, observations: List[Observation]) -> None:
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=["timestamp_utc", "lat", "lon", "observation", "elevation", "heading", "quality", "note"],
+        )
+        writer.writeheader()
+        for obs in observations:
+            writer.writerow(
+                {
+                    "timestamp_utc": format_utc(obs.timestamp_utc).replace("T", " "),
+                    "lat": f"{obs.lat:.8f}",
+                    "lon": f"{obs.lon:.8f}",
+                    "observation": obs.observation,
+                    "elevation": "" if obs.elevation is None else f"{obs.elevation:.4f}",
+                    "heading": "" if obs.heading is None else f"{obs.heading:.2f}",
+                    "quality": obs.quality,
+                    "note": obs.note,
+                }
+            )

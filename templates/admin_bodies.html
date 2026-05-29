@@ -1,0 +1,34 @@
+{% extends "admin_base.html" %}
+{% block title %}Admin Models · Elite Day/Night{% endblock %}
+{% block content %}
+<section class="card">
+  <div class="split">
+    <div>
+      <h1>Models / refit</h1>
+      <p class="muted">Only bodies with observations are listed here.</p>
+    </div>
+    <a class="button" href="/control">Admin home</a>
+  </div>
+  {% if bodies %}
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>System</th><th>Body</th><th>Observations</th><th>Approved</th><th>Active fit</th><th>Actions</th></tr></thead>
+      <tbody>
+      {% for b in bodies %}
+        <tr>
+          <td>{{ b.system_name }}</td>
+          <td><b>{{ b.body_name }}</b><br><span class="muted">body id {{ b.body_pk }}</span></td>
+          <td>{{ b.observations }}</td>
+          <td>{{ b.approved }}</td>
+          <td>{% if b.active_fit_id %}#{{ b.active_fit_id }} / score {{ b.active_fit_score|num(3) }}{% else %}<span class="warn">none</span>{% endif %}</td>
+          <td><a class="button small" href="/control/bodies/{{ b.body_pk }}/fit">Open fit</a></td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+    <p class="muted">No bodies have observations yet.</p>
+  {% endif %}
+</section>
+{% endblock %}

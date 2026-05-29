@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}Import · Elite Day/Night{% endblock %}
+{% block content %}
+<section class="card narrow">
+  <h1>Import from Spansh</h1>
+  <p class="muted">Add a system/body from Spansh. The selected body will stay visible even before observations are added.</p>
+  <form method="post" action="/systems/import" class="stack-form">
+    <label>System name
+      <input required name="system_name" placeholder="Zeta Trianguli Australis">
+    </label>
+    <label>Body / planet / moon name
+      <input required name="body_name" placeholder="Full name or short name, e.g. A 7 a, 2 a, or 2a">
+    </label>
+    <small class="field-help">Short names are accepted when unambiguous. Example: for “Col 285 Sector XK-O d6-90 2 a”, you can enter “2 a” or “2a”.</small>
+    <label>System address / id64 optional
+      <input name="system_address" placeholder="Use this if name resolution fails">
+    </label>
+    <label class="check"><input type="checkbox" name="fetch_body_details" checked> Fetch body details</label>
+    <label class="check"><input type="checkbox" name="fit"> Fit immediately if approved observations already exist</label>
+    <button type="submit" class="primary">Import</button>
+  </form>
+</section>
+{% endblock %}

@@ -1,0 +1,194 @@
+{% extends "base.html" %}
+{% block title %}{{ body.name }} · Elite Day/Night{% endblock %}
+{% block content %}
+<section class="card">
+  <div class="split">
+    <div>
+      <h1>{{ body.name }}</h1>
+      <p class="muted">{{ body.system_name }} · {{ body.body_type }}{% if body.subtype %} / {{ body.subtype }}{% endif %}</p>
+    </div>
+    <a class="button" href="/systems/{{ body.system_id }}">Back to system</a>
+  </div>
+  <div class="facts">
+    <span>Landable: <b>{{ 'yes' if body.is_landable else 'no' }}</b></span>
+    <span>Tidally locked: <b>{{ 'yes' if body.is_tidally_locked else 'no' }}</b></span>
+    <span>Radius: <b>{{ body.radius_m|num(0) }} m</b></span>
+    <span>Gravity: <b>{{ body.gravity_ms2|num(3) }} m/s²</b></span>
+    <span>Rotation: <b>{{ body.rotation_period_s|duration }}</b></span>
+    <span>Orbit: <b>{{ body.orbital_period_s|duration }}</b></span>
+  </div>
+</section>
+
+<section class="body-layout">
+  <div class="body-main">
+    <section class="grid two">
+      <div class="card">
+        <h2>Prediction</h2>
+        {% if fit %}
+          <p class="muted">Using {{ 'provisional' if model_mode == 'provisional' else 'reviewed' }} model #{{ fit.id }} · score {{ fit.fit_score|num(3) }} · altitude RMS {{ fit.rms_altitude_deg|num(3) }}°</p>
+        {% else %}
+          <p class="warn">No {{ 'provisional' if model_mode == 'provisional' else 'reviewed' }} fit for this body yet. Add observations; after review and refit, predictions become available.</p>
+          {% if fit_error %}<p class="muted">{{ fit_error }}</p>{% endif %}
+        {% endif %}
+        {% set pending_obs = (body.observation_counts.get('new', 0) or 0) + (body.observation_counts.get('needs_check', 0) or 0) %}
+        {% if model_mode == 'provisional' %}
+          <div class="warn provisional-box">
+            <b>Provisional model:</b> this prediction includes unreviewed observations.
+            <p><a class="button small" href="/bodies/{{ body.id }}?lat={{ lat }}&lon={{ lon }}&time={{ target_time }}&prediction_hours={{ prediction_hours }}">Use reviewed model</a></p>
+          </div>
+        {% elif pending_obs > 0 %}
+          <div class="notice provisional-box">
+            <b>{{ pending_obs }}</b> unreviewed observation{{ '' if pending_obs == 1 else 's' }} waiting for this body.
+            <form method="post" action="/bodies/{{ body.id }}/provisional-refit" class="inline-form provisional-form">
+              <input type="hidden" name="lat" value="{{ lat }}">
+              <input type="hidden" name="lon" value="{{ lon }}">
+              <input type="hidden" name="target_time" value="{{ target_time }}">
+              <input type="hidden" name="prediction_hours" value="{{ prediction_hours }}">
+              <button type="submit" class="small">Try provisional model</button>
+            </form>
+            <small class="field-help">The normal page always uses reviewed data. This button lets you test approved + unreviewed observations without replacing the reviewed model.</small>
+          </div>
+        {% endif %}
+        {% if selected_poi %}
+          <div class="notice selected-poi-box">
+            <b>Selected POI:</b> {{ selected_poi.name }}<br>
+            <span class="muted">{{ selected_poi.lat|num(6) }}, {{ selected_poi.lon|num(6) }}</span>
+            {% if selected_poi.description %}
+              <p class="poi-description-text">{{ selected_poi.description }}</p>
+            {% endif %}
+          </div>
+        {% endif %}
+        <form class="stack-form" method="get" action="/bodies/{{ body.id }}">
+          <label>Latitude
+            <input required name="lat" type="number" step="0.000001" min="-90" max="90" value="{{ lat }}">
+          </label>
+          <label>Longitude
+            <input required name="lon" type="number" step="0.000001" min="-180" max="180" value="{{ lon }}">
+          </label>
+          <label>UTC time
+            <input required name="time" value="{{ target_time }}">
+          </label>
+          <label>Prediction window hours
+            <input name="prediction_hours" type="number" step="1" min="1" max="168" value="{{ prediction_hours }}">
+          </label>
+          {% if model_mode == 'provisional' %}<input type="hidden" name="model_mode" value="provisional">{% endif %}
+          <button type="submit" class="primary">Calculate</button>
+        </form>
+      </div>
+
+      <div class="card visual-card">
+        <h2>Local sun elevation</h2>
+        {% if prediction %}
+          <canvas id="sunCanvas" width="420" height="280" data-prediction='{{ prediction_json|safe }}'></canvas>
+          <div class="state-pill {{ prediction.centre_state|lower }}">{{ prediction.centre_state }}</div>
+          <div class="sun-trend trend-{{ prediction.sun_altitude_trend|replace(' ', '-') }}">
+            Sun is {{ prediction.sun_altitude_trend }}{% if prediction.sun_altitude_rate_deg_per_min is not none %} · {{ prediction.sun_altitude_rate_deg_per_min|num(4) }}°/min{% endif %}
+          </div>
+          <div id="countdown" class="countdown" data-prediction='{{ prediction_json|safe }}'>Loading timer…</div>
+        {% else %}
+          <div class="empty-visual">Enter latitude/longitude/time or select a POI to calculate.</div>
+        {% endif %}
+      </div>
+    </section>
+  </div>
+
+  <aside class="card poi-panel">
+    <h2>Points of Interest</h2>
+    {% if pois %}
+      <div class="poi-list">
+        {% for p in pois %}
+          <a class="poi-item {% if selected_poi and selected_poi.id == p.id %}active{% endif %}" href="/bodies/{{ body.id }}?poi={{ p.id }}&time={{ target_time }}&prediction_hours={{ prediction_hours }}{% if model_mode == 'provisional' %}&model_mode=provisional{% endif %}">
+            <strong>{{ p.name }}</strong>
+            <span>{{ p.lat|num(5) }}, {{ p.lon|num(5) }}</span>
+            {% if p.description %}<em>has description</em>{% endif %}
+          </a>
+        {% endfor %}
+      </div>
+    {% else %}
+      <p class="muted">No POIs have been added for this body yet.</p>
+    {% endif %}
+    <p class="field-help">Selecting a POI fills its coordinates and immediately calculates the local day/night prediction.</p>
+    {% if public_poi_submissions_enabled %}<p><a class="button small" href="/pois/submit?body_id={{ body.id }}">Submit POI for this body</a></p>{% endif %}
+  </aside>
+</section>
+
+{% if prediction %}
+<section class="card">
+  <h2>Result</h2>
+  {% if prediction.fit_uses_unverified_data %}<p class="warn"><b>Provisional model:</b> {{ prediction.fit_data_note }}</p>{% endif %}
+  {% if prediction.horizon_mode and prediction.horizon_mode != "normal" %}<p class="notice"><b>Horizon status:</b> {{ prediction.horizon_message }}{% if prediction.cycle_min_sun_altitude_deg is not none %}<br><span class="muted">Checked min/max sun altitude: {{ prediction.cycle_min_sun_altitude_deg|num(2) }}° / {{ prediction.cycle_max_sun_altitude_deg|num(2) }}°</span>{% endif %}</p>{% endif %}
+  <div class="result-grid">
+    <div><span>Sun altitude</span><strong>{{ prediction.sun_altitude_deg|num(2) }}°</strong><em>{{ prediction.sun_altitude_trend }}</em></div>
+    <div><span>Sun heading</span><strong>{{ prediction.sun_heading_deg|num(2) }}°</strong></div>
+    <div><span>Next sunrise</span><strong>{{ prediction.next_sunrise_utc|dash }}</strong><em>{{ prediction.next_sunrise_seconds|duration }}</em></div>
+    <div><span>Next sunset</span><strong>{{ prediction.next_sunset_utc|dash }}</strong><em>{{ prediction.next_sunset_seconds|duration }}</em></div>
+    <div><span>Sunlight duration</span><strong>{{ prediction.sunlight_duration_sec|duration }}</strong></div>
+    <div><span>Day period</span><strong>{{ prediction.day_period_sec|duration }}</strong></div>
+  </div>
+  <h3>Upcoming horizon crossings</h3>
+  {% if prediction.crossings_extended_beyond_window %}<p class="muted">Some listed crossings are outside the selected {{ prediction.prediction_window_hours|num(0) }} h window so the next sun passes/day period can still be shown.</p>{% endif %}
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Kind</th><th>UTC time</th><th>From target</th></tr></thead>
+      <tbody>
+      {% for c in prediction.centre_horizon_crossings[:12] %}
+        <tr><td>{{ c.kind }}{% if not c.inside_prediction_window %} <span class="tag">later</span>{% endif %}</td><td>{{ c.time_utc }}</td><td>{{ c.seconds_from_target|duration }}</td></tr>
+      {% else %}
+        <tr><td colspan="3" class="muted">No horizon crossings found in the checked model period.</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endif %}
+
+<section class="card narrow">
+  <h2>Submit sun observation</h2>
+  <p class="muted">Submissions are saved as <b>new</b>. Please use the same observer name for future observations so reviewers can contact you if something looks wrong.</p>
+  <div class="help-box">
+    <b>Observation tips</b>
+    <ul>
+      <li>Use latitude and longitude from the in-game surface HUD.</li>
+      <li>Target the sun, aim at the centre of the targeted sun marker, and read the elevation value.</li>
+      <li>Positive altitude = above the horizon. Negative altitude = below the horizon. 0° = sunrise or sunset.</li>
+      <li>Only enter heading if you are pointing directly at the centre of the sun. If unsure, leave it empty.</li>
+    </ul>
+  </div>
+  <form method="post" action="/bodies/{{ body.id }}/observations" class="stack-form">
+    <label>Commander / observer name
+      <input required name="observer_name" minlength="2" maxlength="40" placeholder="CMDR or reviewer-recognizable name">
+    </label>
+    <label>UTC observation time
+      <input required id="observation-time" name="timestamp_utc" value="{{ target_time }}" data-live-utc-time="1">
+    </label>
+    <label class="check inline-check">
+      <input type="checkbox" id="live-observation-time" checked> Use live UTC time
+    </label>
+    <small class="field-help">When enabled, the observation time updates every second. Disable it to enter an older/manual time.</small>
+    <label>Latitude
+      <input required name="lat" type="number" step="0.000001" min="-90" max="90" value="{{ lat }}">
+    </label>
+    <label>Longitude
+      <input required name="lon" type="number" step="0.000001" min="-180" max="180" value="{{ lon }}">
+    </label>
+    <label>Sun altitude / elevation °
+      <input required name="elevation" type="number" step="0.01" min="-90" max="90" placeholder="34.0">
+    </label>
+    <label>Sun heading optional
+      <input name="heading" type="number" step="0.01" min="0" max="359.99" placeholder="leave empty if unsure">
+    </label>
+    <label>Quality
+      <select name="quality">
+        <option value="high">high</option>
+        <option value="medium" selected>medium</option>
+        <option value="low">low</option>
+      </select>
+      <small class="field-help">High = accurate, about ±1°. Medium = good estimate, about ±2–3°. Low = rough, about ±5° or worse.</small>
+    </label>
+    <label>Notes
+      <textarea name="note" rows="3" placeholder="screenshot link, horizon conditions, etc."></textarea>
+    </label>
+    <button type="submit" class="primary">Submit observation</button>
+  </form>
+</section>
+{% endblock %}
