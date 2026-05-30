@@ -34,19 +34,30 @@
         {% if model_mode == 'provisional' %}
           <div class="warn provisional-box">
             <b>Provisional model:</b> this prediction includes unreviewed observations.
-            <p><a class="button small" href="/bodies/{{ body.id }}?lat={{ lat }}&lon={{ lon }}&time={{ target_time }}&prediction_hours={{ prediction_hours }}">Use reviewed model</a></p>
+            <p><a class="button small" href="/bodies/{{ body.id }}?time={{ target_time }}&prediction_hours={{ prediction_hours }}{% if lat != '' and lon != '' %}&lat={{ lat }}&lon={{ lon }}{% endif %}">Use reviewed model</a></p>
           </div>
         {% elif pending_obs > 0 %}
           <div class="notice provisional-box">
             <b>{{ pending_obs }}</b> unreviewed observation{{ '' if pending_obs == 1 else 's' }} waiting for this body.
-            <form method="post" action="/bodies/{{ body.id }}/provisional-refit" class="inline-form provisional-form">
-              <input type="hidden" name="lat" value="{{ lat }}">
-              <input type="hidden" name="lon" value="{{ lon }}">
-              <input type="hidden" name="target_time" value="{{ target_time }}">
-              <input type="hidden" name="prediction_hours" value="{{ prediction_hours }}">
-              <button type="submit" class="small">Try provisional model</button>
-            </form>
-            <small class="field-help">The normal page always uses reviewed data. This button lets you test approved + unreviewed observations without replacing the reviewed model.</small>
+            {% if provisional_status and provisional_status.ready %}
+              <p><a class="button small" href="/bodies/{{ body.id }}?time={{ target_time }}&prediction_hours={{ prediction_hours }}{% if lat != '' and lon != '' %}&lat={{ lat }}&lon={{ lon }}{% endif %}&model_mode=provisional">View provisional model</a></p>
+              <small class="field-help">The provisional model is ready and includes approved + unreviewed observations. The normal page still uses reviewed data by default.</small>
+            {% elif provisional_status and provisional_status.latest_job and provisional_status.latest_job.status in ['queued', 'running'] %}
+              <p><b>Provisional model is being prepared in the background.</b></p>
+              <small class="field-help">You can continue using the reviewed model. Refresh this page shortly to view the provisional prediction when it is ready.</small>
+            {% elif provisional_status and provisional_status.latest_job and provisional_status.latest_job.status == 'failed' %}
+              <p class="warn"><b>Provisional fit failed:</b> {{ provisional_status.latest_job.error }}</p>
+              <form method="post" action="/bodies/{{ body.id }}/provisional-refit" class="inline-form provisional-form">
+                <input type="hidden" name="lat" value="{{ lat }}">
+                <input type="hidden" name="lon" value="{{ lon }}">
+                <input type="hidden" name="target_time" value="{{ target_time }}">
+                <input type="hidden" name="prediction_hours" value="{{ prediction_hours }}">
+                <button type="submit" class="small">Queue provisional model again</button>
+              </form>
+            {% else %}
+              <p><b>Provisional model will be prepared in the background.</b></p>
+              <small class="field-help">Refresh this page shortly to view the provisional prediction when it is ready.</small>
+            {% endif %}
           </div>
         {% endif %}
         {% if selected_poi %}
