@@ -61,7 +61,7 @@ PUBLIC_POI_SUBMISSIONS_ENABLED = env_bool("ELITE_DAYNIGHT_PUBLIC_POI_SUBMISSIONS
 
 app = FastAPI(
     title="Elite Dangerous Day/Night Calculator Website",
-    version="0.191",
+    version="0.194",
     docs_url=None,
     redoc_url=None,
     openapi_url=None,
@@ -323,14 +323,38 @@ async def system_detail(request: Request, system_id: int) -> HTMLResponse:
     )
 
 
+def parse_optional_query_float(value: Optional[str]) -> Optional[float]:
+    """Parse an optional float from query strings.
+
+    FastAPI returns a 422 before our route runs when an Optional[float] query
+    parameter is present as an empty string, for example ?lat=&lon=. Public
+    template links can legitimately have no selected coordinates yet, so accept
+    empty strings here and treat them as missing values.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    return float(text)
+
+
+def parse_prediction_hours(value: str) -> float:
+    try:
+        hours = float(str(value).strip() or "72")
+    except Exception:
+        hours = 72.0
+    return max(1.0, min(168.0, hours))
+
+
 @app.get("/bodies/{body_id}", response_class=HTMLResponse)
 async def body_detail(
     request: Request,
     body_id: int,
-    lat: Optional[float] = Query(None),
-    lon: Optional[float] = Query(None),
+    lat: Optional[str] = Query(None),
+    lon: Optional[str] = Query(None),
     time: str = Query(""),
-    prediction_hours: float = Query(72.0, ge=1.0, le=168.0),
+    prediction_hours: str = Query("72.0"),
     poi: Optional[int] = Query(None),
     model_mode: str = Query("approved"),
 ) -> HTMLResponse:
@@ -338,6 +362,9 @@ async def body_detail(
     poi_data = await api_request("GET", f"/api/bodies/{body_id}/pois", params={"public_only": True})
     pois = poi_data.get("results", [])
     selected_poi = None
+    lat_value = parse_optional_query_float(lat)
+    lon_value = parse_optional_query_float(lon)
+    prediction_hours_value = parse_prediction_hours(prediction_hours)
     if poi is not None:
         for item in pois:
             try:
@@ -347,11 +374,31 @@ async def body_detail(
             except Exception:
                 pass
         if selected_poi is not None:
-            lat = float(selected_poi["lat"])
-            lon = float(selected_poi["lon"])
+            lat_value = float(selected_poi["lat"])
+            lon_value = float(selected_poi["lon"])
     model_mode = (model_mode or "approved").strip().lower()
     if model_mode not in {"approved", "provisional"}:
         model_mode = "approved"
+
+    counts = body.get("observation_counts") or {}
+    pending_obs = int(counts.get("new", 0) or 0) + int(counts.get("needs_check", 0) or 0)
+    provisional_status = None
+    if pending_obs > 0 or model_mode == "provisional":
+        try:
+            # This queues a background provisional fit when needed, but returns
+            # immediately so slow Raspberry Pi fitting does not block the page.
+            provisional_status = await api_request(
+                "GET",
+                f"/api/bodies/{body_id}/provisional/status",
+                params={"auto_enqueue": True},
+            )
+        except ApiError as exc:
+            provisional_status = {"ready": False, "error": exc.detail}
+
+    if model_mode == "provisional" and not (provisional_status or {}).get("ready"):
+        # Always fall back to the reviewed model until the provisional fit is ready.
+        model_mode = "approved"
+
     prediction = None
     fit = None
     fit_error = None
@@ -360,11 +407,11 @@ async def body_detail(
     except ApiError as exc:
         fit_error = exc.detail
     target_time = time.strip() or now_utc_iso()
-    if lat is not None and lon is not None and fit is not None:
+    if lat_value is not None and lon_value is not None and fit is not None:
         prediction = await api_request(
             "GET",
             f"/api/bodies/{body_id}/prediction",
-            params={"lat": lat, "lon": lon, "time": target_time, "prediction_hours": prediction_hours, "model_mode": model_mode},
+            params={"lat": lat_value, "lon": lon_value, "time": target_time, "prediction_hours": prediction_hours_value, "model_mode": model_mode},
         )
     prediction_json = json.dumps(prediction or {}, ensure_ascii=False)
     return render(
@@ -376,13 +423,14 @@ async def body_detail(
             "fit_error": fit_error,
             "prediction": prediction,
             "prediction_json": prediction_json,
-            "lat": "" if lat is None else lat,
-            "lon": "" if lon is None else lon,
+            "lat": "" if lat_value is None else lat_value,
+            "lon": "" if lon_value is None else lon_value,
             "target_time": target_time,
-            "prediction_hours": prediction_hours,
+            "prediction_hours": prediction_hours_value,
             "pois": pois,
             "selected_poi": selected_poi,
             "model_mode": model_mode,
+            "provisional_status": provisional_status,
         },
     )
 
@@ -421,7 +469,7 @@ async def submit_observation(
     await api_request("POST", f"/api/bodies/{body_id}/observations", json_body=payload)
     # Keep the submitted coordinate as prediction coordinate after redirect.
     return RedirectResponse(
-        f"/bodies/{body_id}?lat={lat}&lon={lon}&time={timestamp_utc}&message=Observation%20submitted%20for%20review",
+        f"/bodies/{body_id}?lat={lat}&lon={lon}&time={timestamp_utc}&message=Observation%20submitted%20for%20review.%20Provisional%20model%20will%20be%20prepared%20in%20the%20background",
         status_code=303,
     )
 
@@ -436,17 +484,12 @@ async def public_provisional_refit(
     target_time: str = Form(""),
     prediction_hours: str = Form("72"),
 ) -> RedirectResponse:
-    """Create a provisional active fit from approved + unreviewed observations.
+    """Compatibility route: queue provisional fitting in the background.
 
-    This route is intentionally narrow: it cannot approve, reject, edit, or delete
-    data. It only lets users try a model that includes submitted but unreviewed
-    observations, and the public page shows a warning when that model is active.
-    A small per-body cooldown avoids accidental or malicious repeated refits.
+    Users no longer wait for fitting. The body page normally auto-queues this
+    when unreviewed observations exist, but this route remains safe if older
+    forms/bookmarks call it.
     """
-    body = await api_request("GET", f"/api/bodies/{body_id}")
-    counts = body.get("observation_counts") or {}
-    pending = int(counts.get("new", 0) or 0) + int(counts.get("needs_check", 0) or 0)
-
     query = {}
     if lat.strip():
         query["lat"] = lat.strip()
@@ -457,42 +500,17 @@ async def public_provisional_refit(
     if prediction_hours.strip():
         query["prediction_hours"] = prediction_hours.strip()
 
-    if pending <= 0:
-        query["message"] = "No new or needs-check observations are waiting for this body"
-        return RedirectResponse(f"/bodies/{body_id}?{urlencode(query)}", status_code=303)
-
-    now = _time.time()
-    last = PUBLIC_REFIT_LAST_RUN.get(body_id, 0.0)
-    wait = int(PUBLIC_REFIT_COOLDOWN_SECONDS - (now - last))
-    if wait > 0:
-        query["message"] = f"Please wait {wait} seconds before running another provisional refit"
-        return RedirectResponse(f"/bodies/{body_id}?{urlencode(query)}", status_code=303)
-
-    # Reuse the current fit settings where available; otherwise use safe defaults.
-    use_heading = False
-    time_weighting = False
     try:
-        fit = await api_request("GET", f"/api/bodies/{body_id}/fit", params={"include_residuals": False})
-        use_heading = bool(fit.get("use_heading"))
-        time_weighting = bool(fit.get("time_weighting"))
-    except ApiError:
-        pass
-
-    query["model_mode"] = "provisional"
-
-    payload = {
-        "use_heading": use_heading,
-        "time_weighting": time_weighting,
-        "time_half_life_hours": 24.0,
-        "include_unreviewed": True,
-        "force_refit": False,
-    }
-    result = await api_request("POST", f"/api/admin/bodies/{body_id}/refit", json_body=payload)
-    PUBLIC_REFIT_LAST_RUN[body_id] = now
-    fit_id = result.get("id", "")
-    query["message"] = f"Provisional model ready from approved + unreviewed observations"
-    if fit_id:
-        query["message"] += f" (fit #{fit_id})"
+        result = await api_request("POST", f"/api/bodies/{body_id}/provisional/ensure", params={"reason": "public_request"})
+        if result.get("ready"):
+            query["model_mode"] = "provisional"
+            query["message"] = "Provisional model is ready"
+        elif result.get("queued") or result.get("job_id"):
+            query["message"] = "Provisional model is being prepared in the background"
+        else:
+            query["message"] = "Provisional model is not available yet"
+    except ApiError as exc:
+        query["message"] = f"Could not prepare provisional model: {exc.detail}"
     return RedirectResponse(f"/bodies/{body_id}?{urlencode(query)}", status_code=303)
 
 
