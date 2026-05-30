@@ -18,6 +18,7 @@ import json
 import sqlite3
 import threading
 import time
+import queue
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Query
@@ -47,13 +48,22 @@ DB_WRITE_RETRIES = int(os.environ.get("ELITE_DAYNIGHT_DB_WRITE_RETRIES", "5"))
 DB_WRITE_RETRY_BASE_SECONDS = float(os.environ.get("ELITE_DAYNIGHT_DB_WRITE_RETRY_BASE_SECONDS", "0.08"))
 
 WRITE_LOCK = threading.RLock()
+
+# Background provisional fitting keeps slow Raspberry Pi CPUs from making users
+# wait after submitting an observation. One worker processes provisional fit jobs
+# sequentially. The reviewed model remains the default public model.
+PROVISIONAL_FIT_QUEUE: "queue.Queue[tuple[int, int, str]]" = queue.Queue()
+PROVISIONAL_JOB_LOCK = threading.RLock()
+PROVISIONAL_JOB_STATE: Dict[int, Dict[str, Any]] = {}
+PROVISIONAL_WORKER_STARTED = False
+
 ALLOWED_REVIEW = {"new", "approved", "rejected", "needs_check", "corrected"}
 ALLOWED_OBSERVATIONS = {"sunrise", "sunset", "horizon", "rise", "set", "elevation", "altitude", "sun_altitude", "alt", "day", "night"}
 ALLOWED_QUALITY = {"high", "medium", "low"}
 
 app = FastAPI(
     title="Elite Dangerous Day/Night Calculator API",
-    version="0.191",
+    version="0.194",
     description="Local-first API for systems, bodies, observations, fitting and prediction.",
 )
 
@@ -70,6 +80,7 @@ app.add_middleware(
 @app.on_event("startup")
 def startup_database_hardening() -> None:
     initialize_database_runtime()
+    start_provisional_fit_worker()
 
 
 # ------------------------------ request models ------------------------------
@@ -289,6 +300,24 @@ def ensure_runtime_migrations(con: sqlite3.Connection) -> None:
     con.execute("CREATE INDEX IF NOT EXISTS idx_audit_log_entity ON audit_log(entity_type, entity_id)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_audit_log_actor ON audit_log(actor)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_audit_log_action ON audit_log(action)")
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS background_fit_jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            body_id INTEGER NOT NULL REFERENCES bodies(id) ON DELETE CASCADE,
+            fit_mode TEXT NOT NULL DEFAULT 'provisional',
+            status TEXT NOT NULL DEFAULT 'queued',
+            reason TEXT,
+            requested_at_utc TEXT NOT NULL,
+            started_at_utc TEXT,
+            finished_at_utc TEXT,
+            fit_id INTEGER REFERENCES fits(id) ON DELETE SET NULL,
+            error TEXT
+        )
+        """
+    )
+    con.execute("CREATE INDEX IF NOT EXISTS idx_background_fit_jobs_body_created ON background_fit_jobs(body_id, requested_at_utc DESC)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_background_fit_jobs_status ON background_fit_jobs(status)")
 
 
 def connect() -> sqlite3.Connection:
@@ -514,13 +543,203 @@ def insert_audit(con: sqlite3.Connection, entity_type: str, entity_id: int, acti
     )
 
 
+def current_provisional_settings(con: sqlite3.Connection, body_id: int) -> Dict[str, Any]:
+    """Reuse reviewed-model settings for provisional background fits."""
+    fit = con.execute(
+        """
+        SELECT use_heading, time_weighting
+          FROM fits
+         WHERE body_id = ? AND fit_mode = 'approved' AND is_active = 1 AND fit_status = 'ok'
+         ORDER BY id DESC LIMIT 1
+        """,
+        (body_id,),
+    ).fetchone()
+    return {
+        "use_heading": bool(fit["use_heading"]) if fit else False,
+        "time_weighting": bool(fit["time_weighting"]) if fit else False,
+        "time_half_life_hours": 24.0,
+    }
+
+
+def provisional_fingerprint(con: sqlite3.Connection, body_id: int, settings: Optional[Dict[str, Any]] = None) -> str:
+    if settings is None:
+        settings = current_provisional_settings(con, body_id)
+    return dbmod.observation_fingerprint_for_body(
+        con,
+        body_id,
+        include_unreviewed=True,
+        use_heading=bool(settings.get("use_heading", False)),
+        time_weighting=bool(settings.get("time_weighting", False)),
+        time_half_life_hours=float(settings.get("time_half_life_hours", 24.0)),
+    )
+
+
+def provisional_fit_ready(con: sqlite3.Connection, body_id: int, settings: Optional[Dict[str, Any]] = None) -> tuple[bool, Optional[sqlite3.Row], Optional[str]]:
+    fp = provisional_fingerprint(con, body_id, settings)
+    fit = con.execute(
+        """
+        SELECT * FROM fits
+         WHERE body_id = ? AND fit_mode = 'provisional' AND is_active = 1 AND fit_status = 'ok'
+         ORDER BY id DESC LIMIT 1
+        """,
+        (body_id,),
+    ).fetchone()
+    ready = bool(fit and fit["observation_fingerprint"] == fp)
+    return ready, fit, fp
+
+
+def pending_unreviewed_count(con: sqlite3.Connection, body_id: int) -> int:
+    row = con.execute(
+        """
+        SELECT COUNT(*) AS c
+          FROM observations
+         WHERE body_id = ? AND review_status IN ('new','needs_check') AND target_type = 'sun'
+        """,
+        (body_id,),
+    ).fetchone()
+    return int(row["c"] if row else 0)
+
+
+def create_background_job_row(body_id: int, reason: str) -> int:
+    with WRITE_LOCK:
+        con = connect_write()
+        try:
+            now = dbmod.utc_now()
+            cur = con.execute(
+                """
+                INSERT INTO background_fit_jobs(body_id, fit_mode, status, reason, requested_at_utc)
+                VALUES (?, 'provisional', 'queued', ?, ?)
+                """,
+                (body_id, reason, now),
+            )
+            job_id = int(cur.lastrowid)
+            insert_audit(con, "background_fit_job", job_id, "queue_provisional_fit", None, {"body_id": body_id, "reason": reason}, "api")
+            con.commit()
+            return job_id
+        finally:
+            con.close()
+
+
+def update_background_job(job_id: int, status: str, fit_id: Optional[int] = None, error: Optional[str] = None, started: bool = False, finished: bool = False) -> None:
+    with WRITE_LOCK:
+        con = connect_write()
+        try:
+            parts = ["status = ?"]
+            params: List[Any] = [status]
+            if started:
+                parts.append("started_at_utc = ?")
+                params.append(dbmod.utc_now())
+            if finished:
+                parts.append("finished_at_utc = ?")
+                params.append(dbmod.utc_now())
+            if fit_id is not None:
+                parts.append("fit_id = ?")
+                params.append(fit_id)
+            if error is not None:
+                parts.append("error = ?")
+                params.append(error[:2000])
+            params.append(job_id)
+            con.execute(f"UPDATE background_fit_jobs SET {', '.join(parts)} WHERE id = ?", params)
+            con.commit()
+        finally:
+            con.close()
+
+
+def enqueue_provisional_fit(body_id: int, reason: str = "observation_submitted") -> Dict[str, Any]:
+    """Queue a background provisional fit if the current one is missing/outdated."""
+    con = connect()
+    try:
+        get_body_row_or_404(con, body_id)
+        pending = pending_unreviewed_count(con, body_id)
+        settings = current_provisional_settings(con, body_id)
+        ready, fit, fp = provisional_fit_ready(con, body_id, settings)
+    finally:
+        con.close()
+
+    if pending <= 0:
+        return {"queued": False, "reason": "no_pending_observations", "ready": ready, "fit_id": None if fit is None else int(fit["id"])}
+    if ready:
+        return {"queued": False, "reason": "already_ready", "ready": True, "fit_id": int(fit["id"])}
+
+    with PROVISIONAL_JOB_LOCK:
+        state = PROVISIONAL_JOB_STATE.get(body_id)
+        if state and state.get("state") in {"queued", "running"}:
+            state["rerun_requested"] = True
+            return {"queued": False, "reason": "already_queued", "ready": False, "job_state": state.get("state"), "job_id": state.get("job_id")}
+        job_id = create_background_job_row(body_id, reason)
+        PROVISIONAL_JOB_STATE[body_id] = {"state": "queued", "job_id": job_id, "rerun_requested": False, "last_error": None}
+        PROVISIONAL_FIT_QUEUE.put((body_id, job_id, reason))
+        return {"queued": True, "reason": reason, "ready": False, "job_id": job_id}
+
+
+def provisional_fit_worker() -> None:
+    while True:
+        body_id, job_id, reason = PROVISIONAL_FIT_QUEUE.get()
+        try:
+            while True:
+                with PROVISIONAL_JOB_LOCK:
+                    PROVISIONAL_JOB_STATE[body_id] = {"state": "running", "job_id": job_id, "rerun_requested": False, "last_error": None}
+                update_background_job(job_id, "running", started=True)
+                try:
+                    con = connect()
+                    try:
+                        body = get_body_row_or_404(con, body_id)
+                        system_name = body["system_name"]
+                        body_name = body["name"]
+                        settings = current_provisional_settings(con, body_id)
+                    finally:
+                        con.close()
+                    fit_id = dbmod.fit_body(
+                        DB_PATH,
+                        system_name,
+                        body_name,
+                        bool(settings.get("use_heading", False)),
+                        bool(settings.get("time_weighting", False)),
+                        float(settings.get("time_half_life_hours", 24.0)),
+                        include_unreviewed=True,
+                        force_refit=False,
+                    )
+                    update_background_job(job_id, "done", fit_id=int(fit_id), finished=True)
+                    with PROVISIONAL_JOB_LOCK:
+                        rerun = bool(PROVISIONAL_JOB_STATE.get(body_id, {}).get("rerun_requested"))
+                    if rerun:
+                        job_id = create_background_job_row(body_id, "rerun_after_new_observation")
+                        continue
+                    with PROVISIONAL_JOB_LOCK:
+                        PROVISIONAL_JOB_STATE[body_id] = {"state": "idle", "job_id": job_id, "rerun_requested": False, "last_error": None}
+                    break
+                except Exception as exc:
+                    err = str(exc)
+                    update_background_job(job_id, "failed", error=err, finished=True)
+                    with PROVISIONAL_JOB_LOCK:
+                        rerun = bool(PROVISIONAL_JOB_STATE.get(body_id, {}).get("rerun_requested"))
+                    if rerun:
+                        job_id = create_background_job_row(body_id, "rerun_after_failed_job")
+                        continue
+                    with PROVISIONAL_JOB_LOCK:
+                        PROVISIONAL_JOB_STATE[body_id] = {"state": "failed", "job_id": job_id, "rerun_requested": False, "last_error": err}
+                    break
+        finally:
+            PROVISIONAL_FIT_QUEUE.task_done()
+
+
+def start_provisional_fit_worker() -> None:
+    global PROVISIONAL_WORKER_STARTED
+    with PROVISIONAL_JOB_LOCK:
+        if PROVISIONAL_WORKER_STARTED:
+            return
+        t = threading.Thread(target=provisional_fit_worker, name="provisional-fit-worker", daemon=True)
+        t.start()
+        PROVISIONAL_WORKER_STARTED = True
+
+
 # ------------------------------ endpoints ------------------------------
 
 @app.get("/")
 def root() -> Dict[str, Any]:
     return {
         "name": "Elite Dangerous Day/Night Calculator API",
-        "version": "0.191",
+        "version": "0.194",
         "db_path": DB_PATH,
         "docs": "/docs",
     }
@@ -739,6 +958,66 @@ def get_body(body_id: int) -> Dict[str, Any]:
     return body
 
 
+@app.get("/api/bodies/{body_id}/provisional/status")
+def get_provisional_status(body_id: int, auto_enqueue: bool = False) -> Dict[str, Any]:
+    con = connect()
+    try:
+        get_body_row_or_404(con, body_id)
+        pending = pending_unreviewed_count(con, body_id)
+        settings = current_provisional_settings(con, body_id)
+        ready, fit, fp = provisional_fit_ready(con, body_id, settings)
+        latest_job = con.execute(
+            """
+            SELECT * FROM background_fit_jobs
+             WHERE body_id = ? AND fit_mode = 'provisional'
+             ORDER BY id DESC LIMIT 1
+            """,
+            (body_id,),
+        ).fetchone()
+    finally:
+        con.close()
+
+    queued_info: Optional[Dict[str, Any]] = None
+    if auto_enqueue and pending > 0 and not ready:
+        queued_info = enqueue_provisional_fit(body_id, "auto_prepare_on_status_check")
+        # Refresh latest job after queuing.
+        con = connect()
+        try:
+            latest_job = con.execute(
+                """
+                SELECT * FROM background_fit_jobs
+                 WHERE body_id = ? AND fit_mode = 'provisional'
+                 ORDER BY id DESC LIMIT 1
+                """,
+                (body_id,),
+            ).fetchone()
+        finally:
+            con.close()
+
+    with PROVISIONAL_JOB_LOCK:
+        memory_state = dict(PROVISIONAL_JOB_STATE.get(body_id, {}))
+
+    return {
+        "body_id": body_id,
+        "pending_unreviewed_count": pending,
+        "ready": ready,
+        "fit_id": None if fit is None else int(fit["id"]),
+        "fit_score": None if fit is None else fit["fit_score"],
+        "observation_fingerprint": fp,
+        "active_fit_fingerprint": None if fit is None else fit["observation_fingerprint"],
+        "settings": settings,
+        "latest_job": None if latest_job is None else row_to_dict(latest_job),
+        "memory_state": memory_state,
+        "enqueue_result": queued_info,
+    }
+
+
+@app.post("/api/bodies/{body_id}/provisional/ensure")
+def ensure_provisional_fit(body_id: int, reason: str = "manual_request") -> Dict[str, Any]:
+    get_body_id = body_id  # keeps FastAPI docs readable while avoiding accidental shadowing later
+    return enqueue_provisional_fit(get_body_id, reason)
+
+
 @app.get("/api/bodies/{body_id}/fit")
 def get_fit(body_id: int, include_residuals: bool = True, model_mode: str = "approved") -> Dict[str, Any]:
     con = connect()
@@ -842,13 +1121,21 @@ def add_observation(body_id: int, req: ObservationCreate) -> Dict[str, Any]:
                 """,
                 (ohash,),
             ).fetchone()
-            insert_audit(con, "observation", int(row["id"]), "api_upsert_observation", None, observation_public_dict(row), req.observer_name or "api")
+            public_row = observation_public_dict(row)
+            insert_audit(con, "observation", int(row["id"]), "api_upsert_observation", None, public_row, req.observer_name or "api")
             con.commit()
-            return observation_public_dict(row)
         except sqlite3.OperationalError as exc:
             raise http_error_from_exception(exc)
         finally:
             con.close()
+
+    # Do not make the submitter wait for a slow Raspberry Pi fit. Queue the
+    # provisional model in the background; reviewed model remains the default.
+    try:
+        public_row["provisional_job"] = enqueue_provisional_fit(body_id, "observation_submitted")
+    except Exception as exc:
+        public_row["provisional_job"] = {"queued": False, "error": str(exc)}
+    return public_row
 
 
 @app.get("/api/bodies/{body_id}/pois")
