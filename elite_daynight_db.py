@@ -1284,6 +1284,10 @@ def fit_body(
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA foreign_keys = ON")
     ensure_fit_mode_columns(con)
+    # ensure_fit_mode_columns() may run ALTER/UPDATE statements for older DBs.
+    # Commit that migration work before the later explicit BEGIN IMMEDIATE,
+    # otherwise SQLite can raise: "cannot start a transaction within a transaction".
+    con.commit()
     system_id, body_pk = lookup_system_body(con, system_name, body_name)
     system, body = raw_system_and_body(con, system_id, body_pk)
     fit_mode = fit_mode_from_include_unreviewed(include_unreviewed)
