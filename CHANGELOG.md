@@ -1,6 +1,17 @@
 # Changelog
 
-## V0.191
+## V0.194
+
+- Fixed the body page failing with HTTP 422 when the provisional-model link was clicked before latitude/longitude were selected.
+- The body route now treats empty `lat`/`lon` query parameters as missing values instead of invalid floats.
+- The reviewed/provisional model links no longer add empty coordinate parameters.
+
+## V0.192
+
+- Fixed provisional/refit failure on existing databases: `cannot start a transaction within a transaction`.
+- No database migration needed; existing V0.191 databases can be reused.
+
+## V0.192
 
 Clean naming pass before publishing to GitHub.
 
