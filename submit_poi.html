@@ -1,0 +1,20 @@
+{% extends "admin_base.html" %}
+{% block title %}Change Password · Elite Day/Night{% endblock %}
+{% block content %}
+<section class="card narrow">
+  <h1>Change password</h1>
+  {% if bad_message %}<div class="notice danger-note">{{ bad_message }}</div>{% endif %}
+  <form class="stack-form" method="post" action="/control/account/password">
+    <label>Current password
+      <input type="password" name="current_password" required autofocus>
+    </label>
+    <label>New password
+      <input type="password" name="new_password" minlength="8" required>
+    </label>
+    <label>Confirm new password
+      <input type="password" name="confirm_password" minlength="8" required>
+    </label>
+    <button class="primary" type="submit">Change password</button>
+  </form>
+</section>
+{% endblock %}

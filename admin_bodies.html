@@ -1,0 +1,54 @@
+{% extends "admin_base.html" %}
+{% block title %}Admin · Elite Day/Night{% endblock %}
+{% block content %}
+<section class="card">
+  <div class="split">
+    <div>
+      <h1>Admin dashboard</h1>
+      <p class="muted">Review observations first. Approved observations are used only after a manual refit.</p>
+    </div>
+    <form method="post" action="/control/logout">
+      <button type="submit">Log out</button>
+    </form>
+  </div>
+  <div class="stats">
+    <div><strong>{{ summary.counts.systems }}</strong><span>systems</span></div>
+    <div><strong>{{ summary.bodies_with_observations|length }}</strong><span>bodies with observations</span></div>
+    <div><strong>{{ summary.counts.observations }}</strong><span>observations</span></div>
+    <div><strong>{{ summary.counts.fits }}</strong><span>fits</span></div>
+  </div>
+  <p class="actions-row">
+    <a class="button primary" href="/control/observations?status=new">Review new observations</a>
+    <a class="button" href="/control/observations?status=approved">Approved observations</a>
+    <a class="button" href="/control/bodies">Models / refit</a>
+    <a class="button" href="/control/account/password">Change password</a>
+    {% if is_super_admin %}<a class="button" href="/control/users">Manage users</a>{% endif %}
+  </p>
+</section>
+
+<section class="card">
+  <h2>Newest unreviewed observations</h2>
+  {% if new_observations %}
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>ID</th><th>Body</th><th>Time</th><th>Lat/Lon</th><th>Alt/Head</th><th>Quality</th><th>Actions</th></tr></thead>
+      <tbody>
+      {% for o in new_observations %}
+        <tr>
+          <td>#{{ o.id }}</td>
+          <td>{{ o.system_name }}<br><b>{{ o.body_name }}</b></td>
+          <td>{{ o.timestamp_utc }}</td>
+          <td>{{ o.lat|num(5) }}, {{ o.lon|num(5) }}</td>
+          <td>{{ o.elevation|dash }}° / {{ o.heading|dash }}°</td>
+          <td>{{ o.quality }}</td>
+          <td><a class="button small" href="/control/observations/{{ o.id }}/edit">Open</a></td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="muted">No new observations waiting for review.</p>
+  {% endif %}
+</section>
+{% endblock %}

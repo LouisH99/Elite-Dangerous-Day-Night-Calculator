@@ -1,0 +1,124 @@
+{% extends "admin_base.html" %}
+{% block title %}Admin Observations · Elite Day/Night{% endblock %}
+{% block content %}
+<section class="card">
+  <div class="split">
+    <div>
+      <h1>Observations</h1>
+      <p class="muted">Review datapoints, find observations by system/body/submitter, and compare each row against stored fit residuals.</p>
+    </div>
+    <a class="button" href="/control">Admin home</a>
+  </div>
+  <form class="inline-form wrap" method="get" action="/control/observations">
+    <label>Status
+      <select name="status">
+        {% for s in ['new','approved','needs_check','rejected','corrected','all'] %}
+          <option value="{{ s }}" {% if status == s %}selected{% endif %}>{{ s }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>System
+      <input name="system_name" value="{{ system_name }}" placeholder="optional, e.g. Nyamad">
+    </label>
+    <label>Body / planet
+      <input name="body_name" value="{{ body_name }}" placeholder="optional, e.g. C 1 or 2 a">
+    </label>
+    <label>Submitter
+      <input name="observer_name" value="{{ observer_name }}" placeholder="optional name">
+    </label>
+    <label>Limit
+      <input name="limit" type="number" min="1" max="500" value="{{ limit }}">
+    </label>
+    <button type="submit">Filter</button>
+  </form>
+</section>
+
+<section class="card wide-card">
+  {% if observations %}
+  <div class="table-wrap">
+    <table class="dense admin-review-table">
+      <thead>
+        <tr>
+          <th>ID</th>
+          <th>Status</th>
+          <th>System / body</th>
+          <th>Submitter</th>
+          <th>Time</th>
+          <th>Lat/Lon</th>
+          <th>Obs</th>
+          <th>Alt/Head</th>
+          <th>Quality</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for o in observations %}
+      <tr class="review-main-row {% if o.approved_altitude_error_deg is not none and (o.approved_altitude_error_deg|abs) > 5 %}bad-row{% endif %}">
+        <td>#{{ o.id }}</td>
+        <td><span class="badge {{ o.review_status|review_badge }}">{{ o.review_status }}</span></td>
+        <td>{{ o.system_name }}<br><b>{{ o.body_name }}</b></td>
+        <td>{{ o.observer_name|dash }}</td>
+        <td>{{ o.timestamp_utc }}<br><span class="muted">submitted {{ o.created_at_utc }}</span></td>
+        <td>{{ o.lat|num(5) }}<br>{{ o.lon|num(5) }}</td>
+        <td>{{ o.observation }}</td>
+        <td>{{ o.elevation|dash }}°<br>{{ o.heading|dash }}°</td>
+        <td>{{ o.quality }}</td>
+        <td class="action-cell">
+          <a class="button small" href="/control/observations/{{ o.id }}/edit">Edit</a>
+          <form method="post" action="/control/observations/{{ o.id }}/review">
+            <input type="hidden" name="next_url" value="/control/observations?{{ filter_qs }}">
+            <input type="hidden" name="review_status" value="approved">
+            <button class="small ok-btn" type="submit">Approve</button>
+          </form>
+          <form method="post" action="/control/observations/{{ o.id }}/review">
+            <input type="hidden" name="next_url" value="/control/observations?{{ filter_qs }}">
+            <input type="hidden" name="review_status" value="needs_check">
+            <button class="small" type="submit">Needs check</button>
+          </form>
+          <form method="post" action="/control/observations/{{ o.id }}/review">
+            <input type="hidden" name="next_url" value="/control/observations?{{ filter_qs }}">
+            <input type="hidden" name="review_status" value="rejected">
+            <button class="small danger-btn" type="submit">Reject</button>
+          </form>
+        </td>
+      </tr>
+      <tr class="review-detail-row {% if o.approved_altitude_error_deg is not none and (o.approved_altitude_error_deg|abs) > 5 %}bad-row{% endif %}">
+        <td colspan="10">
+          <div class="review-detail-grid">
+            <div class="residual-detail">
+              <b>Fit residuals</b>
+              <p>
+                {% if o.approved_fit_id %}
+                  <span class="muted">reviewed #{{ o.approved_fit_id }}</span> — alt {{ o.approved_altitude_error_deg|num(3) }}°{% if o.approved_heading_error_deg is not none %}, head {{ o.approved_heading_error_deg|num(3) }}°{% endif %}
+                {% else %}
+                  <span class="muted">reviewed —</span>
+                {% endif %}
+              </p>
+              <p>
+                {% if o.provisional_fit_id %}
+                  <span class="muted">provisional #{{ o.provisional_fit_id }}</span> — alt {{ o.provisional_altitude_error_deg|num(3) }}°{% if o.provisional_heading_error_deg is not none %}, head {{ o.provisional_heading_error_deg|num(3) }}°{% endif %}
+                {% else %}
+                  <span class="muted">provisional —</span>
+                {% endif %}
+              </p>
+            </div>
+            <div class="note-detail">
+              <b>Note</b>
+              <p>{{ o.note|dash }}</p>
+            </div>
+          </div>
+        </td>
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <div class="pager">
+    {% if offset > 0 %}<a class="button" href="/control/observations?{{ base_filter_qs }}&offset={{ [offset-limit, 0]|max }}">Previous</a>{% endif %}
+    <a class="button" href="/control/observations?{{ base_filter_qs }}&offset={{ offset+limit }}">Next</a>
+  </div>
+  {% else %}
+  <p class="muted">No observations match this filter.</p>
+  {% endif %}
+</section>
+{% endblock %}
