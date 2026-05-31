@@ -61,7 +61,7 @@ PUBLIC_POI_SUBMISSIONS_ENABLED = env_bool("ELITE_DAYNIGHT_PUBLIC_POI_SUBMISSIONS
 
 app = FastAPI(
     title="Elite Dangerous Day/Night Calculator Website",
-    version="0.194",
+    version="0.198",
     docs_url=None,
     redoc_url=None,
     openapi_url=None,
@@ -1182,6 +1182,37 @@ async def admin_delete_observation(request: Request, observation_id: int):
 
 
 
+@app.get("/control/racing", response_class=HTMLResponse)
+async def admin_racing_import_page(request: Request, limit: int = Query(25, ge=1, le=200), preview: str = Query("")):
+    if not admin_logged_in(request):
+        return admin_redirect(request)
+    results = None
+    if preview:
+        results = await api_request("GET", "/api/admin/racing/preview", params={"limit": limit})
+    return render(request, "admin_racing_import.html", {"limit": limit, "preview": preview, "results": None if results is None else results.get("results", [])})
+
+
+@app.post("/control/racing/import")
+async def admin_racing_import_submit(
+    request: Request,
+    limit: int = Form(100),
+    import_missing_systems: str = Form(""),
+    review_status: str = Form("needs_check"),
+    make_public: str = Form(""),
+):
+    if not admin_logged_in(request):
+        return admin_redirect(request)
+    payload = {
+        "limit": int(limit),
+        "import_missing_systems": bool(import_missing_systems),
+        "review_status": review_status.strip().lower(),
+        "make_public": bool(make_public),
+        "actor": request.session.get("admin_user", "control-admin"),
+    }
+    result = await api_request("POST", "/api/admin/racing/import", json_body=payload)
+    return render(request, "admin_racing_result.html", {"result": result})
+
+
 @app.get("/control/pois", response_class=HTMLResponse)
 async def admin_pois(request: Request, body_name: str = Query(""), review_status: str = Query("")):
     if not admin_logged_in(request):
@@ -1308,7 +1339,23 @@ async def admin_body_fit(request: Request, body_id: int):
         provisional_fit = await api_request("GET", f"/api/bodies/{body_id}/fit", params={"include_residuals": True, "model_mode": "provisional"})
     except ApiError as exc:
         provisional_fit_error = exc.detail
-    return render(request, "admin_body_fit.html", {"body": body, "approved_fit": approved_fit, "approved_fit_error": approved_fit_error, "provisional_fit": provisional_fit, "provisional_fit_error": provisional_fit_error})
+    fit_jobs = {"results": []}
+    try:
+        fit_jobs = await api_request("GET", f"/api/admin/bodies/{body_id}/fit-jobs", params={"limit": 8})
+    except ApiError:
+        fit_jobs = {"results": []}
+    fit_job_rows = fit_jobs.get("results", [])
+    fit_jobs_active = any(str(j.get("status", "")).lower() in {"queued", "running"} for j in fit_job_rows)
+    return render(request, "admin_body_fit.html", {
+        "body": body,
+        "approved_fit": approved_fit,
+        "approved_fit_error": approved_fit_error,
+        "provisional_fit": provisional_fit,
+        "provisional_fit_error": provisional_fit_error,
+        "fit_jobs": fit_job_rows,
+        "fit_jobs_active": fit_jobs_active,
+        "fit_refresh_seconds": int(os.getenv("ELITE_DAYNIGHT_ADMIN_FIT_REFRESH_SECONDS", "5")),
+    })
 
 
 @app.post("/control/bodies/{body_id}/refit")
@@ -1329,9 +1376,11 @@ async def admin_refit_body(
         "time_half_life_hours": time_half_life_hours,
         "include_unreviewed": bool(include_unreviewed),
         "force_refit": True,
+        "background": True,
+        "actor": request.session.get("admin_user", "control-super"),
     }
     await api_request("POST", f"/api/admin/bodies/{body_id}/refit", json_body=payload)
-    return RedirectResponse(f"/control/bodies/{body_id}/fit?message=Refit%20complete", status_code=303)
+    return RedirectResponse(f"/control/bodies/{body_id}/fit?message=Fit%20queued.%20Refresh%20this%20page%20to%20see%20progress.", status_code=303)
 
 
 @app.get("/about", response_class=HTMLResponse)

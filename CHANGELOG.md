@@ -31,4 +31,3 @@ Review workflow improvements.
 - Added observation filters by system, body, submitter, and review status.
 - Added submitter display to the observation review table.
 - Added reviewed/provisional residual columns next to observations.
-- Updated the admin observation API to support these filters and residual fields.

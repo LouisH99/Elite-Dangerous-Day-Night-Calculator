@@ -212,7 +212,7 @@ def http_get_json(url: str, timeout: float = 30.0, retries: int = 2, pause: floa
     last_error: Optional[BaseException] = None
     for attempt in range(retries + 1):
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "EliteDayNightDB/0.194"})
+            req = urllib.request.Request(url, headers={"User-Agent": "EliteDayNightDB/0.198"})
             with urllib.request.urlopen(req, timeout=timeout) as response:
                 raw = response.read().decode("utf-8")
                 return json.loads(raw)

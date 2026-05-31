@@ -53,7 +53,7 @@
   <h2>Existing and submitted POIs</h2>
   <div class="table-wrap">
     <table class="dense">
-      <thead><tr><th>POI</th><th>Body</th><th>Submitter</th><th>Coords</th><th>Status</th><th>Public</th><th>Description</th><th></th></tr></thead>
+      <thead><tr><th>POI</th><th>Body</th><th>Submitter</th><th>Coords</th><th>Status</th><th>Public</th><th>Source</th><th>Description</th><th></th></tr></thead>
       <tbody>
       {% for p in pois %}
         <tr>
@@ -63,6 +63,7 @@
           <td>{{ p.lat|num(6) }}, {{ p.lon|num(6) }}</td>
           <td><span class="badge {% if p.review_status == 'approved' %}badge-ok{% elif p.review_status in ['new','needs_check'] %}badge-warn{% else %}badge-muted{% endif %}">{{ p.review_status }}</span></td>
           <td>{{ 'yes' if p.is_public else 'no' }}</td>
+          <td>{{ p.source_label|dash }}{% if p.source_id %}<br><span class="muted">{{ p.source_id }}</span>{% endif %}</td>
           <td class="note-cell">{{ p.description }}</td>
           <td class="action-cell">
             {% if p.review_status != 'approved' %}
@@ -84,7 +85,7 @@
           </td>
         </tr>
       {% else %}
-        <tr><td colspan="8" class="muted">No POIs found.</td></tr>
+        <tr><td colspan="9" class="muted">No POIs found.</td></tr>
       {% endfor %}
       </tbody>
     </table>

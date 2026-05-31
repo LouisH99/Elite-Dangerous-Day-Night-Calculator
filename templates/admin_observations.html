@@ -33,10 +33,10 @@
   </form>
 </section>
 
-<section class="card">
+<section class="card wide-card">
   {% if observations %}
   <div class="table-wrap">
-    <table class="dense">
+    <table class="dense admin-review-table">
       <thead>
         <tr>
           <th>ID</th>
@@ -48,14 +48,12 @@
           <th>Obs</th>
           <th>Alt/Head</th>
           <th>Quality</th>
-          <th>Fit residuals</th>
-          <th>Note</th>
           <th>Actions</th>
         </tr>
       </thead>
       <tbody>
       {% for o in observations %}
-      <tr class="{% if o.approved_altitude_error_deg is not none and (o.approved_altitude_error_deg|abs) > 5 %}bad-row{% endif %}">
+      <tr class="review-main-row {% if o.approved_altitude_error_deg is not none and (o.approved_altitude_error_deg|abs) > 5 %}bad-row{% endif %}">
         <td>#{{ o.id }}</td>
         <td><span class="badge {{ o.review_status|review_badge }}">{{ o.review_status }}</span></td>
         <td>{{ o.system_name }}<br><b>{{ o.body_name }}</b></td>
@@ -65,22 +63,6 @@
         <td>{{ o.observation }}</td>
         <td>{{ o.elevation|dash }}°<br>{{ o.heading|dash }}°</td>
         <td>{{ o.quality }}</td>
-        <td class="residual-cell">
-          {% if o.approved_fit_id %}
-            <span class="muted">reviewed #{{ o.approved_fit_id }}</span><br>
-            alt {{ o.approved_altitude_error_deg|num(3) }}°{% if o.approved_heading_error_deg is not none %}, head {{ o.approved_heading_error_deg|num(3) }}°{% endif %}
-          {% else %}
-            <span class="muted">reviewed —</span>
-          {% endif %}
-          <br>
-          {% if o.provisional_fit_id %}
-            <span class="muted">provisional #{{ o.provisional_fit_id }}</span><br>
-            alt {{ o.provisional_altitude_error_deg|num(3) }}°{% if o.provisional_heading_error_deg is not none %}, head {{ o.provisional_heading_error_deg|num(3) }}°{% endif %}
-          {% else %}
-            <span class="muted">provisional —</span>
-          {% endif %}
-        </td>
-        <td class="note-cell">{{ o.note|dash }}</td>
         <td class="action-cell">
           <a class="button small" href="/control/observations/{{ o.id }}/edit">Edit</a>
           <form method="post" action="/control/observations/{{ o.id }}/review">
@@ -98,6 +80,33 @@
             <input type="hidden" name="review_status" value="rejected">
             <button class="small danger-btn" type="submit">Reject</button>
           </form>
+        </td>
+      </tr>
+      <tr class="review-detail-row {% if o.approved_altitude_error_deg is not none and (o.approved_altitude_error_deg|abs) > 5 %}bad-row{% endif %}">
+        <td colspan="10">
+          <div class="review-detail-grid">
+            <div class="residual-detail">
+              <b>Fit residuals</b>
+              <p>
+                {% if o.approved_fit_id %}
+                  <span class="muted">reviewed #{{ o.approved_fit_id }}</span> — alt {{ o.approved_altitude_error_deg|num(3) }}°{% if o.approved_heading_error_deg is not none %}, head {{ o.approved_heading_error_deg|num(3) }}°{% endif %}
+                {% else %}
+                  <span class="muted">reviewed —</span>
+                {% endif %}
+              </p>
+              <p>
+                {% if o.provisional_fit_id %}
+                  <span class="muted">provisional #{{ o.provisional_fit_id }}</span> — alt {{ o.provisional_altitude_error_deg|num(3) }}°{% if o.provisional_heading_error_deg is not none %}, head {{ o.provisional_heading_error_deg|num(3) }}°{% endif %}
+                {% else %}
+                  <span class="muted">provisional —</span>
+                {% endif %}
+              </p>
+            </div>
+            <div class="note-detail">
+              <b>Note</b>
+              <p>{{ o.note|dash }}</p>
+            </div>
+          </div>
         </td>
       </tr>
       {% endfor %}

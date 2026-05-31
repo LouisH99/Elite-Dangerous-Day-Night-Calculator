@@ -81,6 +81,56 @@
   {% endif %}
 {% endmacro %}
 
+
+<section class="card" id="background-fit-jobs" data-auto-refresh="{{ '1' if fit_jobs_active else '0' }}" data-refresh-seconds="{{ fit_refresh_seconds }}">
+  <h2>Background fit jobs</h2>
+  {% if fit_jobs_active %}
+  <div class="notice-box">
+    <strong>Fit is running.</strong> This page will refresh automatically every {{ fit_refresh_seconds }} seconds until the model is updated.
+  </div>
+  {% else %}
+  <p class="muted">Refits are queued so slow Raspberry Pi calculations do not make the control page time out.</p>
+  {% endif %}
+  {% if fit_jobs %}
+  <div class="table-wrap">
+    <table class="dense">
+      <thead><tr><th>Job</th><th>Mode</th><th>Status</th><th>Requested</th><th>Started</th><th>Finished</th><th>Fit</th><th>Error</th></tr></thead>
+      <tbody>
+      {% for job in fit_jobs %}
+        <tr>
+          <td>#{{ job.id }}</td>
+          <td>{{ job.fit_mode }}</td>
+          <td><span class="badge">{{ job.status }}</span></td>
+          <td>{{ job.requested_at_utc|dash }}</td>
+          <td>{{ job.started_at_utc|dash }}</td>
+          <td>{{ job.finished_at_utc|dash }}</td>
+          <td>{{ job.fit_id|dash }}</td>
+          <td>{{ job.error|dash }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="muted">No background fit jobs yet.</p>
+  {% endif %}
+</section>
+
 {{ fit_block('Reviewed model', approved_fit, approved_fit_error, False) }}
 {{ fit_block('Provisional model', provisional_fit, provisional_fit_error, True) }}
+
+{% if fit_jobs_active %}
+<script>
+(function () {
+  const box = document.getElementById('background-fit-jobs');
+  const seconds = Number(box?.dataset.refreshSeconds || 5);
+  const delayMs = Math.max(2, seconds) * 1000;
+  window.setTimeout(function () {
+    const url = new URL(window.location.href);
+    url.searchParams.set('message', 'Checking fit job status...');
+    window.location.replace(url.toString());
+  }, delayMs);
+})();
+</script>
+{% endif %}
 {% endblock %}

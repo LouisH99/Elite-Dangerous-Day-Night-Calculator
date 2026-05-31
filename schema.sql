@@ -1,3 +1,25 @@
+CREATE INDEX idx_admin_users_active ON admin_users(is_active);
+CREATE INDEX idx_admin_users_username ON admin_users(username);
+CREATE INDEX idx_audit_log_action ON audit_log(action);
+CREATE INDEX idx_audit_log_actor ON audit_log(actor);
+CREATE INDEX idx_audit_log_created ON audit_log(created_at_utc DESC);
+CREATE INDEX idx_audit_log_entity ON audit_log(entity_type, entity_id);
+CREATE INDEX idx_background_fit_jobs_body_created ON background_fit_jobs(body_id, requested_at_utc DESC);
+CREATE INDEX idx_background_fit_jobs_body_mode_status ON background_fit_jobs(body_id, fit_mode, status);
+CREATE INDEX idx_background_fit_jobs_status ON background_fit_jobs(status);
+CREATE INDEX idx_bodies_parent ON bodies(system_id, parent_body_id);
+CREATE INDEX idx_bodies_system_name ON bodies(system_id, name COLLATE NOCASE);
+CREATE INDEX idx_bodies_tracked ON bodies(tracked_for_prediction);
+CREATE INDEX idx_body_pois_body_public ON body_pois(body_id, is_public);
+CREATE INDEX idx_body_pois_name ON body_pois(name);
+CREATE INDEX idx_body_pois_review ON body_pois(review_status);
+CREATE INDEX idx_body_pois_source ON body_pois(source, source_id);
+CREATE INDEX idx_fits_body_active ON fits(body_id, is_active);
+CREATE INDEX idx_fits_body_mode_active ON fits(body_id, fit_mode, is_active);
+CREATE INDEX idx_fits_body_mode_fingerprint ON fits(body_id, fit_mode, observation_fingerprint);
+CREATE INDEX idx_observations_body_status ON observations(body_id, review_status);
+CREATE INDEX idx_observations_time ON observations(timestamp_utc);
+CREATE INDEX idx_systems_name ON systems(name COLLATE NOCASE);
 CREATE TABLE admin_users (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     username TEXT NOT NULL UNIQUE COLLATE NOCASE,
@@ -11,7 +33,6 @@ CREATE TABLE admin_users (
                     created_by TEXT,
                     updated_by TEXT
                 );
-
 CREATE TABLE audit_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             entity_type TEXT NOT NULL,
@@ -22,7 +43,18 @@ CREATE TABLE audit_log (
             created_at_utc TEXT NOT NULL,
             actor TEXT
         );
-
+CREATE TABLE background_fit_jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            body_id INTEGER NOT NULL REFERENCES bodies(id) ON DELETE CASCADE,
+            fit_mode TEXT NOT NULL DEFAULT 'provisional',
+            status TEXT NOT NULL DEFAULT 'queued',
+            reason TEXT,
+            requested_at_utc TEXT NOT NULL,
+            started_at_utc TEXT,
+            finished_at_utc TEXT,
+            fit_id INTEGER REFERENCES fits(id) ON DELETE SET NULL,
+            error TEXT
+        , use_heading INTEGER NOT NULL DEFAULT 0, time_weighting INTEGER NOT NULL DEFAULT 0, time_half_life_hours REAL NOT NULL DEFAULT 24.0, include_unreviewed INTEGER NOT NULL DEFAULT 1, force_refit INTEGER NOT NULL DEFAULT 0, requested_by TEXT);
 CREATE TABLE bodies (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             system_id INTEGER NOT NULL REFERENCES systems(id) ON DELETE CASCADE,
@@ -65,7 +97,6 @@ CREATE TABLE bodies (
             UNIQUE(system_id, name),
             UNIQUE(system_id, body_id)
         );
-
 CREATE TABLE body_pois (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             body_id INTEGER NOT NULL REFERENCES bodies(id) ON DELETE CASCADE,
@@ -78,8 +109,7 @@ CREATE TABLE body_pois (
             updated_at_utc TEXT NOT NULL,
             created_by TEXT,
             updated_by TEXT
-        , review_status TEXT NOT NULL DEFAULT 'approved', submitter_name TEXT NOT NULL DEFAULT '', reviewed_at_utc TEXT, reviewed_by TEXT);
-
+        , review_status TEXT NOT NULL DEFAULT 'approved', submitter_name TEXT NOT NULL DEFAULT '', reviewed_at_utc TEXT, reviewed_by TEXT, source TEXT NOT NULL DEFAULT '', source_id TEXT NOT NULL DEFAULT '', source_url TEXT NOT NULL DEFAULT '', source_label TEXT NOT NULL DEFAULT '');
 CREATE TABLE fit_observations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             fit_id INTEGER NOT NULL REFERENCES fits(id) ON DELETE CASCADE,
@@ -90,7 +120,6 @@ CREATE TABLE fit_observations (
             used_in_fit INTEGER NOT NULL DEFAULT 1,
             UNIQUE(fit_id, observation_id)
         );
-
 CREATE TABLE fits (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             system_id INTEGER NOT NULL REFERENCES systems(id) ON DELETE CASCADE,
@@ -108,7 +137,6 @@ CREATE TABLE fits (
             is_active INTEGER NOT NULL DEFAULT 0,
             created_at_utc TEXT NOT NULL
         , fit_mode TEXT NOT NULL DEFAULT 'approved', observation_fingerprint TEXT, includes_unreviewed INTEGER NOT NULL DEFAULT 0, used_statuses_json TEXT);
-
 CREATE TABLE observations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             obs_hash TEXT NOT NULL UNIQUE,
@@ -131,7 +159,6 @@ CREATE TABLE observations (
             created_at_utc TEXT NOT NULL,
             updated_at_utc TEXT NOT NULL
         );
-
 CREATE TABLE prediction_cache (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             body_id INTEGER NOT NULL REFERENCES bodies(id) ON DELETE CASCADE,
@@ -142,12 +169,11 @@ CREATE TABLE prediction_cache (
             prediction_json TEXT NOT NULL,
             created_at_utc TEXT NOT NULL
         );
-
 CREATE TABLE schema_meta (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
         );
-
+CREATE TABLE sqlite_sequence(name,seq);
 CREATE TABLE systems (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             system_address INTEGER UNIQUE,
@@ -161,39 +187,3 @@ CREATE TABLE systems (
             created_at_utc TEXT NOT NULL,
             updated_at_utc TEXT NOT NULL
         );
-
-CREATE INDEX idx_admin_users_active ON admin_users(is_active);
-
-CREATE INDEX idx_admin_users_username ON admin_users(username);
-
-CREATE INDEX idx_audit_log_action ON audit_log(action);
-
-CREATE INDEX idx_audit_log_actor ON audit_log(actor);
-
-CREATE INDEX idx_audit_log_created ON audit_log(created_at_utc DESC);
-
-CREATE INDEX idx_audit_log_entity ON audit_log(entity_type, entity_id);
-
-CREATE INDEX idx_bodies_parent ON bodies(system_id, parent_body_id);
-
-CREATE INDEX idx_bodies_system_name ON bodies(system_id, name COLLATE NOCASE);
-
-CREATE INDEX idx_bodies_tracked ON bodies(tracked_for_prediction);
-
-CREATE INDEX idx_body_pois_body_public ON body_pois(body_id, is_public);
-
-CREATE INDEX idx_body_pois_name ON body_pois(name);
-
-CREATE INDEX idx_body_pois_review ON body_pois(review_status);
-
-CREATE INDEX idx_fits_body_active ON fits(body_id, is_active);
-
-CREATE INDEX idx_fits_body_mode_active ON fits(body_id, fit_mode, is_active);
-
-CREATE INDEX idx_fits_body_mode_fingerprint ON fits(body_id, fit_mode, observation_fingerprint);
-
-CREATE INDEX idx_observations_body_status ON observations(body_id, review_status);
-
-CREATE INDEX idx_observations_time ON observations(timestamp_utc);
-
-CREATE INDEX idx_systems_name ON systems(name COLLATE NOCASE);
