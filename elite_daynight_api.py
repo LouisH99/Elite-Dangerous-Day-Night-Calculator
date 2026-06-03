@@ -67,7 +67,7 @@ ALLOWED_QUALITY = {"high", "medium", "low"}
 
 app = FastAPI(
     title="Elite Dangerous Day/Night Calculator API",
-    version="0.204",
+    version="0.205",
     description="Local-first API for systems, bodies, observations, fitting and prediction.",
 )
 
@@ -934,7 +934,7 @@ def start_provisional_fit_worker() -> None:
 def root() -> Dict[str, Any]:
     return {
         "name": "Elite Dangerous Day/Night Calculator API",
-        "version": "0.204",
+        "version": "0.205",
         "db_path": DB_PATH,
         "docs": "/docs",
     }
@@ -1127,6 +1127,9 @@ def search_systems(
                 SELECT s.*,
                        COALESCE(SUM(body_flags.is_tracked), 0) AS tracked_body_count,
                        COALESCE(SUM(body_flags.has_observations), 0) AS observed_body_count,
+                       COALESCE(SUM(body_flags.observations), 0) AS observation_count,
+                       COALESCE(SUM(body_flags.approved_observations), 0) AS approved_observation_count,
+                       COALESCE(SUM(body_flags.unreviewed_observations), 0) AS unreviewed_observation_count,
                        COALESCE(SUM(body_flags.has_approved_fit), 0) AS approved_model_count,
                        COALESCE(SUM(body_flags.has_provisional_fit), 0) AS provisional_model_count,
                        COALESCE(SUM(body_flags.needs_observations), 0) AS needs_observations_body_count,

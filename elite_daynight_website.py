@@ -61,7 +61,7 @@ PUBLIC_POI_SUBMISSIONS_ENABLED = env_bool("ELITE_DAYNIGHT_PUBLIC_POI_SUBMISSIONS
 
 app = FastAPI(
     title="Elite Dangerous Day/Night Calculator Website",
-    version="0.204",
+    version="0.205",
     docs_url=None,
     redoc_url=None,
     openapi_url=None,
@@ -293,22 +293,25 @@ async def systems_autocomplete(q: str = Query(""), limit: int = Query(8, ge=1, l
     results = []
     for row in data.get("results", []):
         tracked = int(row.get("tracked_body_count") or 0)
-        observed = int(row.get("observed_body_count") or 0)
+        observed_bodies = int(row.get("observed_body_count") or 0)
+        observations = int(row.get("observation_count") or 0)
         models = int(row.get("approved_model_count") or 0)
         suffix_parts = []
         if tracked:
             suffix_parts.append(f"{tracked} tracked")
-        if observed:
-            suffix_parts.append(f"{observed} with observations")
+        if observations:
+            suffix_parts.append(f"{observations} obs")
+        elif observed_bodies:
+            suffix_parts.append(f"{observed_bodies} observed")
         if models:
             suffix_parts.append(f"{models} model{'s' if models != 1 else ''}")
         suffix = " · ".join(suffix_parts) if suffix_parts else "no tracked bodies yet"
         results.append({
             "id": row.get("id"),
             "name": row.get("name"),
-            "system_address": row.get("system_address"),
             "tracked_body_count": tracked,
-            "observed_body_count": observed,
+            "observed_body_count": observed_bodies,
+            "observation_count": observations,
             "approved_model_count": models,
             "url": system_open_url(row),
             "label": f"{row.get('name')} — {suffix}",

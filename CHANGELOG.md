@@ -1,3 +1,11 @@
+## V0.205
+
+- Simplified the public `/systems` overview table.
+- Removed system address and galactic coordinate columns from the systems overview.
+- Added total system observation counts, with approved and pending observation subtotals.
+- Kept the V0.204 filters while making the table rows easier to scan.
+- Updated system autocomplete labels to use total observation counts when available.
+
 ## V0.204
 
 - Added public `/systems` overview filters for reviewed models, provisional models, observations, needs-observations, and high/low confidence.

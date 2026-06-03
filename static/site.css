@@ -384,3 +384,10 @@ button.secondary, .button.secondary { background: rgba(255,255,255,0.045); color
   .check-pill, .filter-select { width: 100%; justify-content: start; }
   .filter-select select { width: 100%; }
 }
+
+/* Cleaner public systems overview */
+.systems-table-wrap table { min-width: 860px; }
+.systems-table th,
+.systems-table td { vertical-align: top; }
+.system-name-cell { min-width: 180px; }
+.systems-table .badge { margin: 0.08rem 0.12rem 0.08rem 0; }
