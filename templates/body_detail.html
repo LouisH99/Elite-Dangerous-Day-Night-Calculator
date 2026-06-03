@@ -26,6 +26,17 @@
         <h2>Prediction</h2>
         {% if fit %}
           <p class="muted">Using {{ 'provisional' if model_mode == 'provisional' else 'reviewed' }} model #{{ fit.id }} · score {{ fit.fit_score|num(3) }} · altitude RMS {{ fit.rms_altitude_deg|num(3) }}°</p>
+          {% set conf = (prediction.model_confidence if prediction and prediction.model_confidence else fit.model_confidence) %}
+          {% if conf %}
+            <div class="confidence-box confidence-{{ conf.level|replace(' ', '-') }}">
+              <div><span>Model confidence</span><strong>{{ conf.level|title }} · {{ conf.score }}%</strong></div>
+              <small>
+                {{ conf.used_observations }} obs · effective {{ conf.effective_observations|num(1) }} · RMS {{ conf.fit_rms_altitude_deg|num(2) }}°
+                {% if conf.prediction_distance_hours is not none %} · {{ conf.prediction_distance_hours|num(1) }} h from latest obs{% endif %}
+              </small>
+              {% if conf.warnings %}<small class="confidence-warnings">Notes: {{ conf.warnings|join('; ') }}</small>{% endif %}
+            </div>
+          {% endif %}
         {% else %}
           <p class="warn">No {{ 'provisional' if model_mode == 'provisional' else 'reviewed' }} fit for this body yet. Add observations; after review and refit, predictions become available.</p>
           {% if fit_error %}<p class="muted">{{ fit_error }}</p>{% endif %}
@@ -127,6 +138,11 @@
 <section class="card">
   <h2>Result</h2>
   {% if prediction.fit_uses_unverified_data %}<p class="warn"><b>Provisional model:</b> {{ prediction.fit_data_note }}</p>{% endif %}
+  {% if prediction.model_confidence %}
+    <p class="notice"><b>Confidence:</b> {{ prediction.model_confidence.level|title }} · {{ prediction.model_confidence.score }}%
+      {% if prediction.model_confidence.warnings %}<br><span class="muted">{{ prediction.model_confidence.warnings|join('; ') }}</span>{% endif %}
+    </p>
+  {% endif %}
   {% if prediction.horizon_mode and prediction.horizon_mode != "normal" %}<p class="notice"><b>Horizon status:</b> {{ prediction.horizon_message }}{% if prediction.cycle_min_sun_altitude_deg is not none %}<br><span class="muted">Checked min/max sun altitude: {{ prediction.cycle_min_sun_altitude_deg|num(2) }}° / {{ prediction.cycle_max_sun_altitude_deg|num(2) }}°</span>{% endif %}</p>{% endif %}
   <div class="result-grid">
     <div><span>Sun altitude</span><strong>{{ prediction.sun_altitude_deg|num(2) }}°</strong><em>{{ prediction.sun_altitude_trend }}</em></div>

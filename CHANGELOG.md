@@ -1,3 +1,10 @@
+## V0.201
+
+- Added model confidence scoring for reviewed and provisional fits.
+- Prediction responses now include a `model_confidence` object for API/website use.
+- Body pages show confidence level, percent score, key inputs, and warning notes.
+- Admin fit pages show confidence next to fit diagnostics.
+
 ## V0.200
 
 - Improved prediction-window fallback behavior.
@@ -64,7 +71,7 @@ Clean naming pass before publishing to GitHub.
 - Renamed the local API to `elite_daynight_api.py`.
 - Renamed the website entry point to `elite_daynight_website.py`.
 - Renamed the database/import helper to `elite_daynight_db.py`.
-- Kept `elite_daynight_model_v15.py` because the model version remains important for prediction behavior.
+- Kept `elite_daynight_model_v16.py` because the model version remains important for prediction behavior.
 - Changed the default runtime database name to `elite_daynight.db`.
 - Added `elite_daynight_template.db` as an empty template database for new installs.
 - Updated run scripts and documentation for the clean names.

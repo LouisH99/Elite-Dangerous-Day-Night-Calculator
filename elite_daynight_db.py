@@ -2,7 +2,7 @@
 """
 Elite Dangerous Day/Night Calculator - compact local SQLite database and Spansh importer
 
-This is the local database prototype for the v15 model split.
+This is the local database prototype for the v16 model split.
 It intentionally stores only the fields needed for:
   * system/body selection
   * day/night fitting and prediction
@@ -12,7 +12,7 @@ It intentionally stores only the fields needed for:
 It does NOT store full current-system/Spansh JSON, journal events, factions,
 materials, station data, raw Status.json snapshots, or full raw body blobs.
 
-Keep this file in the same folder as elite_daynight_model_v15.py.
+Keep this file in the same folder as elite_daynight_model_v16.py.
 """
 from __future__ import annotations
 
@@ -65,15 +65,15 @@ def begin_write_transaction(con: sqlite3.Connection) -> None:
             time.sleep(DB_WRITE_RETRY_BASE_SECONDS * (2 ** attempt))
 
 try:
-    import elite_daynight_model_v15 as model
+    import elite_daynight_model_v16 as model
 except Exception as exc:  # pragma: no cover
     raise SystemExit(
-        "Could not import elite_daynight_model_v15.py. Put this script in the same folder as the model module.\n"
+        "Could not import elite_daynight_model_v16.py. Put this script in the same folder as the model module.\n"
         f"Import error: {exc}"
     ) from exc
 
 SCHEMA_VERSION = 3
-MODEL_VERSION = "v15"
+MODEL_VERSION = "v16"
 
 SPANSH_API_BASE = "https://www.spansh.co.uk/api"
 EDSM_SYSTEM_API_BASE = "https://www.edsm.net/api-v1"
@@ -1000,7 +1000,7 @@ def compact_body_dict(row: sqlite3.Row) -> Dict[str, Any]:
         parents = json.loads(row["parents_json"] or "[]")
     except Exception:
         parents = []
-    # The v15 model only needs the direct parent for sun-vector mode selection.
+    # The v16 model only needs the direct parent for sun-vector mode selection.
     # Keeping distant ancestor stars in a moon's Parents list can make the
     # stellar-disc calculation accidentally use the moon-parent distance.
     d["Parents"] = parents[:1]
@@ -1481,7 +1481,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     po.add_argument("--csv", required=True); po.add_argument("--system-name", required=True); po.add_argument("--body-name", required=True)
     po.add_argument("--system-address", type=int); po.add_argument("--review-status", default="new", choices=["new", "approved", "rejected", "needs_check", "corrected"])
     po.add_argument("--observer-name", default=""); po.add_argument("--source", default="local_csv")
-    pf = sub.add_parser("fit", help="Fit an active v15 model from approved observations")
+    pf = sub.add_parser("fit", help="Fit an active v16 model from approved observations")
     pf.add_argument("--system-name", required=True); pf.add_argument("--body-name", required=True)
     pf.add_argument("--use-heading", action="store_true"); pf.add_argument("--time-weight", action="store_true"); pf.add_argument("--time-half-life-hours", type=float, default=24.0); pf.add_argument("--include-unreviewed", action="store_true", help="Use approved + new/needs_check observations for a provisional fit")
     pp = sub.add_parser("predict", help="Predict from the active stored fit")

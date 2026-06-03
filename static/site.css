@@ -282,3 +282,36 @@ input[readonly] { opacity: 0.82; }
 @media (max-width: 900px) {
   .review-detail-grid { grid-template-columns: 1fr; }
 }
+
+/* V0.201 model confidence */
+.confidence-box {
+  border: 1px solid rgba(124,199,255,0.28);
+  background: rgba(124,199,255,0.065);
+  border-radius: 14px;
+  padding: 0.75rem 0.85rem;
+  margin: 0.65rem 0 0.9rem;
+}
+.confidence-box div {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  align-items: baseline;
+}
+.confidence-box span {
+  color: var(--muted);
+}
+.confidence-box strong {
+  color: var(--text);
+}
+.confidence-box small {
+  display: block;
+  margin-top: 0.25rem;
+  color: var(--muted);
+  line-height: 1.35;
+}
+.confidence-box .confidence-warnings {
+  color: #ffd37a;
+}
+.confidence-high { border-color: rgba(81, 214, 132, 0.38); background: rgba(81, 214, 132, 0.07); }
+.confidence-medium { border-color: rgba(255, 211, 122, 0.38); background: rgba(255, 211, 122, 0.07); }
+.confidence-low, .confidence-very-low { border-color: rgba(255, 122, 122, 0.38); background: rgba(255, 122, 122, 0.07); }

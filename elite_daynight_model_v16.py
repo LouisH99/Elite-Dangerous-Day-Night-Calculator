@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Elite Dangerous day/night calculation core - v15 separated model module.
+Elite Dangerous day/night calculation core - v16 separated model module.
 
 This file intentionally contains no tkinter GUI code. It can be imported by:
   * the desktop GUI wrapper
   * a CLI wrapper
   * a future website/backend API
 
-The model is based on v15 compact output: moon-safe distant-star handling for
+The model is based on v16 model: moon-safe distant-star handling for
 non-star parents, direct orbital vectors for direct star-orbiting planets,
 and compact sunrise/sunset/day-period prediction helpers.
 """
@@ -1254,7 +1254,7 @@ def make_report(
 ) -> str:
     body = model.body
     lines: List[str] = []
-    lines.append("Elite Dangerous orbital day/night model v15")
+    lines.append("Elite Dangerous orbital day/night model v16")
     lines.append("============================================")
     lines.append(f"Body: {body_name(body)}")
     lines.append(f"Calibration CSV: {calibration_source_label(calibration_path)}")
@@ -1362,7 +1362,7 @@ def model_summary_dict(model: FittedModel) -> Dict[str, Any]:
     a, b, g, p = model.params
     return {
         "body_name": body_name(model.body),
-        "model_version": "v15",
+        "model_version": "v16",
         "score": float(model.score),
         "rms_altitude_deg": float(model.rms_altitude),
         "rms_heading_deg": None if model.rms_heading is None else float(model.rms_heading),
@@ -1416,7 +1416,7 @@ def model_horizon_check_hours(model: FittedModel, prediction_hours: float = 72.0
     """Return the period to sample when no sunrise/sunset is found.
 
     This is intentionally a checked model period, not a promise that a body
-    literally never has a transition. For moons/non-star parents v15 uses a
+    literally never has a transition. For moons/non-star parents v16 uses a
     fitted distant-star direction, so one rotation is the relevant cycle. For
     direct star-orbiting bodies we include the apparent beat period and, when
     reasonable, the orbital period so polar-season cases can be detected.
@@ -1647,8 +1647,216 @@ def calculate_prediction(
         "visual_disc_crossings": visual_disc_crossings,
     }
     result.update(horizon_info)
+    result["model_confidence"] = model_confidence_dict(model, target_time=target_time)
     return result
 
+
+
+# ------------------------------ model confidence ------------------------------
+
+
+def clamp01(value: float) -> float:
+    return max(0.0, min(1.0, float(value)))
+
+
+def confidence_level(score: float) -> str:
+    if score >= 85.0:
+        return "high"
+    if score >= 65.0:
+        return "medium"
+    if score >= 40.0:
+        return "low"
+    return "very low"
+
+
+def estimated_model_day_period_seconds(model: FittedModel) -> Optional[float]:
+    """Return a conservative estimate for the model's relevant day/night period.
+
+    This is used only for confidence/coverage scoring.  When possible we use the
+    shorter apparent rotation/orbit period because that usually matches the
+    repeating local light cycle better for Elite bodies.  If the orbital fields
+    are incomplete, rotation period is used as a safe fallback.
+    """
+    try:
+        rot = abs(float(model.body.get("RotationPeriod", 0.0) or 0.0))
+    except Exception:
+        rot = 0.0
+    candidates: List[float] = []
+    diff_p, sum_p = apparent_mean_periods(model.body)
+    for value in (diff_p, sum_p, rot):
+        try:
+            v = float(value)
+            if math.isfinite(v) and v > 0:
+                candidates.append(v)
+        except Exception:
+            pass
+    if not candidates:
+        return None
+    # Avoid selecting tiny artefacts while still supporting short moon cycles.
+    return max(60.0, min(candidates))
+
+
+def model_confidence_dict(
+    model: FittedModel,
+    target_time: Optional[datetime] = None,
+    model_mode: str = "approved",
+    includes_unreviewed: bool = False,
+) -> Dict[str, Any]:
+    """Return a human/API friendly confidence estimate for this fitted model.
+
+    The score is intentionally heuristic.  It combines residual quality,
+    observation count, time coverage, freshness and review status.  It should be
+    read as a practical confidence indicator, not as a formal probability.
+    """
+    residuals = residuals_as_dicts(model)
+    alt_errors = [abs(float(r["altitude_error_deg"])) for r in residuals if r.get("altitude_error_deg") is not None]
+    max_alt_error = max(alt_errors) if alt_errors else None
+    rms_alt = float(model.rms_altitude)
+
+    # 1) Fit quality: RMS is the main factor, but a single large outlier hurts.
+    rms_score = clamp01(1.0 - (rms_alt / 5.0))
+    if rms_alt <= 1.0:
+        rms_score = 1.0
+    elif rms_alt <= 2.0:
+        rms_score = 0.85
+    elif rms_alt <= 4.0:
+        rms_score = 0.55
+    outlier_score = 1.0
+    if max_alt_error is not None:
+        if max_alt_error <= 2.0:
+            outlier_score = 1.0
+        elif max_alt_error <= 5.0:
+            outlier_score = 0.65
+        elif max_alt_error <= 10.0:
+            outlier_score = 0.30
+        else:
+            outlier_score = 0.0
+    fit_quality_score = 0.75 * rms_score + 0.25 * outlier_score
+
+    # 2) Observation amount, weighted by quality/time weight.
+    used_observations = len(model.observations)
+    effective_observations = sum(float(r.get("effective_weight", 0.0) or 0.0) for r in residuals)
+    observation_count_score = clamp01((effective_observations - 2.0) / 6.0)
+    if used_observations >= 10 and effective_observations >= 6.0:
+        observation_count_score = max(observation_count_score, 0.95)
+    elif used_observations >= 6 and effective_observations >= 4.0:
+        observation_count_score = max(observation_count_score, 0.75)
+    elif used_observations >= 3:
+        observation_count_score = max(observation_count_score, 0.45)
+
+    # 3) Observation time coverage relative to the estimated cycle.
+    timestamps = [obs.timestamp_utc for obs in model.observations]
+    newest = max(timestamps) if timestamps else None
+    oldest = min(timestamps) if timestamps else None
+    span_hours: Optional[float] = None
+    estimated_day_period_sec = estimated_model_day_period_seconds(model)
+    estimated_day_period_hours = None if estimated_day_period_sec is None else estimated_day_period_sec / 3600.0
+    if newest and oldest:
+        span_hours = max(0.0, (newest - oldest).total_seconds() / 3600.0)
+    if span_hours is not None and estimated_day_period_hours and estimated_day_period_hours > 0:
+        coverage_ratio = span_hours / estimated_day_period_hours
+        time_coverage_score = clamp01(coverage_ratio / 0.8)
+        if coverage_ratio >= 1.0:
+            time_coverage_score = 1.0
+        elif coverage_ratio >= 0.5:
+            time_coverage_score = max(time_coverage_score, 0.8)
+        elif coverage_ratio >= 0.2:
+            time_coverage_score = max(time_coverage_score, 0.55)
+    elif used_observations >= 3:
+        coverage_ratio = None
+        time_coverage_score = 0.45
+    else:
+        coverage_ratio = None
+        time_coverage_score = 0.2
+
+    # 4) Freshness: predictions far from the newest observation become less certain.
+    prediction_distance_hours: Optional[float] = None
+    if target_time is not None and newest is not None:
+        prediction_distance_hours = abs((target_time - newest).total_seconds()) / 3600.0
+    if prediction_distance_hours is None:
+        freshness_score = 0.75
+    else:
+        half_life_hours = max(24.0 * 7.0, 3.0 * (estimated_day_period_hours or 24.0))
+        freshness_score = max(0.25, 0.5 ** (prediction_distance_hours / half_life_hours))
+
+    # 5) Review/model safety.  Provisional data is capped below high confidence.
+    mode = (model_mode or "approved").strip().lower()
+    review_safety_score = 1.0
+    if includes_unreviewed or mode == "provisional":
+        review_safety_score = 0.65
+
+    # 6) Geometry/source complexity. Explicit/inferred recursive star source is OK;
+    # last-resort fallback is more risky.
+    source_mode = sun_source_mode_label(model.system, model.body)
+    if source_mode == "fallback":
+        geometry_score = 0.55
+    elif source_mode == "explicit":
+        geometry_score = 0.95
+    else:
+        geometry_score = 0.85
+
+    raw_score = (
+        0.40 * fit_quality_score
+        + 0.20 * observation_count_score
+        + 0.15 * time_coverage_score
+        + 0.15 * freshness_score
+        + 0.10 * ((review_safety_score * 0.7) + (geometry_score * 0.3))
+    ) * 100.0
+
+    if includes_unreviewed or mode == "provisional":
+        raw_score = min(raw_score, 70.0)
+    score = int(round(max(0.0, min(100.0, raw_score))))
+
+    warnings: List[str] = []
+    strengths: List[str] = []
+    if rms_alt <= 1.0:
+        strengths.append("good altitude fit")
+    elif rms_alt > 4.0:
+        warnings.append("high altitude residuals")
+    if max_alt_error is not None and max_alt_error > 5.0:
+        warnings.append("one or more large residuals")
+    if used_observations < 4:
+        warnings.append("few observations")
+    elif effective_observations >= 6.0:
+        strengths.append("good observation count")
+    if span_hours is not None and estimated_day_period_hours and estimated_day_period_hours > 0 and span_hours < 0.2 * estimated_day_period_hours:
+        warnings.append("observations cover a short part of the cycle")
+    if prediction_distance_hours is not None and prediction_distance_hours > max(24.0 * 14.0, 6.0 * (estimated_day_period_hours or 24.0)):
+        warnings.append("prediction is far from latest observation")
+    if includes_unreviewed or mode == "provisional":
+        warnings.append("includes unreviewed observations")
+    if source_mode == "fallback":
+        warnings.append("sun-source geometry uses fallback mode")
+
+    return {
+        "score": score,
+        "level": confidence_level(float(score)),
+        "model_mode": mode,
+        "fit_rms_altitude_deg": rms_alt,
+        "max_altitude_residual_deg": None if max_alt_error is None else float(max_alt_error),
+        "used_observations": int(used_observations),
+        "effective_observations": float(effective_observations),
+        "observation_time_span_hours": None if span_hours is None else float(span_hours),
+        "estimated_day_period_hours": None if estimated_day_period_hours is None else float(estimated_day_period_hours),
+        "observation_coverage_ratio": None if coverage_ratio is None else float(coverage_ratio),
+        "newest_observation_utc": None if newest is None else format_utc(newest),
+        "oldest_observation_utc": None if oldest is None else format_utc(oldest),
+        "prediction_distance_hours": None if prediction_distance_hours is None else float(prediction_distance_hours),
+        "includes_unreviewed": bool(includes_unreviewed or mode == "provisional"),
+        "sun_source_mode": source_mode,
+        "illumination_source": illumination_source_name(model.system, model.body),
+        "orbit_context": orbit_context_label(model.system, model.body),
+        "component_scores": {
+            "fit_quality": round(fit_quality_score * 100.0, 1),
+            "observation_count": round(observation_count_score * 100.0, 1),
+            "time_coverage": round(time_coverage_score * 100.0, 1),
+            "freshness": round(freshness_score * 100.0, 1),
+            "review_safety": round(review_safety_score * 100.0, 1),
+            "geometry": round(geometry_score * 100.0, 1),
+        },
+        "warnings": warnings,
+        "strengths": strengths,
+    }
 
 def fit_model_from_files(
     system_path: str,

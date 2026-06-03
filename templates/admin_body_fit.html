@@ -69,8 +69,12 @@
       <div><strong>{{ fit.rms_altitude_deg|num(3) }}°</strong><span>RMS altitude</span></div>
       <div><strong>{{ fit.rms_heading_deg|num(3) if fit.rms_heading_deg is not none else '—' }}°</strong><span>RMS heading</span></div>
       <div><strong>{{ fit.observation_count }}</strong><span>observations</span></div>
+      {% if fit.model_confidence %}<div><strong>{{ fit.model_confidence.level|title }} · {{ fit.model_confidence.score }}%</strong><span>confidence</span></div>{% endif %}
       <div><strong>{{ fit.created_at_utc }}</strong><span>created</span></div>
     </div>
+    {% if fit.model_confidence and fit.model_confidence.warnings %}
+      <p class="muted">Confidence notes: {{ fit.model_confidence.warnings|join('; ') }}</p>
+    {% endif %}
   </section>
   <section class="card">
     <h2>{{ title }} residuals</h2>

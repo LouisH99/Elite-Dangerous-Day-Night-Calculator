@@ -9,7 +9,7 @@ Environment:
   ELITE_DAYNIGHT_DB=/path/to/elite_daynight.db
 
 This API is intentionally small and local-first. It uses the compact SQLite
-database and the separated v15 model module.
+database and the separated v16 model module.
 """
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, validator
 
 import elite_daynight_db as dbmod
-import elite_daynight_model_v15 as model
+import elite_daynight_model_v16 as model
 
 DB_PATH = os.environ.get(
     "ELITE_DAYNIGHT_DB",
@@ -67,7 +67,7 @@ ALLOWED_QUALITY = {"high", "medium", "low"}
 
 app = FastAPI(
     title="Elite Dangerous Day/Night Calculator API",
-    version="0.200",
+    version="0.201",
     description="Local-first API for systems, bodies, observations, fitting and prediction.",
 )
 
@@ -934,7 +934,7 @@ def start_provisional_fit_worker() -> None:
 def root() -> Dict[str, Any]:
     return {
         "name": "Elite Dangerous Day/Night Calculator API",
-        "version": "0.200",
+        "version": "0.201",
         "db_path": DB_PATH,
         "docs": "/docs",
     }
@@ -1247,7 +1247,17 @@ def get_fit(body_id: int, include_residuals: bool = True, model_mode: str = "app
         # Parse params_json safely without mutating compatibility fields.
         import json as _json
         data["params"] = _json.loads(fit["params_json"]) if fit["params_json"] else None
-        data.update(fit_review_metadata(con, int(fit["id"])))
+        review_meta = fit_review_metadata(con, int(fit["id"]))
+        data.update(review_meta)
+        try:
+            _system, _fitted, _fit_id = dbmod.model_from_active_fit(con, body_id, fit_mode=mode)
+            data["model_confidence"] = model.model_confidence_dict(
+                _fitted,
+                model_mode=mode,
+                includes_unreviewed=bool(review_meta.get("fit_uses_unverified_data")),
+            )
+        except Exception:
+            data["model_confidence"] = None
         if include_residuals:
             rows = con.execute(
                 """
@@ -1281,10 +1291,11 @@ def predict(
         if mode not in {"approved", "provisional"}:
             raise HTTPException(status_code=400, detail="model_mode must be approved or provisional")
         system, fitted, fit_id = dbmod.model_from_active_fit(con, body_id, fit_mode=mode)
+        target_dt = model.parse_utc(time)
         prediction = model.calculate_prediction(
             fitted,
             system,
-            model.parse_utc(time),
+            target_dt,
             lat,
             lon,
             prediction_hours=prediction_hours,
@@ -1292,7 +1303,14 @@ def predict(
             max_extended_prediction_hours=max_extended_hours,
         )
         prediction["model_mode"] = mode
-        prediction.update(fit_review_metadata(con, int(fit_id)))
+        review_meta = fit_review_metadata(con, int(fit_id))
+        prediction.update(review_meta)
+        prediction["model_confidence"] = model.model_confidence_dict(
+            fitted,
+            target_time=target_dt,
+            model_mode=mode,
+            includes_unreviewed=bool(review_meta.get("fit_uses_unverified_data")),
+        )
         with WRITE_LOCK:
             begin_write_transaction(con)
             con.execute(
