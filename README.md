@@ -1,12 +1,12 @@
 # Elite Dangerous Day/Night Calculator
 
-Current package version: **V0.198**.
+Current package version: **V0.199**.
 
 A community tool for predicting local daylight, sunrise, sunset, and sun elevation on planets and moons in **Elite Dangerous**.
 
 The project lets players add systems/bodies, submit sun observations, review submitted data, fit a prediction model, and use saved Points of Interest (POIs) to quickly check local light conditions.
 
-> **Project status:** early community tool, currently around `V0.198`.
+> **Project status:** early community tool, currently around `V0.199`.
 >
 > **Transparency note:** this is a **vibe-coded / AI-assisted project**. A large part of the design, code structure, debugging, and documentation was created with help from ChatGPT. The model, outputs, and implementation should be treated as experimental and should be validated with real observations.
 
@@ -168,6 +168,7 @@ On Windows:
 copy elite_daynight.db elite_daynight_BACKUP.db
 ```
 
+
 ---
 
 ## How observations work
@@ -280,11 +281,45 @@ low    = weak weight
 
 Optional time weighting can reduce the influence of old observations, but it is not always enabled.
 
-### 4. Planets vs moons
+### 4. Illumination source and multi-star systems
 
-For direct star-orbiting planets, the model can use the body/orbit data more directly.
+Elite Dangerous can show multiple stars in a system, but a planet/moon appears to be lit by one effective illumination source. The model stores an optional explicit field:
 
-For moons, a previous bug showed that using the moon's direct parent vector as the sun vector can be wrong, because the parent is often a planet or gas giant. The current model handles this more safely by fitting the useful star/sun direction from observations instead of blindly treating the parent-body direction as the sun.
+```text
+illumination_source_star_name
+```
+
+Examples:
+
+```text
+Sosong B 1 a     -> Sosong B
+Sosong ABC 1 a   -> Sosong A
+```
+
+When this field is empty, the model tries to infer the light source:
+
+```text
+body around star A                -> use A
+moon around planet around star B  -> use B
+combined-name ABC/AB bodies       -> default to A
+combined-name BC bodies           -> default to B, but treat as uncertain
+```
+
+Admins can override the inferred source on the body fit page with:
+
+```text
+Illumination source star: auto / system star list
+```
+
+The fit report and model metadata show:
+
+```text
+Illumination source
+Orbit context
+Sun-source mode: explicit / inferred / fallback
+```
+
+For moons, the model now uses recursive parent/body positions where possible, so a moon around a planet orbiting a secondary star can use the correct moving star direction instead of treating the moon's direct parent planet as the sun.
 
 ### 5. Prediction
 
