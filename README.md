@@ -1,12 +1,12 @@
 # Elite Dangerous Day/Night Calculator
 
-Current package version: **V0.199**.
+Current package version: **V0.200**.
 
 A community tool for predicting local daylight, sunrise, sunset, and sun elevation on planets and moons in **Elite Dangerous**.
 
 The project lets players add systems/bodies, submit sun observations, review submitted data, fit a prediction model, and use saved Points of Interest (POIs) to quickly check local light conditions.
 
-> **Project status:** early community tool, currently around `V0.199`.
+> **Project status:** early community tool, currently around `V0.200`.
 >
 > **Transparency note:** this is a **vibe-coded / AI-assisted project**. A large part of the design, code structure, debugging, and documentation was created with help from ChatGPT. The model, outputs, and implementation should be treated as experimental and should be validated with real observations.
 
@@ -330,7 +330,7 @@ sun altitude crosses 0° upward   → sunrise
 sun altitude crosses 0° downward → sunset
 ```
 
-If no crossing is found in the normal prediction window, the model checks farther ahead and reports continuous daylight/night or later crossings when possible.
+The website first uses the selected prediction window. If there is no day/night change in that window, the model searches farther ahead up to 30 days and shows the next fallback transition(s). If the selected window does not contain a complete day/night cycle, the same extended search is used to calculate sunlight duration and day period when possible.
 
 The website then displays:
 
