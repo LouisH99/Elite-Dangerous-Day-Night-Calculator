@@ -61,7 +61,7 @@ PUBLIC_POI_SUBMISSIONS_ENABLED = env_bool("ELITE_DAYNIGHT_PUBLIC_POI_SUBMISSIONS
 
 app = FastAPI(
     title="Elite Dangerous Day/Night Calculator Website",
-    version="0.202",
+    version="0.203",
     docs_url=None,
     redoc_url=None,
     openapi_url=None,
@@ -237,10 +237,56 @@ async def index(request: Request) -> HTMLResponse:
     )
 
 
+def system_open_url(system_row: Dict[str, Any]) -> str:
+    try:
+        tracked = int(system_row.get("tracked_body_count") or 0)
+    except Exception:
+        tracked = 0
+    single_body_id = system_row.get("single_tracked_body_id")
+    if tracked == 1 and single_body_id:
+        return f"/bodies/{int(single_body_id)}"
+    return f"/systems/{int(system_row['id'])}"
+
+
 @app.get("/systems", response_class=HTMLResponse)
 async def systems(request: Request, q: str = Query("")) -> HTMLResponse:
     data = await api_request("GET", "/api/systems/search", params={"q": q, "limit": 50})
-    return render(request, "systems.html", {"q": q, "systems": data.get("results", [])})
+    rows = data.get("results", [])
+    for row in rows:
+        row["open_url"] = system_open_url(row)
+    return render(request, "systems.html", {"q": q, "systems": rows})
+
+
+@app.get("/systems/autocomplete")
+async def systems_autocomplete(q: str = Query(""), limit: int = Query(8, ge=1, le=20)) -> Dict[str, Any]:
+    q = (q or "").strip()
+    if len(q) < 2:
+        return {"results": []}
+    data = await api_request("GET", "/api/systems/search", params={"q": q, "limit": limit})
+    results = []
+    for row in data.get("results", []):
+        tracked = int(row.get("tracked_body_count") or 0)
+        observed = int(row.get("observed_body_count") or 0)
+        models = int(row.get("approved_model_count") or 0)
+        suffix_parts = []
+        if tracked:
+            suffix_parts.append(f"{tracked} tracked")
+        if observed:
+            suffix_parts.append(f"{observed} with observations")
+        if models:
+            suffix_parts.append(f"{models} model{'s' if models != 1 else ''}")
+        suffix = " · ".join(suffix_parts) if suffix_parts else "no tracked bodies yet"
+        results.append({
+            "id": row.get("id"),
+            "name": row.get("name"),
+            "system_address": row.get("system_address"),
+            "tracked_body_count": tracked,
+            "observed_body_count": observed,
+            "approved_model_count": models,
+            "url": system_open_url(row),
+            "label": f"{row.get('name')} — {suffix}",
+        })
+    return {"results": results}
 
 
 @app.get("/systems/import", response_class=HTMLResponse)
@@ -329,6 +375,20 @@ async def submit_poi_post(
     }
     await api_request("POST", f"/api/bodies/{body_id}/pois/submit", json_body=payload)
     return RedirectResponse(f"/bodies/{body_id}?lat={lat}&lon={lon}&message=POI%20submitted%20for%20review", status_code=303)
+
+
+@app.get("/systems/{system_id}/open")
+async def system_open(system_id: int) -> RedirectResponse:
+    # Normal system links can use this convenience route. If the system only has
+    # one tracked/predictable body, jump straight to that body. Otherwise show
+    # the system overview.
+    bodies = await api_request("GET", f"/api/systems/{system_id}/bodies")
+    summary = await api_request("GET", "/api/summary")
+    tracked_body_ids = {int(row["body_pk"]) for row in summary.get("tracked_bodies", summary.get("bodies_with_observations", []))}
+    target_bodies = [b for b in bodies.get("results", []) if int(b.get("id", -1)) in tracked_body_ids]
+    if len(target_bodies) == 1:
+        return RedirectResponse(f"/bodies/{int(target_bodies[0]['id'])}", status_code=303)
+    return RedirectResponse(f"/systems/{system_id}", status_code=303)
 
 
 @app.get("/systems/{system_id}", response_class=HTMLResponse)

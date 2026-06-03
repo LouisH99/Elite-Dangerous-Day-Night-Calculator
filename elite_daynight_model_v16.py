@@ -38,13 +38,39 @@ except Exception:
 
 
 def parse_utc(value: str) -> datetime:
+    """Parse UTC timestamps used by the website/API.
+
+    Besides full ISO timestamps, accept user-friendly full-hour inputs such as:
+      2026-06-02 18
+      2026-06-02 18:00
+      2026-06-02T18
+      2026-06-02T18:00
+    Missing minutes/seconds are normalized to :00. Naive values are treated as UTC.
+    """
+    import re
+
     s = str(value).strip()
     if not s:
         raise ValueError("empty UTC timestamp")
+
+    # Normalize common UTC suffix and the first date/time separator.
     if s.endswith("Z"):
         s = s[:-1] + "+00:00"
     if "T" not in s and " " in s:
         s = s.replace(" ", "T", 1)
+
+    # Allow full-hour or minute-only input while preserving optional timezone suffixes.
+    m = re.match(r"^(\d{4}-\d{2}-\d{2})T(\d{1,2})(?:(?::(\d{1,2}))(?::(\d{1,2}))?)?(.+)?$", s)
+    if m:
+        date, hour, minute, second, suffix = m.groups()
+        # Only treat a suffix as timezone when it looks like one. Otherwise leave
+        # the original string for datetime.fromisoformat to validate.
+        suffix = suffix or ""
+        if suffix and not (suffix.startswith("+") or suffix.startswith("-")):
+            pass
+        else:
+            s = f"{date}T{int(hour):02d}:{int(minute or 0):02d}:{int(second or 0):02d}{suffix}"
+
     dt = datetime.fromisoformat(s)
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)

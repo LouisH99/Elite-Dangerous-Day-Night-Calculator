@@ -1,3 +1,11 @@
+## V0.203
+
+- Added local system search autocomplete on the top search and systems page.
+- Selecting/opening a system with exactly one tracked body now opens that body page directly.
+- System search results now show tracked-body, observation, and reviewed-model counts.
+- Prediction and observation timestamp parsing now accepts shorter UTC inputs such as `2026-06-02 18`, `2026-06-02 18:00`, and `2026-06-02T18`.
+- No deploy directory is included in the release package.
+
 ## V0.202
 
 - Changed website timestamp display from raw ISO strings like `2026-06-02T18:36:04Z` to a more readable UTC format like `2026-06-02 18:36:04 UTC`.

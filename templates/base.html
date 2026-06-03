@@ -16,8 +16,11 @@
     {% if public_poi_submissions_enabled %}<a href="/pois/submit">Submit POI</a>{% endif %}
     <a href="/about">About</a>
   </nav>
-  <form class="top-search" method="get" action="/systems">
-    <input name="q" placeholder="Search system" value="{{ q|default('') }}">
+  <form class="top-search system-search" method="get" action="/systems" autocomplete="off">
+    <div class="autocomplete-wrap">
+      <input name="q" placeholder="Search system" value="{{ q|default('') }}" data-system-autocomplete="1">
+      <div class="autocomplete-menu" hidden></div>
+    </div>
     <button type="submit">Search</button>
   </form>
 </header>

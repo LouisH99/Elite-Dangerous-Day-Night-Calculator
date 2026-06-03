@@ -3,26 +3,32 @@
 {% block content %}
 <section class="card">
   <h1>Systems</h1>
-  <form class="inline-form" method="get" action="/systems">
-    <input name="q" placeholder="System name or address" value="{{ q }}">
+  <form class="inline-form system-search" method="get" action="/systems" autocomplete="off">
+    <div class="autocomplete-wrap wide">
+      <input name="q" placeholder="System name or address" value="{{ q }}" data-system-autocomplete="1">
+      <div class="autocomplete-menu" hidden></div>
+    </div>
     <button type="submit">Search</button>
     <a class="button" href="/systems/import">Import new</a>
   </form>
+  <p class="field-help">Start typing to select a local system. Systems with only one tracked body open that body directly.</p>
 </section>
 
 <section class="card">
   {% if systems %}
   <div class="table-wrap">
     <table>
-      <thead><tr><th>Name</th><th>Address</th><th>Coords</th><th>Updated</th><th></th></tr></thead>
+      <thead><tr><th>Name</th><th>Address</th><th>Tracked bodies</th><th>Models</th><th>Coords</th><th>Updated</th><th></th></tr></thead>
       <tbody>
       {% for s in systems %}
         <tr>
           <td>{{ s.name }}</td>
           <td>{{ s.system_address }}</td>
+          <td>{{ s.tracked_body_count or 0 }}{% if s.observed_body_count %} <span class="muted">({{ s.observed_body_count }} observed)</span>{% endif %}</td>
+          <td>{{ s.approved_model_count or 0 }}</td>
           <td>{{ s.x|num(3) }}, {{ s.y|num(3) }}, {{ s.z|num(3) }}</td>
           <td>{{ s.updated_at_utc|utc }}</td>
-          <td><a href="/systems/{{ s.id }}">Open</a></td>
+          <td><a href="{{ s.open_url or ('/systems/' ~ s.id ~ '/open') }}">Open</a></td>
         </tr>
       {% endfor %}
       </tbody>

@@ -67,7 +67,7 @@ ALLOWED_QUALITY = {"high", "medium", "low"}
 
 app = FastAPI(
     title="Elite Dangerous Day/Night Calculator API",
-    version="0.202",
+    version="0.203",
     description="Local-first API for systems, bodies, observations, fitting and prediction.",
 )
 
@@ -934,7 +934,7 @@ def start_provisional_fit_worker() -> None:
 def root() -> Dict[str, Any]:
     return {
         "name": "Elite Dangerous Day/Night Calculator API",
-        "version": "0.202",
+        "version": "0.203",
         "db_path": DB_PATH,
         "docs": "/docs",
     }
@@ -1006,13 +1006,43 @@ def summary() -> Dict[str, Any]:
 def search_systems(q: str = Query("", description="Local database search"), limit: int = Query(20, ge=1, le=100)) -> Dict[str, Any]:
     con = connect()
     try:
+        sql = """
+            WITH obs AS (
+                SELECT body_id, COUNT(*) AS observations
+                  FROM observations
+                 GROUP BY body_id
+            ), approved_fits AS (
+                SELECT body_id, COUNT(*) AS approved_fit_count
+                  FROM fits
+                 WHERE is_active = 1 AND fit_mode = 'approved'
+                 GROUP BY body_id
+            ), body_flags AS (
+                SELECT b.system_id,
+                       b.id AS body_pk,
+                       CASE WHEN b.tracked_for_prediction = 1 OR COALESCE(obs.observations, 0) > 0 THEN 1 ELSE 0 END AS is_tracked,
+                       CASE WHEN COALESCE(obs.observations, 0) > 0 THEN 1 ELSE 0 END AS has_observations,
+                       CASE WHEN COALESCE(approved_fits.approved_fit_count, 0) > 0 THEN 1 ELSE 0 END AS has_approved_fit
+                  FROM bodies b
+                  LEFT JOIN obs ON obs.body_id = b.id
+                  LEFT JOIN approved_fits ON approved_fits.body_id = b.id
+            )
+            SELECT s.*,
+                   COALESCE(SUM(body_flags.is_tracked), 0) AS tracked_body_count,
+                   COALESCE(SUM(body_flags.has_observations), 0) AS observed_body_count,
+                   COALESCE(SUM(body_flags.has_approved_fit), 0) AS approved_model_count,
+                   CASE WHEN COALESCE(SUM(body_flags.is_tracked), 0) = 1
+                        THEN MIN(CASE WHEN body_flags.is_tracked = 1 THEN body_flags.body_pk END)
+                        ELSE NULL END AS single_tracked_body_id
+              FROM systems s
+              LEFT JOIN body_flags ON body_flags.system_id = s.id
+        """
+        params: List[Any] = []
         if q.strip():
-            rows = con.execute(
-                "SELECT * FROM systems WHERE lower(name) LIKE lower(?) OR CAST(system_address AS TEXT) = ? ORDER BY name LIMIT ?",
-                (f"%{q.strip()}%", q.strip(), limit),
-            ).fetchall()
-        else:
-            rows = con.execute("SELECT * FROM systems ORDER BY name LIMIT ?", (limit,)).fetchall()
+            sql += " WHERE lower(s.name) LIKE lower(?) OR CAST(s.system_address AS TEXT) = ?"
+            params.extend([f"%{q.strip()}%", q.strip()])
+        sql += " GROUP BY s.id ORDER BY s.name LIMIT ?"
+        params.append(limit)
+        rows = con.execute(sql, params).fetchall()
     finally:
         con.close()
     return {"results": [row_to_dict(r) for r in rows]}

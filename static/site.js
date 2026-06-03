@@ -151,3 +151,74 @@ function setupLiveObservationTime() {
 document.addEventListener('DOMContentLoaded', () => {
   setupLiveObservationTime();
 });
+
+function initSystemAutocomplete() {
+  const inputs = document.querySelectorAll('[data-system-autocomplete="1"]');
+  inputs.forEach((input) => {
+    const wrap = input.closest('.autocomplete-wrap') || input.parentElement;
+    const menu = wrap ? wrap.querySelector('.autocomplete-menu') : null;
+    if (!menu) return;
+    let timer = null;
+    let lastQuery = '';
+
+    function hide() {
+      menu.hidden = true;
+      menu.innerHTML = '';
+    }
+    function show(items) {
+      menu.innerHTML = '';
+      if (!items || !items.length) {
+        hide();
+        return;
+      }
+      for (const item of items) {
+        const a = document.createElement('a');
+        a.href = item.url || `/systems/${item.id}/open`;
+        a.className = 'autocomplete-item';
+        const title = document.createElement('strong');
+        title.textContent = item.name || 'Unknown system';
+        const detail = document.createElement('span');
+        const parts = [];
+        if (item.tracked_body_count) parts.push(`${item.tracked_body_count} tracked`);
+        if (item.observed_body_count) parts.push(`${item.observed_body_count} observed`);
+        if (item.approved_model_count) parts.push(`${item.approved_model_count} model${item.approved_model_count === 1 ? '' : 's'}`);
+        detail.textContent = parts.length ? parts.join(' · ') : 'no tracked bodies yet';
+        a.appendChild(title);
+        a.appendChild(detail);
+        menu.appendChild(a);
+      }
+      menu.hidden = false;
+    }
+    async function search() {
+      const q = input.value.trim();
+      if (q.length < 2) {
+        hide();
+        return;
+      }
+      if (q === lastQuery) return;
+      lastQuery = q;
+      try {
+        const res = await fetch(`/systems/autocomplete?q=${encodeURIComponent(q)}`);
+        if (!res.ok) return;
+        const data = await res.json();
+        show(data.results || []);
+      } catch {
+        hide();
+      }
+    }
+    input.addEventListener('input', () => {
+      clearTimeout(timer);
+      timer = setTimeout(search, 180);
+    });
+    input.addEventListener('focus', search);
+    document.addEventListener('click', (ev) => {
+      if (!wrap.contains(ev.target)) hide();
+    });
+  });
+}
+
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', initSystemAutocomplete);
+} else {
+  initSystemAutocomplete();
+}
