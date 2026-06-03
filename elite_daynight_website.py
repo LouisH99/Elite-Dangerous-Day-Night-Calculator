@@ -61,7 +61,7 @@ PUBLIC_POI_SUBMISSIONS_ENABLED = env_bool("ELITE_DAYNIGHT_PUBLIC_POI_SUBMISSIONS
 
 app = FastAPI(
     title="Elite Dangerous Day/Night Calculator Website",
-    version="0.203",
+    version="0.204",
     docs_url=None,
     redoc_url=None,
     openapi_url=None,
@@ -248,13 +248,40 @@ def system_open_url(system_row: Dict[str, Any]) -> str:
     return f"/systems/{int(system_row['id'])}"
 
 
+def query_flag(value: str, default: bool = False) -> bool:
+    text = str(value or "").strip().lower()
+    if not text:
+        return default
+    return text not in {"0", "false", "no", "off"}
+
+
 @app.get("/systems", response_class=HTMLResponse)
-async def systems(request: Request, q: str = Query("")) -> HTMLResponse:
-    data = await api_request("GET", "/api/systems/search", params={"q": q, "limit": 50})
+async def systems(
+    request: Request,
+    q: str = Query(""),
+    hide_racing_only: str = Query("1"),
+    has_reviewed_model: str = Query(""),
+    needs_observations: str = Query(""),
+    has_provisional_model: str = Query(""),
+    has_observations: str = Query(""),
+    confidence: str = Query(""),
+) -> HTMLResponse:
+    filters = {
+        "hide_racing_only": query_flag(hide_racing_only, True),
+        "has_reviewed_model": query_flag(has_reviewed_model),
+        "needs_observations": query_flag(needs_observations),
+        "has_provisional_model": query_flag(has_provisional_model),
+        "has_observations": query_flag(has_observations),
+        "confidence": (confidence or "").strip().lower(),
+    }
+    if filters["confidence"] not in {"", "all", "high", "low"}:
+        filters["confidence"] = ""
+    params = {"q": q, "limit": 100, **filters}
+    data = await api_request("GET", "/api/systems/search", params=params)
     rows = data.get("results", [])
     for row in rows:
         row["open_url"] = system_open_url(row)
-    return render(request, "systems.html", {"q": q, "systems": rows})
+    return render(request, "systems.html", {"q": q, "systems": rows, "filters": filters})
 
 
 @app.get("/systems/autocomplete")

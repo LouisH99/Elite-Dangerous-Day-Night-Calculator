@@ -1,3 +1,10 @@
+## V0.204
+
+- Added public `/systems` overview filters for reviewed models, provisional models, observations, needs-observations, and high/low confidence.
+- Added a default-on "Hide racing-only systems" filter so systems imported only because of Razz Racing POIs do not overwhelm the public systems list.
+- Added lightweight system health counters to `/api/systems/search`, including provisional model count, POI count, racing POI count, needs-observations count, and confidence buckets.
+- Updated the systems table with model, health, and POI badges so filtered results are easier to scan.
+
 ## V0.203
 
 - Added local system search autocomplete on the top search and systems page.

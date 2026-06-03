@@ -3,29 +3,94 @@
 {% block content %}
 <section class="card">
   <h1>Systems</h1>
-  <form class="inline-form system-search" method="get" action="/systems" autocomplete="off">
-    <div class="autocomplete-wrap wide">
-      <input name="q" placeholder="System name or address" value="{{ q }}" data-system-autocomplete="1">
-      <div class="autocomplete-menu" hidden></div>
+  <form class="system-filter-form" method="get" action="/systems" autocomplete="off">
+    <div class="inline-form system-search">
+      <div class="autocomplete-wrap wide">
+        <input name="q" placeholder="System name or address" value="{{ q }}" data-system-autocomplete="1">
+        <div class="autocomplete-menu" hidden></div>
+      </div>
+      <button type="submit">Search</button>
+      <a class="button" href="/systems/import">Import new</a>
     </div>
-    <button type="submit">Search</button>
-    <a class="button" href="/systems/import">Import new</a>
+
+    <div class="filter-panel">
+      <label class="check-pill">
+        <input type="hidden" name="hide_racing_only" value="0">
+        <input type="checkbox" name="hide_racing_only" value="1" {% if filters.hide_racing_only %}checked{% endif %}>
+        Hide racing-only systems
+      </label>
+      <label class="check-pill">
+        <input type="checkbox" name="has_reviewed_model" value="1" {% if filters.has_reviewed_model %}checked{% endif %}>
+        Has reviewed model
+      </label>
+      <label class="check-pill">
+        <input type="checkbox" name="needs_observations" value="1" {% if filters.needs_observations %}checked{% endif %}>
+        Needs observations
+      </label>
+      <label class="check-pill">
+        <input type="checkbox" name="has_provisional_model" value="1" {% if filters.has_provisional_model %}checked{% endif %}>
+        Has provisional model
+      </label>
+      <label class="check-pill">
+        <input type="checkbox" name="has_observations" value="1" {% if filters.has_observations %}checked{% endif %}>
+        Has observations
+      </label>
+      <label class="filter-select">
+        Confidence
+        <select name="confidence">
+          <option value="" {% if not filters.confidence or filters.confidence == 'all' %}selected{% endif %}>Any</option>
+          <option value="high" {% if filters.confidence == 'high' %}selected{% endif %}>High</option>
+          <option value="low" {% if filters.confidence == 'low' %}selected{% endif %}>Low / very low</option>
+        </select>
+      </label>
+      <button type="submit" class="secondary">Apply filters</button>
+      <a class="button secondary" href="/systems">Reset</a>
+    </div>
   </form>
-  <p class="field-help">Start typing to select a local system. Systems with only one tracked body open that body directly.</p>
+  <p class="field-help">Start typing to select a local system. Systems with only one tracked body open that body directly. Racing-only systems are systems whose tracked targets only came from Razz Racing POIs and have no observations or models yet.</p>
 </section>
 
 <section class="card">
   {% if systems %}
+  <p class="muted">Showing {{ systems|length }} matching system{% if systems|length != 1 %}s{% endif %}.</p>
   <div class="table-wrap">
     <table>
-      <thead><tr><th>Name</th><th>Address</th><th>Tracked bodies</th><th>Models</th><th>Coords</th><th>Updated</th><th></th></tr></thead>
+      <thead><tr><th>Name</th><th>Address</th><th>Target bodies</th><th>Models</th><th>Health</th><th>POIs</th><th>Coords</th><th>Updated</th><th></th></tr></thead>
       <tbody>
       {% for s in systems %}
         <tr>
           <td>{{ s.name }}</td>
           <td>{{ s.system_address }}</td>
-          <td>{{ s.tracked_body_count or 0 }}{% if s.observed_body_count %} <span class="muted">({{ s.observed_body_count }} observed)</span>{% endif %}</td>
-          <td>{{ s.approved_model_count or 0 }}</td>
+          <td>
+            {{ s.tracked_body_count or 0 }}
+            {% if s.observed_body_count %}<span class="muted">· {{ s.observed_body_count }} observed</span>{% endif %}
+            {% if s.racing_only_body_count %}<span class="muted">· {{ s.racing_only_body_count }} racing-only</span>{% endif %}
+          </td>
+          <td>
+            <span class="badge {% if s.approved_model_count %}badge-ok{% else %}badge-muted{% endif %}">{{ s.approved_model_count or 0 }} reviewed</span>
+            {% if s.provisional_model_count %}<span class="badge badge-new">{{ s.provisional_model_count }} provisional</span>{% endif %}
+          </td>
+          <td>
+            {% if s.system_is_racing_only %}
+              <span class="badge badge-muted">racing only</span>
+            {% endif %}
+            {% if s.needs_observations_body_count %}
+              <span class="badge badge-warn">{{ s.needs_observations_body_count }} needs obs</span>
+            {% endif %}
+            {% if s.high_confidence_body_count %}
+              <span class="badge badge-ok">{{ s.high_confidence_body_count }} high</span>
+            {% endif %}
+            {% if s.low_confidence_body_count %}
+              <span class="badge badge-danger">{{ s.low_confidence_body_count }} low</span>
+            {% endif %}
+            {% if not s.system_is_racing_only and not s.needs_observations_body_count and not s.high_confidence_body_count and not s.low_confidence_body_count %}
+              <span class="badge badge-muted">—</span>
+            {% endif %}
+          </td>
+          <td>
+            {{ s.poi_count or 0 }}
+            {% if s.racing_poi_count %}<span class="muted">· {{ s.racing_poi_count }} racing</span>{% endif %}
+          </td>
           <td>{{ s.x|num(3) }}, {{ s.y|num(3) }}, {{ s.z|num(3) }}</td>
           <td>{{ s.updated_at_utc|utc }}</td>
           <td><a href="{{ s.open_url or ('/systems/' ~ s.id ~ '/open') }}">Open</a></td>

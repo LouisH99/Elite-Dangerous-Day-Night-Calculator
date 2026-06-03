@@ -67,7 +67,7 @@ ALLOWED_QUALITY = {"high", "medium", "low"}
 
 app = FastAPI(
     title="Elite Dangerous Day/Night Calculator API",
-    version="0.203",
+    version="0.204",
     description="Local-first API for systems, bodies, observations, fitting and prediction.",
 )
 
@@ -934,7 +934,7 @@ def start_provisional_fit_worker() -> None:
 def root() -> Dict[str, Any]:
     return {
         "name": "Elite Dangerous Day/Night Calculator API",
-        "version": "0.203",
+        "version": "0.204",
         "db_path": DB_PATH,
         "docs": "/docs",
     }
@@ -1003,44 +1003,170 @@ def summary() -> Dict[str, Any]:
 
 
 @app.get("/api/systems/search")
-def search_systems(q: str = Query("", description="Local database search"), limit: int = Query(20, ge=1, le=100)) -> Dict[str, Any]:
+def search_systems(
+    q: str = Query("", description="Local database search"),
+    limit: int = Query(20, ge=1, le=100),
+    hide_racing_only: bool = False,
+    has_reviewed_model: bool = False,
+    needs_observations: bool = False,
+    has_provisional_model: bool = False,
+    has_observations: bool = False,
+    confidence: str = Query("", description="Filter by confidence: high or low"),
+) -> Dict[str, Any]:
+    """Search local systems with lightweight model-health/filter counters.
+
+    The public website uses this for the /systems overview.  The confidence and
+    observation-need flags are intentionally cheap SQL heuristics for filtering;
+    detailed per-prediction confidence still comes from model_confidence_dict.
+    """
+    confidence_filter = (confidence or "").strip().lower()
+    if confidence_filter not in {"", "all", "high", "low"}:
+        raise HTTPException(status_code=400, detail="confidence must be high, low, all, or empty")
+
     con = connect()
     try:
         sql = """
             WITH obs AS (
-                SELECT body_id, COUNT(*) AS observations
+                SELECT body_id,
+                       COUNT(*) AS observations,
+                       SUM(CASE WHEN review_status = 'approved' THEN 1 ELSE 0 END) AS approved_observations,
+                       SUM(CASE WHEN review_status IN ('new','needs_check') THEN 1 ELSE 0 END) AS unreviewed_observations
                   FROM observations
+                 WHERE target_type = 'sun'
                  GROUP BY body_id
-            ), approved_fits AS (
-                SELECT body_id, COUNT(*) AS approved_fit_count
-                  FROM fits
-                 WHERE is_active = 1 AND fit_mode = 'approved'
+            ), active_approved AS (
+                SELECT * FROM fits
+                 WHERE is_active = 1 AND fit_mode = 'approved' AND fit_status = 'ok'
+            ), active_provisional AS (
+                SELECT * FROM fits
+                 WHERE is_active = 1 AND fit_mode = 'provisional' AND fit_status = 'ok'
+            ), fit_err AS (
+                SELECT fit_id,
+                       MAX(ABS(altitude_error_deg)) AS max_altitude_error_deg
+                  FROM fit_observations
+                 WHERE altitude_error_deg IS NOT NULL
+                 GROUP BY fit_id
+            ), poi AS (
+                SELECT body_id,
+                       COUNT(*) AS poi_count,
+                       SUM(CASE WHEN source = 'razz_racing_api'
+                                  OR lower(COALESCE(source_label, '')) LIKE '%razz racing%'
+                                  OR lower(COALESCE(source, '')) LIKE '%racing%'
+                                THEN 1 ELSE 0 END) AS racing_poi_count
+                  FROM body_pois
                  GROUP BY body_id
-            ), body_flags AS (
+            ), body_base AS (
                 SELECT b.system_id,
                        b.id AS body_pk,
-                       CASE WHEN b.tracked_for_prediction = 1 OR COALESCE(obs.observations, 0) > 0 THEN 1 ELSE 0 END AS is_tracked,
-                       CASE WHEN COALESCE(obs.observations, 0) > 0 THEN 1 ELSE 0 END AS has_observations,
-                       CASE WHEN COALESCE(approved_fits.approved_fit_count, 0) > 0 THEN 1 ELSE 0 END AS has_approved_fit
+                       b.tracked_for_prediction,
+                       COALESCE(obs.observations, 0) AS observations,
+                       COALESCE(obs.approved_observations, 0) AS approved_observations,
+                       COALESCE(obs.unreviewed_observations, 0) AS unreviewed_observations,
+                       active_approved.id AS approved_fit_id,
+                       active_approved.fit_score AS approved_fit_score,
+                       active_approved.rms_altitude_deg AS approved_rms_altitude_deg,
+                       active_provisional.id AS provisional_fit_id,
+                       active_provisional.fit_score AS provisional_fit_score,
+                       COALESCE(fit_err.max_altitude_error_deg, 0.0) AS approved_max_altitude_error_deg,
+                       COALESCE(poi.poi_count, 0) AS poi_count,
+                       COALESCE(poi.racing_poi_count, 0) AS racing_poi_count
                   FROM bodies b
                   LEFT JOIN obs ON obs.body_id = b.id
-                  LEFT JOIN approved_fits ON approved_fits.body_id = b.id
+                  LEFT JOIN active_approved ON active_approved.body_id = b.id
+                  LEFT JOIN active_provisional ON active_provisional.body_id = b.id
+                  LEFT JOIN fit_err ON fit_err.fit_id = active_approved.id
+                  LEFT JOIN poi ON poi.body_id = b.id
+            ), body_flags_1 AS (
+                SELECT *,
+                       CASE WHEN tracked_for_prediction = 1
+                                  OR observations > 0
+                                  OR approved_fit_id IS NOT NULL
+                                  OR provisional_fit_id IS NOT NULL
+                                  OR poi_count > 0
+                            THEN 1 ELSE 0 END AS is_tracked,
+                       CASE WHEN poi_count > 0
+                                  AND racing_poi_count = poi_count
+                                  AND observations = 0
+                                  AND approved_fit_id IS NULL
+                                  AND provisional_fit_id IS NULL
+                            THEN 1 ELSE 0 END AS is_racing_only
+                  FROM body_base
+            ), body_flags AS (
+                SELECT *,
+                       CASE WHEN approved_fit_id IS NOT NULL THEN 1 ELSE 0 END AS has_approved_fit,
+                       CASE WHEN provisional_fit_id IS NOT NULL THEN 1 ELSE 0 END AS has_provisional_fit,
+                       CASE WHEN observations > 0 THEN 1 ELSE 0 END AS has_observations,
+                       CASE WHEN approved_fit_id IS NOT NULL
+                                  AND approved_observations >= 4
+                                  AND approved_rms_altitude_deg IS NOT NULL
+                                  AND approved_rms_altitude_deg <= 1.5
+                                  AND approved_max_altitude_error_deg <= 3.0
+                            THEN 1 ELSE 0 END AS high_confidence,
+                       CASE WHEN is_tracked = 1
+                                  AND is_racing_only = 0
+                                  AND (
+                                      approved_fit_id IS NULL
+                                      OR approved_observations < 4
+                                      OR approved_rms_altitude_deg IS NULL
+                                      OR approved_rms_altitude_deg > 3.0
+                                      OR approved_max_altitude_error_deg > 6.0
+                                  )
+                            THEN 1 ELSE 0 END AS low_confidence,
+                       CASE WHEN is_tracked = 1
+                                  AND is_racing_only = 0
+                                  AND (
+                                      approved_fit_id IS NULL
+                                      OR approved_observations < 4
+                                      OR approved_rms_altitude_deg IS NULL
+                                      OR approved_rms_altitude_deg > 3.0
+                                      OR approved_max_altitude_error_deg > 6.0
+                                  )
+                            THEN 1 ELSE 0 END AS needs_observations
+                  FROM body_flags_1
+            ), system_flags AS (
+                SELECT s.*,
+                       COALESCE(SUM(body_flags.is_tracked), 0) AS tracked_body_count,
+                       COALESCE(SUM(body_flags.has_observations), 0) AS observed_body_count,
+                       COALESCE(SUM(body_flags.has_approved_fit), 0) AS approved_model_count,
+                       COALESCE(SUM(body_flags.has_provisional_fit), 0) AS provisional_model_count,
+                       COALESCE(SUM(body_flags.needs_observations), 0) AS needs_observations_body_count,
+                       COALESCE(SUM(body_flags.high_confidence), 0) AS high_confidence_body_count,
+                       COALESCE(SUM(body_flags.low_confidence), 0) AS low_confidence_body_count,
+                       COALESCE(SUM(body_flags.poi_count), 0) AS poi_count,
+                       COALESCE(SUM(body_flags.racing_poi_count), 0) AS racing_poi_count,
+                       COALESCE(SUM(body_flags.is_racing_only), 0) AS racing_only_body_count,
+                       CASE WHEN COALESCE(SUM(body_flags.is_tracked), 0) > 0
+                                  AND COALESCE(SUM(body_flags.is_tracked), 0) = COALESCE(SUM(body_flags.is_racing_only), 0)
+                            THEN 1 ELSE 0 END AS system_is_racing_only,
+                       CASE WHEN COALESCE(SUM(body_flags.is_tracked), 0) = 1
+                            THEN MIN(CASE WHEN body_flags.is_tracked = 1 THEN body_flags.body_pk END)
+                            ELSE NULL END AS single_tracked_body_id
+                  FROM systems s
+                  LEFT JOIN body_flags ON body_flags.system_id = s.id
+                 GROUP BY s.id
             )
-            SELECT s.*,
-                   COALESCE(SUM(body_flags.is_tracked), 0) AS tracked_body_count,
-                   COALESCE(SUM(body_flags.has_observations), 0) AS observed_body_count,
-                   COALESCE(SUM(body_flags.has_approved_fit), 0) AS approved_model_count,
-                   CASE WHEN COALESCE(SUM(body_flags.is_tracked), 0) = 1
-                        THEN MIN(CASE WHEN body_flags.is_tracked = 1 THEN body_flags.body_pk END)
-                        ELSE NULL END AS single_tracked_body_id
-              FROM systems s
-              LEFT JOIN body_flags ON body_flags.system_id = s.id
+            SELECT * FROM system_flags
+             WHERE 1 = 1
         """
         params: List[Any] = []
         if q.strip():
-            sql += " WHERE lower(s.name) LIKE lower(?) OR CAST(s.system_address AS TEXT) = ?"
+            sql += " AND (lower(name) LIKE lower(?) OR CAST(system_address AS TEXT) = ?)"
             params.extend([f"%{q.strip()}%", q.strip()])
-        sql += " GROUP BY s.id ORDER BY s.name LIMIT ?"
+        if hide_racing_only:
+            sql += " AND system_is_racing_only = 0"
+        if has_reviewed_model:
+            sql += " AND approved_model_count > 0"
+        if needs_observations:
+            sql += " AND needs_observations_body_count > 0"
+        if has_provisional_model:
+            sql += " AND provisional_model_count > 0"
+        if has_observations:
+            sql += " AND observed_body_count > 0"
+        if confidence_filter == "high":
+            sql += " AND high_confidence_body_count > 0"
+        elif confidence_filter == "low":
+            sql += " AND low_confidence_body_count > 0"
+        sql += " ORDER BY name LIMIT ?"
         params.append(limit)
         rows = con.execute(sql, params).fetchall()
     finally:
