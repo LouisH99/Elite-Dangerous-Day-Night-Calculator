@@ -1,12 +1,12 @@
 # Elite Dangerous Day/Night Calculator
 
-Current package version: **V0.200**.
+Current package version: **V0.201**.
 
 A community tool for predicting local daylight, sunrise, sunset, and sun elevation on planets and moons in **Elite Dangerous**.
 
 The project lets players add systems/bodies, submit sun observations, review submitted data, fit a prediction model, and use saved Points of Interest (POIs) to quickly check local light conditions.
 
-> **Project status:** early community tool, currently around `V0.200`.
+> **Project status:** early community tool, currently around `V0.201`.
 >
 > **Transparency note:** this is a **vibe-coded / AI-assisted project**. A large part of the design, code structure, debugging, and documentation was created with help from ChatGPT. The model, outputs, and implementation should be treated as experimental and should be validated with real observations.
 
@@ -24,6 +24,7 @@ For a selected planet or moon, the website can show:
 - whether the sun is rising or falling
 - saved POIs for common locations
 - reviewed and provisional prediction models
+- model confidence level and score
 
 Players can help by submitting surface observations. Reviewers can approve, reject, edit, or inspect observations before they are used in the reviewed model.
 
@@ -64,6 +65,7 @@ Players can help by submitting surface observations. Reviewers can approve, reje
 - Compact storage of relevant system/body/orbital data
 - Reviewed and provisional fits stored separately
 - Old fit cleanup
+- Heuristic model-confidence output for website/API use
 
 ---
 
@@ -341,6 +343,27 @@ The website then displays:
 - sunlight duration
 - day period
 - POI-specific predictions if a POI is selected
+
+### Model confidence
+
+Each prediction includes a practical confidence estimate. The score is not a formal probability; it is a heuristic indicator based on:
+
+- fit RMS and maximum altitude residual
+- number and quality-weighted count of observations
+- observation time spread compared with the estimated day cycle
+- time distance between the prediction and the newest observation
+- reviewed vs provisional data
+- sun-source/orbit geometry mode
+
+The website shows a simple label such as:
+
+```text
+High · 88%
+Medium · 67%
+Low · 42%
+```
+
+The detailed confidence object is also returned in prediction responses for future public API use.
 
 ---
 
