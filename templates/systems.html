@@ -21,7 +21,7 @@
           <td>{{ s.name }}</td>
           <td>{{ s.system_address }}</td>
           <td>{{ s.x|num(3) }}, {{ s.y|num(3) }}, {{ s.z|num(3) }}</td>
-          <td>{{ s.updated_at_utc|dash }}</td>
+          <td>{{ s.updated_at_utc|utc }}</td>
           <td><a href="/systems/{{ s.id }}">Open</a></td>
         </tr>
       {% endfor %}

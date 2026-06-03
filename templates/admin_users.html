@@ -19,8 +19,8 @@
           <td>{{ u.role }}</td>
           <td>{% if u.is_active %}<span class="badge badge-ok">active</span>{% else %}<span class="badge badge-danger">disabled</span>{% endif %}</td>
           <td>{% if u.must_change_password %}<span class="badge badge-warn">must change</span>{% else %}<span class="badge badge-muted">ok</span>{% endif %}</td>
-          <td>{{ u.last_login_at_utc or '—' }}</td>
-          <td>{{ u.updated_at_utc }}</td>
+          <td>{{ u.last_login_at_utc|utc }}</td>
+          <td>{{ u.updated_at_utc|utc }}</td>
           <td><a class="button small" href="/control/users/{{ u.id }}/edit">Edit</a></td>
         </tr>
       {% endfor %}

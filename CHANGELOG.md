@@ -1,3 +1,9 @@
+## V0.202
+
+- Changed website timestamp display from raw ISO strings like `2026-06-02T18:36:04Z` to a more readable UTC format like `2026-06-02 18:36:04 UTC`.
+- Kept internal form values and API timestamps in ISO UTC format for compatibility.
+- Removed the deploy examples directory from the release package.
+
 ## V0.201
 
 - Added model confidence scoring for reviewed and provisional fits.

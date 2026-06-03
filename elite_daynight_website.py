@@ -61,7 +61,7 @@ PUBLIC_POI_SUBMISSIONS_ENABLED = env_bool("ELITE_DAYNIGHT_PUBLIC_POI_SUBMISSIONS
 
 app = FastAPI(
     title="Elite Dangerous Day/Night Calculator Website",
-    version="0.201",
+    version="0.202",
     docs_url=None,
     redoc_url=None,
     openapi_url=None,
@@ -104,9 +104,36 @@ def short_num(value: Any, digits: int = 3) -> str:
         return str(value)
 
 
+def readable_utc(value: Any) -> str:
+    """Display UTC timestamps in a human-friendly form while keeping ISO internally."""
+    if value is None or value == "":
+        return "—"
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        text = str(value).strip()
+        if not text:
+            return "—"
+        # Common internal/API format is 2026-06-02T18:36:04Z.
+        # Also accept SQLite-ish values and offsets.
+        parse_text = text.replace("Z", "+00:00")
+        try:
+            dt = datetime.fromisoformat(parse_text)
+        except Exception:
+            # Best-effort cosmetic fallback for already-normalized strings.
+            if text.endswith("Z") and "T" in text:
+                return text[:-1].replace("T", " ") + " UTC"
+            return text
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    dt = dt.astimezone(timezone.utc).replace(microsecond=0)
+    return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
 templates.env.filters["duration"] = fmt_seconds
 templates.env.filters["dash"] = none_dash
 templates.env.filters["num"] = short_num
+templates.env.filters["utc"] = readable_utc
 
 
 class ApiError(Exception):

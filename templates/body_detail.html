@@ -147,8 +147,8 @@
   <div class="result-grid">
     <div><span>Sun altitude</span><strong>{{ prediction.sun_altitude_deg|num(2) }}°</strong><em>{{ prediction.sun_altitude_trend }}</em></div>
     <div><span>Sun heading</span><strong>{{ prediction.sun_heading_deg|num(2) }}°</strong></div>
-    <div><span>Next sunrise</span><strong>{{ prediction.next_sunrise_utc|dash }}</strong><em>{{ prediction.next_sunrise_seconds|duration }}</em></div>
-    <div><span>Next sunset</span><strong>{{ prediction.next_sunset_utc|dash }}</strong><em>{{ prediction.next_sunset_seconds|duration }}</em></div>
+    <div><span>Next sunrise</span><strong>{{ prediction.next_sunrise_utc|utc }}</strong><em>{{ prediction.next_sunrise_seconds|duration }}</em></div>
+    <div><span>Next sunset</span><strong>{{ prediction.next_sunset_utc|utc }}</strong><em>{{ prediction.next_sunset_seconds|duration }}</em></div>
     <div><span>Sunlight duration</span><strong>{{ prediction.sunlight_duration_sec|duration }}</strong></div>
     <div><span>Day period</span><strong>{{ prediction.day_period_sec|duration }}</strong></div>
   </div>
@@ -160,7 +160,7 @@
       <thead><tr><th>Kind</th><th>UTC time</th><th>From target</th></tr></thead>
       <tbody>
       {% for c in prediction.centre_horizon_crossings[:12] %}
-        <tr><td>{{ c.kind }}{% if not c.inside_prediction_window %} <span class="tag">later</span>{% endif %}</td><td>{{ c.time_utc }}</td><td>{{ c.seconds_from_target|duration }}</td></tr>
+        <tr><td>{{ c.kind }}{% if not c.inside_prediction_window %} <span class="tag">later</span>{% endif %}</td><td>{{ c.time_utc|utc }}</td><td>{{ c.seconds_from_target|duration }}</td></tr>
       {% else %}
         <tr><td colspan="3" class="muted">No horizon crossings found in the checked model period.</td></tr>
       {% endfor %}

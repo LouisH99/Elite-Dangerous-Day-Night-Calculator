@@ -28,7 +28,7 @@
       <tbody>
       {% for e in entries %}
         <tr>
-          <td class="small-text">{{ e.created_at_utc }}</td>
+          <td class="small-text">{{ e.created_at_utc|utc }}</td>
           <td>{{ e.actor or '—' }}</td>
           <td><code>{{ e.action }}</code></td>
           <td>{{ e.entity_type }} #{{ e.entity_id or '—' }}</td>

@@ -58,7 +58,7 @@
         <td><span class="badge {{ o.review_status|review_badge }}">{{ o.review_status }}</span></td>
         <td>{{ o.system_name }}<br><b>{{ o.body_name }}</b></td>
         <td>{{ o.observer_name|dash }}</td>
-        <td>{{ o.timestamp_utc }}<br><span class="muted">submitted {{ o.created_at_utc }}</span></td>
+        <td>{{ o.timestamp_utc|utc }}<br><span class="muted">submitted {{ o.created_at_utc|utc }}</span></td>
         <td>{{ o.lat|num(5) }}<br>{{ o.lon|num(5) }}</td>
         <td>{{ o.observation }}</td>
         <td>{{ o.elevation|dash }}°<br>{{ o.heading|dash }}°</td>

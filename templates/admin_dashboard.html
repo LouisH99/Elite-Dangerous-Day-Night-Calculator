@@ -37,7 +37,7 @@
         <tr>
           <td>#{{ o.id }}</td>
           <td>{{ o.system_name }}<br><b>{{ o.body_name }}</b></td>
-          <td>{{ o.timestamp_utc }}</td>
+          <td>{{ o.timestamp_utc|utc }}</td>
           <td>{{ o.lat|num(5) }}, {{ o.lon|num(5) }}</td>
           <td>{{ o.elevation|dash }}° / {{ o.heading|dash }}°</td>
           <td>{{ o.quality }}</td>
