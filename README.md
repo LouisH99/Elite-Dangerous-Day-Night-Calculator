@@ -1,12 +1,12 @@
 # Elite Dangerous Day/Night Calculator
 
-Current package version: **V0.203**.
+Current package version: **V0.204**.
 
 A community tool for predicting local daylight, sunrise, sunset, and sun elevation on planets and moons in **Elite Dangerous**.
 
 The project lets players add systems/bodies, submit sun observations, review submitted data, fit a prediction model, and use saved Points of Interest (POIs) to quickly check local light conditions.
 
-> **Project status:** early community tool, currently around `V0.203`.
+> **Project status:** early community tool, currently around `V0.204`.
 >
 > **Transparency note:** this is a **vibe-coded / AI-assisted project**. A large part of the design, code structure, debugging, and documentation was created with help from ChatGPT. The model, outputs, and implementation should be treated as experimental and should be validated with real observations.
 
@@ -25,6 +25,7 @@ For a selected planet or moon, the website can show:
 - saved POIs for common locations
 - reviewed and provisional prediction models
 - model confidence level and score
+- system-overview health badges for model and observation triage
 
 Players can help by submitting surface observations. Reviewers can approve, reject, edit, or inspect observations before they are used in the reviewed model.
 
@@ -35,6 +36,7 @@ Players can help by submitting surface observations. Reviewers can approve, reje
 ### Public website
 
 - Search systems already in the local database with autocomplete
+- Filter the systems overview by reviewed model, provisional model, observations, needs-observations, confidence, and racing-only status
 - Import systems/bodies from Spansh
 - View predictable bodies only
 - Predict day/night for manual coordinates
@@ -367,6 +369,22 @@ Low · 42%
 ```
 
 The detailed confidence object is also returned in prediction responses for future public API use.
+
+### System overview filters
+
+The `/systems` page can filter the local system list by:
+
+```text
+Has reviewed model
+Needs observations
+Has provisional model
+Has observations
+High confidence
+Low / very low confidence
+Hide racing-only systems
+```
+
+A racing-only system is one where the tracked target bodies only exist because of Razz Racing POIs and do not yet have observations or active models. This keeps large racing imports from overwhelming the normal prediction-work overview while still allowing the filter to be disabled when needed.
 
 ---
 
