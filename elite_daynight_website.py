@@ -61,7 +61,7 @@ PUBLIC_POI_SUBMISSIONS_ENABLED = env_bool("ELITE_DAYNIGHT_PUBLIC_POI_SUBMISSIONS
 
 app = FastAPI(
     title="Elite Dangerous Day/Night Calculator Website",
-    version="0.198",
+    version="0.199",
     docs_url=None,
     redoc_url=None,
     openapi_url=None,
@@ -1327,6 +1327,8 @@ async def admin_body_fit(request: Request, body_id: int):
     if not admin_logged_in(request):
         return admin_redirect(request)
     body = await api_request("GET", f"/api/bodies/{body_id}")
+    stars_resp = await api_request("GET", f"/api/systems/{body['system_id']}/stars")
+    stars = stars_resp.get("results", [])
     approved_fit = None
     approved_fit_error = None
     provisional_fit = None
@@ -1348,6 +1350,7 @@ async def admin_body_fit(request: Request, body_id: int):
     fit_jobs_active = any(str(j.get("status", "")).lower() in {"queued", "running"} for j in fit_job_rows)
     return render(request, "admin_body_fit.html", {
         "body": body,
+        "stars": stars,
         "approved_fit": approved_fit,
         "approved_fit_error": approved_fit_error,
         "provisional_fit": provisional_fit,
@@ -1366,6 +1369,7 @@ async def admin_refit_body(
     time_weighting: str = Form(""),
     include_unreviewed: str = Form(""),
     time_half_life_hours: float = Form(24.0),
+    illumination_source_star_name: str = Form(""),
 ):
     redirect = require_super_admin(request)
     if redirect:
@@ -1377,6 +1381,7 @@ async def admin_refit_body(
         "include_unreviewed": bool(include_unreviewed),
         "force_refit": True,
         "background": True,
+        "illumination_source_star_name": illumination_source_star_name,
         "actor": request.session.get("admin_user", "control-super"),
     }
     await api_request("POST", f"/api/admin/bodies/{body_id}/refit", json_body=payload)

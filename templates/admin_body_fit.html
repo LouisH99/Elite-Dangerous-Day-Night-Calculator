@@ -17,6 +17,16 @@
       <label class="check"><input type="checkbox" name="use_heading" value="on"> Use heading constraints</label>
       <label class="check"><input type="checkbox" name="time_weighting" value="on"> Weight recent observations</label>
       <label>Half-life hours <input type="number" step="0.1" name="time_half_life_hours" value="24"></label>
+      <label>Illumination source star
+        <select name="illumination_source_star_name">
+          <option value="" {% if not body.illumination_source_star_name %}selected{% endif %}>auto</option>
+          {% for star in stars %}
+          <option value="{{ star.name }}" {% if body.illumination_source_star_name == star.name %}selected{% endif %}>{{ star.name }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <p class="muted small-help">Auto uses parent-chain inference; combined-name bodies like ABC/AB/BC can be overridden here.</p>
+
       <button class="primary" type="submit">Refit reviewed model</button>
     </form>
     <form class="stack-form" method="post" action="/control/bodies/{{ body.id }}/refit">
@@ -26,6 +36,16 @@
       <label class="check"><input type="checkbox" name="use_heading" value="on"> Use heading constraints</label>
       <label class="check"><input type="checkbox" name="time_weighting" value="on"> Weight recent observations</label>
       <label>Half-life hours <input type="number" step="0.1" name="time_half_life_hours" value="24"></label>
+      <label>Illumination source star
+        <select name="illumination_source_star_name">
+          <option value="" {% if not body.illumination_source_star_name %}selected{% endif %}>auto</option>
+          {% for star in stars %}
+          <option value="{{ star.name }}" {% if body.illumination_source_star_name == star.name %}selected{% endif %}>{{ star.name }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <p class="muted small-help">Auto uses parent-chain inference; combined-name bodies like ABC/AB/BC can be overridden here.</p>
+
       <button class="primary" type="submit">Refit provisional model</button>
     </form>
   </div>
@@ -41,6 +61,9 @@
   <section class="card">
     <h2>{{ title }} #{{ fit.id }}</h2>
     {% if provisional or fit.fit_uses_unverified_data %}<p class="warn"><b>Provisional model:</b> {{ fit.fit_data_note }}</p>{% else %}<p class="muted">{{ fit.fit_data_note }}</p>{% endif %}
+    {% if fit.params %}
+    <p class="muted">Illumination source: <b>{{ fit.params.illumination_source|default('unknown') }}</b> · Sun-source mode: <b>{{ fit.params.sun_source_mode|default('unknown') }}</b> · {{ fit.params.orbit_context|default('') }}</p>
+    {% endif %}
     <div class="stats">
       <div><strong>{{ fit.fit_score|num(3) }}</strong><span>fit score</span></div>
       <div><strong>{{ fit.rms_altitude_deg|num(3) }}°</strong><span>RMS altitude</span></div>

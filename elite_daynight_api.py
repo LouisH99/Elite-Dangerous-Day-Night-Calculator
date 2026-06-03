@@ -67,7 +67,7 @@ ALLOWED_QUALITY = {"high", "medium", "low"}
 
 app = FastAPI(
     title="Elite Dangerous Day/Night Calculator API",
-    version="0.198",
+    version="0.199",
     description="Local-first API for systems, bodies, observations, fitting and prediction.",
 )
 
@@ -188,6 +188,7 @@ class RefitRequest(BaseModel):
     include_unreviewed: bool = False
     force_refit: bool = False
     background: bool = False
+    illumination_source_star_name: Optional[str] = None
     actor: str = "api-admin"
 
 
@@ -334,6 +335,8 @@ def ensure_runtime_migrations(con: sqlite3.Connection) -> None:
     con.execute("CREATE INDEX IF NOT EXISTS idx_body_pois_body_public ON body_pois(body_id, is_public, review_status)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_body_pois_name ON body_pois(name)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_body_pois_review ON body_pois(review_status)")
+    if hasattr(dbmod, "ensure_illumination_columns"):
+        dbmod.ensure_illumination_columns(con)
     if hasattr(dbmod, "ensure_fit_mode_columns"):
         dbmod.ensure_fit_mode_columns(con)
     con.execute("CREATE INDEX IF NOT EXISTS idx_audit_log_created ON audit_log(created_at_utc DESC)")
@@ -486,6 +489,7 @@ def body_public_dict(row: sqlite3.Row) -> Dict[str, Any]:
         "parent_type": d["parent_type"],
         "parent_body_id": d["parent_body_id"],
         "parent_name": d["parent_name"],
+        "illumination_source_star_name": d.get("illumination_source_star_name"),
         "is_landable": None if d["is_landable"] is None else bool(d["is_landable"]),
         "is_tidally_locked": None if d["is_tidally_locked"] is None else bool(d["is_tidally_locked"]),
         "radius_m": d["radius_m"],
@@ -930,7 +934,7 @@ def start_provisional_fit_worker() -> None:
 def root() -> Dict[str, Any]:
     return {
         "name": "Elite Dangerous Day/Night Calculator API",
-        "version": "0.198",
+        "version": "0.199",
         "db_path": DB_PATH,
         "docs": "/docs",
     }
@@ -1074,6 +1078,25 @@ def get_system(system_id: int) -> Dict[str, Any]:
         con.close()
     system["body_count"] = body_count
     return system
+
+
+@app.get("/api/systems/{system_id}/stars")
+def get_system_stars(system_id: int) -> Dict[str, Any]:
+    con = connect()
+    try:
+        get_system_row_or_404(con, system_id)
+        rows = con.execute(
+            """
+            SELECT id, body_id, body_id64, name, subtype, star_type, is_landable
+              FROM bodies
+             WHERE system_id = ? AND lower(COALESCE(body_type, '')) = 'star'
+             ORDER BY COALESCE(body_id, 999999), name
+            """,
+            (system_id,),
+        ).fetchall()
+    finally:
+        con.close()
+    return {"results": [row_to_dict(r) for r in rows]}
 
 
 @app.get("/api/systems/by-address/{system_address}")
@@ -1915,6 +1938,11 @@ def refit_body(body_id: int, req: RefitRequest) -> Dict[str, Any]:
         body = get_body_row_or_404(con, body_id)
         system_name = body["system_name"]
         body_name = body["name"]
+        if req.illumination_source_star_name is not None:
+            with WRITE_LOCK:
+                begin_write_transaction(con)
+                dbmod.set_body_illumination_source(con, body_id, req.illumination_source_star_name, req.actor or "api-admin")
+                con.commit()
     finally:
         con.close()
 

@@ -1,3 +1,15 @@
+## V0.199
+
+- Added explicit illumination-source support for multi-star systems.
+- Added `illumination_source_star_name` to body/model data.
+- Added recursive star-vector geometry so moons around planets orbiting secondary stars use the correct star path.
+- Added automatic illumination inference:
+  - direct planet around star A -> A
+  - moon around planet around star B -> B
+  - combined-name bodies like ABC/AB default to A, BC defaults to B and can be overridden.
+- Added an admin fit-page selector for illumination source: auto or any star in the system.
+- Fit reports and fit metadata now show illumination source, orbit context, and sun-source mode.
+
 ## V0.198
 
 - Cleaned imported Razz Racing POI names by removing the `Race Start:` prefix.
@@ -16,7 +28,7 @@
 ## V0.196
 
 - The body fit control page now auto-refreshes while a reviewed/provisional fit job is queued or running.
-- Once fitting finishes, the page reloads and shows the updated model without manual refresh.
+- Once the Raspberry Pi finishes fitting, the page reloads and shows the updated model without manual refresh.
 - Added `ELITE_DAYNIGHT_ADMIN_FIT_REFRESH_SECONDS` to configure the refresh interval.
 
 ## V0.195

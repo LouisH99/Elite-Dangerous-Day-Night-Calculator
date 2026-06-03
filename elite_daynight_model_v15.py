@@ -92,6 +92,12 @@ SOLAR_RADIUS_METRES = 695_700_000.0
 # indistinguishable from the centre-horizon crossing, so keep the report clean.
 VISUAL_DISC_MIN_RADIUS_DEG = 1.0
 
+# Fitting evaluates the same observation timestamps thousands of times. Cache the
+# recursive inertial sun vectors by system/body/time/orbit convention so the
+# multi-star/moon fix does not make fitting painfully slow on a Raspberry Pi.
+_ILLUMINATION_VECTOR_CACHE: Dict[Tuple[int, str, str, int, str], Tuple[Optional[np.ndarray], str, str]] = {}
+_ILLUMINATION_VECTOR_CACHE_LIMIT = 50000
+
 
 def rotz(a: float) -> np.ndarray:
     c, s = math.cos(a), math.sin(a)
@@ -351,49 +357,281 @@ def body_orbits_star_directly(body: Dict[str, Any]) -> bool:
     return direct_parent_kind(body) == "star"
 
 
-def sun_vector_source_label(body: Dict[str, Any]) -> str:
-    kind = direct_parent_kind(body)
-    if kind == "star":
-        return "direct parent-star orbital vector"
-    if kind == "planet":
-        return "fitted distant-star vector (moon/non-star parent)"
-    if kind == "null":
-        return "fitted distant-star vector (unknown/null barycentre parent)"
-    return "fitted distant-star vector (unknown parent)"
+def is_star_body(body: Dict[str, Any]) -> bool:
+    return str(body.get("BodyType") or body.get("type") or "").strip().lower() == "star"
+
+
+def body_ref_values(body: Dict[str, Any]) -> set:
+    vals = set()
+    for key in ("BodyID", "bodyId", "body_id", "bodyId64", "id64", "SystemAddress"):
+        v = body.get(key)
+        if v not in (None, ""):
+            vals.add(str(v))
+            try:
+                vals.add(str(int(v)))
+            except Exception:
+                pass
+    name = body_name(body)
+    if name:
+        vals.add(str(name).strip().lower())
+    return vals
+
+
+def parent_ref_value(p: Dict[str, Any]) -> Optional[Any]:
+    if "Star" in p:
+        return p.get("Star")
+    if "Planet" in p:
+        return p.get("Planet")
+    for key in ("BodyID", "bodyId", "body_id", "id64", "bodyId64", "name", "Name"):
+        if p.get(key) not in (None, ""):
+            return p.get(key)
+    return None
+
+
+def find_body_by_ref(system: Dict[str, Any], ref: Any) -> Optional[Dict[str, Any]]:
+    if system is None or ref is None:
+        return None
+    ref_s = str(ref).strip()
+    ref_l = ref_s.lower()
+    for b in bodies(system):
+        vals = body_ref_values(b)
+        if ref_s in vals or ref_l in vals:
+            return b
+    return None
+
+
+def direct_parent_body(system: Dict[str, Any], body: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    parents = parent_entries(body)
+    if not parents or system is None:
+        return None
+    p = parents[0]
+    if "Null" in p or str(p.get("type") or "").strip().lower() == "null":
+        return None
+    return find_body_by_ref(system, parent_ref_value(p))
+
+
+def parent_body_name(system: Optional[Dict[str, Any]], body: Dict[str, Any]) -> Optional[str]:
+    if system is None:
+        parents = parent_entries(body)
+        if parents:
+            return str(parents[0].get("name") or parents[0].get("Name") or "") or None
+        return None
+    pb = direct_parent_body(system, body)
+    if pb is not None:
+        return body_name(pb)
+    parents = parent_entries(body)
+    if parents:
+        p = parents[0]
+        return str(p.get("name") or p.get("Name") or p.get("type") or next(iter(p.keys()), "")) or None
+    return None
+
+
+def find_star_by_name(system: Dict[str, Any], name: str) -> Optional[Dict[str, Any]]:
+    needle = str(name or "").strip().lower()
+    if not needle:
+        return None
+    for b in bodies(system):
+        if is_star_body(b) and body_name(b).strip().lower() == needle:
+            return b
+    return None
+
+
+def system_name_value(system: Optional[Dict[str, Any]]) -> str:
+    if not system:
+        return ""
+    return str(system.get("name") or system.get("Name") or system.get("systemName") or system.get("StarSystem") or "").strip()
+
+
+def find_star_by_letter(system: Dict[str, Any], letter: str) -> Optional[Dict[str, Any]]:
+    sysname = system_name_value(system)
+    candidates = []
+    wanted = str(letter).strip().upper()
+    if not wanted:
+        return None
+    exact = f"{sysname} {wanted}".strip().lower()
+    for b in bodies(system):
+        if not is_star_body(b):
+            continue
+        name = body_name(b).strip()
+        if name.lower() == exact or name.upper().endswith(" " + wanted):
+            candidates.append(b)
+    return candidates[0] if candidates else None
+
+
+def body_designator(system: Optional[Dict[str, Any]], body: Dict[str, Any]) -> str:
+    name = body_name(body).strip()
+    sysname = system_name_value(system)
+    if sysname and name.lower().startswith(sysname.lower()):
+        return name[len(sysname):].strip()
+    return name
+
+
+def combined_name_star_default(system: Dict[str, Any], body: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Infer Elite's likely single illumination source for AB/BC/ABC barycentre names.
+
+    Elite appears to light a body from one star only. For combined-name orbits we
+    avoid treating a Null/barycentre as the light source and choose a star rule
+    that can be manually overridden later.
+    """
+    designator = body_designator(system, body)
+    token = designator.split()[0].upper() if designator.split() else ""
+    if token.startswith("ABC"):
+        st = find_star_by_letter(system, "A") or find_main_star(system)
+        return st, "combined-name ABC rule -> primary star A"
+    if token.startswith("AB"):
+        st = find_star_by_letter(system, "A") or find_main_star(system)
+        return st, "combined-name AB rule -> star A"
+    if token.startswith("BC"):
+        st = find_star_by_letter(system, "B") or find_main_star(system)
+        return st, "combined-name BC rule -> star B (uncertain; override if needed)"
+    return None, None
 
 
 def find_parent_star(system: Dict[str, Any], body: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    parents = parent_entries(body)
-    star_ref: Any = None
-    for p in parents:
-        if "Star" in p:
-            star_ref = p.get("Star")
-            break
-        if str(p.get("type") or "").strip().lower() == "star":
-            star_ref = p.get("BodyID", p.get("bodyId", p.get("id64")))
-            break
-    if star_ref is None:
+    """Find the first real star in the resolved parent chain."""
+    if system is None:
         return None
-    for b in bodies(system):
-        refs = {body_id(b), b.get("bodyId64"), b.get("id64"), b.get("SystemAddress")}
-        try:
-            if int(star_ref) in {int(x) for x in refs if x is not None}:
-                return b
-        except Exception:
-            pass
-        if str(star_ref) in {str(x) for x in refs if x is not None}:
-            return b
+    seen = set()
+    cur = body
+    for _ in range(12):
+        parent = direct_parent_body(system, cur)
+        if parent is None:
+            return None
+        key = body_name(parent).lower() or str(parent.get("BodyID") or parent.get("bodyId") or id(parent))
+        if key in seen:
+            return None
+        seen.add(key)
+        if is_star_body(parent):
+            return parent
+        cur = parent
     return None
 
 
 def find_main_star(system: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     for b in bodies(system):
-        if str(b.get("BodyType") or b.get("type") or "").lower() == "star" and bool((b.get("rawSpanshBody") or {}).get("is_main_star")):
+        if is_star_body(b) and bool((b.get("rawSpanshBody") or {}).get("is_main_star")):
             return b
+    # Prefer a star named "<system> A" when Spansh did not set is_main_star.
+    st = find_star_by_letter(system, "A")
+    if st is not None:
+        return st
     for b in bodies(system):
-        if str(b.get("BodyType") or b.get("type") or "").lower() == "star":
+        if is_star_body(b):
             return b
     return None
+
+
+def illumination_source_info(system: Optional[Dict[str, Any]], body: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], str, str]:
+    """Return (star, mode, reason) for the light source.
+
+    mode is one of: explicit, inferred, fallback.
+    """
+    explicit = str(body.get("illumination_source_star_name") or body.get("IlluminationSourceStarName") or "").strip()
+    if explicit.lower() == "auto":
+        explicit = ""
+    if system and explicit:
+        st = find_star_by_name(system, explicit)
+        if st is not None:
+            return st, "explicit", f"manual override: {body_name(st)}"
+        return None, "fallback", f"manual override star not found: {explicit}"
+
+    if system:
+        st = find_parent_star(system, body)
+        if st is not None:
+            return st, "inferred", f"parent chain contains {body_name(st)}"
+        st, reason = combined_name_star_default(system, body)
+        if st is not None:
+            return st, "inferred", reason or f"combined-name rule -> {body_name(st)}"
+        st = find_main_star(system)
+        if st is not None:
+            return st, "inferred", f"system primary/main star fallback: {body_name(st)}"
+    return None, "fallback", "fitted distant-star vector; no resolvable illumination star"
+
+
+def illumination_source_name(system: Optional[Dict[str, Any]], body: Dict[str, Any]) -> str:
+    st, _mode, _reason = illumination_source_info(system, body)
+    return body_name(st) if st is not None else "unknown"
+
+
+def sun_source_mode_label(system: Optional[Dict[str, Any]], body: Dict[str, Any]) -> str:
+    _st, mode, _reason = illumination_source_info(system, body)
+    return mode
+
+
+def sun_vector_source_label(body: Dict[str, Any], system: Optional[Dict[str, Any]] = None) -> str:
+    st, mode, reason = illumination_source_info(system, body)
+    if st is not None:
+        return f"{mode} illumination source {body_name(st)} ({reason})"
+    return f"fallback fitted distant-star vector ({reason})"
+
+
+def orbit_context_label(system: Optional[Dict[str, Any]], body: Dict[str, Any]) -> str:
+    kind = direct_parent_kind(body)
+    pname = parent_body_name(system, body) or "unknown parent"
+    if kind == "star":
+        return f"target orbits star {pname}"
+    if kind == "planet":
+        return f"target is moon of {pname}"
+    if kind == "null":
+        return "target orbits a Null/barycentre parent"
+    return f"target parent is {pname}"
+
+
+def body_position_inertial(system: Dict[str, Any], body: Dict[str, Any], t: datetime, orbit_flip: int = 1, _seen: Optional[set] = None) -> Optional[np.ndarray]:
+    """Approximate barycentric inertial position for a body.
+
+    Null parents are treated as a local inertial root. For star/planet parents we
+    recursively add parent->child orbital vectors. The global axes are still
+    arbitrary; the fitted body frame absorbs that convention.
+    """
+    if _seen is None:
+        _seen = set()
+    key = body_name(body).lower() or str(body.get("BodyID") or body.get("bodyId") or id(body))
+    if key in _seen:
+        return None
+    _seen.add(key)
+    try:
+        own = float(orbit_flip) * orbital_position_parent_to_body(body, t)
+    except Exception:
+        own = np.zeros(3)
+    parent = direct_parent_body(system, body)
+    if parent is None:
+        return own
+    ppos = body_position_inertial(system, parent, t, orbit_flip=orbit_flip, _seen=_seen)
+    if ppos is None:
+        return own
+    return ppos + own
+
+
+def _illumination_vector_inertial_uncached(system: Optional[Dict[str, Any]], body: Dict[str, Any], t: datetime, orbit_flip: int = 1) -> Tuple[Optional[np.ndarray], str, str]:
+    if system is None:
+        return None, "fallback", "no system context attached to model"
+    star, mode, reason = illumination_source_info(system, body)
+    if star is None:
+        return None, mode, reason
+    spos = body_position_inertial(system, star, t, orbit_flip=orbit_flip)
+    bpos = body_position_inertial(system, body, t, orbit_flip=orbit_flip)
+    if spos is None or bpos is None:
+        return None, "fallback", "could not resolve recursive orbital positions"
+    vec = spos - bpos
+    if float(np.linalg.norm(vec)) <= 0:
+        return None, "fallback", "zero-length illumination vector"
+    return norm(vec), mode, reason
+
+
+def illumination_vector_inertial(system: Optional[Dict[str, Any]], body: Dict[str, Any], t: datetime, orbit_flip: int = 1) -> Tuple[Optional[np.ndarray], str, str]:
+    if system is None:
+        return None, "fallback", "no system context attached to model"
+    explicit = str(body.get("illumination_source_star_name") or body.get("IlluminationSourceStarName") or "").strip()
+    key = (id(system), body_name(body), format_utc(t), int(orbit_flip), explicit)
+    cached = _ILLUMINATION_VECTOR_CACHE.get(key)
+    if cached is not None:
+        return cached
+    value = _illumination_vector_inertial_uncached(system, body, t, orbit_flip=orbit_flip)
+    if len(_ILLUMINATION_VECTOR_CACHE) > _ILLUMINATION_VECTOR_CACHE_LIMIT:
+        _ILLUMINATION_VECTOR_CACHE.clear()
+    _ILLUMINATION_VECTOR_CACHE[key] = value
+    return value
 
 
 def star_radius_metres(star: Dict[str, Any]) -> Optional[float]:
@@ -414,18 +652,19 @@ def star_radius_metres(star: Dict[str, Any]) -> Optional[float]:
 
 
 def star_distance_metres(system: Dict[str, Any], body: Dict[str, Any], t: datetime) -> Optional[float]:
-    # For direct star-orbiting bodies, the orbital vector gives a time-dependent distance.
-    if find_parent_star(system, body) is not None:
-        try:
-            d = float(np.linalg.norm(orbital_position_parent_to_body(body, t)))
-            if d > 0:
-                return d
-        except Exception:
-            pass
+    vec, _mode, _reason = illumination_vector_inertial(system, body, t, orbit_flip=1)
+    if vec is not None:
+        # Recompute unnormalised vector for distance.
+        star, _m, _r = illumination_source_info(system, body)
+        if star is not None:
+            spos = body_position_inertial(system, star, t, orbit_flip=1)
+            bpos = body_position_inertial(system, body, t, orbit_flip=1)
+            if spos is not None and bpos is not None:
+                d = float(np.linalg.norm(spos - bpos))
+                if d > 0:
+                    return d
 
-    # For moons and barycentre-parent bodies, the moon's own orbital vector points to
-    # the local parent planet, not the star. DistanceFromArrivalLS is the useful
-    # approximation for apparent stellar disc size.
+    # Fallback to Spansh/Journal distance-to-arrival when recursive geometry is incomplete.
     for key in ("DistanceFromArrivalLS", "distanceToArrival", "distance_to_arrival"):
         try:
             value = body.get(key)
@@ -446,7 +685,7 @@ def star_distance_metres(system: Dict[str, Any], body: Dict[str, Any], t: dateti
 def star_angular_radius_deg(system: Optional[Dict[str, Any]], body: Dict[str, Any], t: datetime) -> Optional[float]:
     if not system:
         return None
-    star = find_parent_star(system, body) or find_main_star(system)
+    star, _mode, _reason = illumination_source_info(system, body)
     if not star:
         return None
     R = star_radius_metres(star)
@@ -471,6 +710,7 @@ class FittedModel:
     time_ref: Optional[datetime] = None
     time_half_life_hours: float = 24.0
     time_min_weight: float = 0.05
+    system: Optional[Dict[str, Any]] = None
     def predict(self, t: datetime, lat_deg: float, lon_deg: float) -> Tuple[float, float]:
         return predict_alt_az(self, t, lat_deg, lon_deg)
 
@@ -483,17 +723,10 @@ def body_frame_matrix(alpha: float, beta: float, gamma: float) -> np.ndarray:
 
 def sun_vector_body(model: FittedModel, t: datetime) -> np.ndarray:
     alpha, beta, gamma, phase = model.params
-    if body_orbits_star_directly(model.body):
-        r_parent_to_body = orbital_position_parent_to_body(model.body, t)
-        # Body -> parent star. orbit_flip absorbs sign/convention ambiguity.
-        s_inertial = norm(-float(model.orbit_flip) * r_parent_to_body)
-    else:
-        # For moons and bodies whose direct parent is a planet/null barycentre,
-        # orbital_position_parent_to_body() points to the local parent, not the
-        # star. A distant star has almost constant inertial direction over a
-        # short calibration window; the free body-frame angles fit that unknown
-        # direction. This avoids the old bug where a tidally locked moon used
-        # its gas-giant direction as the sun direction.
+    s_inertial, _mode, _reason = illumination_vector_inertial(model.system, model.body, t, orbit_flip=model.orbit_flip)
+    if s_inertial is None:
+        # Last-resort legacy fallback. This keeps older/incomplete data usable,
+        # but reports should show Sun-source mode: fallback.
         s_inertial = np.array([float(model.orbit_flip), 0.0, 0.0])
     epoch = scan_epoch(model.body)
     dt = (t - epoch).total_seconds()
@@ -532,10 +765,11 @@ def make_model(
     time_ref: Optional[datetime] = None,
     time_half_life_hours: float = 24.0,
     time_min_weight: float = 0.05,
+    system: Optional[Dict[str, Any]] = None,
 ) -> FittedModel:
     return FittedModel(
         body, params, spin_sign, lon_sign, orbit_flip, score, 0.0, None, observations,
-        time_weighting, time_ref, time_half_life_hours, time_min_weight
+        time_weighting, time_ref, time_half_life_hours, time_min_weight, system
     )
 
 
@@ -600,6 +834,7 @@ def fit_model(
     time_half_life_hours: float = 24.0,
     time_ref: Optional[datetime] = None,
     time_min_weight: float = 0.05,
+    system: Optional[Dict[str, Any]] = None,
 ) -> FittedModel:
     # Validate required fields early.
     for key in ("timestamp", "RotationPeriod", "OrbitalPeriod", "SemiMajorAxis"):
@@ -621,6 +856,7 @@ def fit_model(
             time_ref=effective_time_ref,
             time_half_life_hours=time_half_life_hours,
             time_min_weight=time_min_weight,
+            system=system,
         )
         return model_loss(m, use_heading=use_heading)[0]
 
@@ -646,6 +882,7 @@ def fit_model(
                 time_ref=effective_time_ref,
                 time_half_life_hours=time_half_life_hours,
                 time_min_weight=time_min_weight,
+                system=system,
             )
             score, rms_alt, rms_head = model_loss(model, use_heading=use_heading)
             model.score = score
@@ -688,6 +925,7 @@ def fit_model(
                     time_ref=effective_time_ref,
                     time_half_life_hours=time_half_life_hours,
                     time_min_weight=time_min_weight,
+                    system=system,
                 )
                 score, rms_alt, rms_head = model_loss(model, use_heading=use_heading)
                 model.score = score
@@ -935,7 +1173,10 @@ def make_report(
     orb = abs(float(body.get("OrbitalPeriod", 0.0)))
     lines.append(f"Rotation period: {rot:.3f} s ({rot/3600.0:.4f} h)")
     lines.append(f"Orbital period:  {orb:.3f} s ({orb/3600.0:.4f} h)")
-    lines.append(f"Sun-vector source: {sun_vector_source_label(body)}")
+    lines.append(f"Illumination source: {illumination_source_name(system, body) if system else 'unknown'}")
+    lines.append(f"Orbit context: {orbit_context_label(system, body)}")
+    lines.append(f"Sun-source mode: {sun_source_mode_label(system, body)}")
+    lines.append(f"Sun-vector source: {sun_vector_source_label(body, system)}")
     diff_p, sum_p = apparent_mean_periods(body)
     lines.append(f"Mean rotation-orbit beat period: {diff_p:.1f} s ({diff_p/3600.0:.4f} h)")
     lines.append(f"Mean rotation+orbit period:     {sum_p:.1f} s ({sum_p/3600.0:.4f} h)")
@@ -1052,7 +1293,10 @@ def model_summary_dict(model: FittedModel) -> Dict[str, Any]:
         "time_ref_utc": None if model.time_ref is None else format_utc(model.time_ref),
         "time_half_life_hours": float(model.time_half_life_hours),
         "time_min_weight": float(model.time_min_weight),
-        "sun_vector_source": sun_vector_source_label(model.body),
+        "illumination_source": illumination_source_name(model.system, model.body),
+        "sun_source_mode": sun_source_mode_label(model.system, model.body),
+        "orbit_context": orbit_context_label(model.system, model.body),
+        "sun_vector_source": sun_vector_source_label(model.body, model.system),
     }
 
 
@@ -1304,6 +1548,7 @@ def fit_model_from_files(
         time_weighting=time_weighting,
         time_half_life_hours=time_half_life_hours,
         time_ref=time_ref,
+        system=system,
     )
     return system, body, observations, model
 

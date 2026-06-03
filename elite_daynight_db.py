@@ -72,7 +72,7 @@ except Exception as exc:  # pragma: no cover
         f"Import error: {exc}"
     ) from exc
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 MODEL_VERSION = "v15"
 
 SPANSH_API_BASE = "https://www.spansh.co.uk/api"
@@ -212,7 +212,7 @@ def http_get_json(url: str, timeout: float = 30.0, retries: int = 2, pause: floa
     last_error: Optional[BaseException] = None
     for attempt in range(retries + 1):
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "EliteDayNightDB/0.198"})
+            req = urllib.request.Request(url, headers={"User-Agent": "EliteDayNightDB/0.199"})
             with urllib.request.urlopen(req, timeout=timeout) as response:
                 raw = response.read().decode("utf-8")
                 return json.loads(raw)
@@ -698,6 +698,7 @@ def init_db(db_path: str) -> None:
             parent_type TEXT,
             parent_body_id INTEGER,
             parent_name TEXT,
+            illumination_source_star_name TEXT,
             is_landable INTEGER,
             is_tidally_locked INTEGER,
             radius_m REAL,
@@ -819,6 +820,7 @@ def init_db(db_path: str) -> None:
     con.execute("CREATE INDEX IF NOT EXISTS idx_audit_log_entity ON audit_log(entity_type, entity_id)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_audit_log_actor ON audit_log(actor)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_audit_log_action ON audit_log(action)")
+    ensure_illumination_columns(con)
     con.execute("INSERT OR REPLACE INTO schema_meta(key, value) VALUES (?, ?)", ("schema_version", str(SCHEMA_VERSION)))
     con.execute("INSERT OR REPLACE INTO schema_meta(key, value) VALUES (?, ?)", ("model_version", MODEL_VERSION))
     con.commit()
@@ -916,6 +918,7 @@ def import_system_json(db_path: str, json_path: str) -> int:
             UPDATE bodies SET
                 body_id = COALESCE(?, body_id), body_id64 = ?, name = ?, body_type = ?, subtype = ?,
                 parents_json = ?, parent_type = ?, parent_body_id = ?, parent_name = ?,
+                illumination_source_star_name = COALESCE(illumination_source_star_name, ?),
                 is_landable = ?, is_tidally_locked = ?, radius_m = ?, mass_em = ?, gravity_ms2 = ?,
                 distance_from_arrival_ls = ?, surface_temperature_k = ?, surface_pressure_pa = ?,
                 atmosphere = ?, atmosphere_type = ?, star_type = ?, stellar_mass = ?, absolute_magnitude = ?,
@@ -934,6 +937,7 @@ def import_system_json(db_path: str, json_path: str) -> int:
                 ptype,
                 parent_body_id,
                 parent_name,
+                str(get_any(b, "illumination_source_star_name", "IlluminationSourceStarName", default="") or "") or None,
                 as_bool_int(get_any(b, "Landable", "is_landable", default=raw.get("is_landable"))),
                 as_bool_int(get_any(b, "TidalLock", "IsTidallyLocked", default=raw.get("is_rotational_period_tidally_locked"))),
                 parse_optional_float(get_any(b, "Radius", default=raw.get("radius"))),
@@ -985,6 +989,9 @@ def compact_body_dict(row: sqlite3.Row) -> Dict[str, Any]:
         "SubType": row["subtype"], "subType": row["subtype"],
         "timestamp": row["scan_timestamp_utc"] or "1970-01-01T00:00:00Z",
     }
+    if "illumination_source_star_name" in row.keys() and row["illumination_source_star_name"]:
+        d["illumination_source_star_name"] = row["illumination_source_star_name"]
+        d["IlluminationSourceStarName"] = row["illumination_source_star_name"]
     if row["body_type"] == "Planet":
         d["PlanetClass"] = row["subtype"] or ""
     if row["body_type"] == "Star":
@@ -1131,6 +1138,31 @@ def lookup_system_body(con: sqlite3.Connection, system_name: str, body_name: str
         raise ValueError(f"Body not found in database for {system_name}: {body_name}")
     return system_id, int(b[0])
 
+
+
+
+def ensure_illumination_columns(con: sqlite3.Connection) -> None:
+    """Add explicit illumination-source support to older databases."""
+    cols = {r[1] for r in con.execute("PRAGMA table_info(bodies)").fetchall()}
+    if "illumination_source_star_name" not in cols:
+        con.execute("ALTER TABLE bodies ADD COLUMN illumination_source_star_name TEXT")
+
+
+def set_body_illumination_source(con: sqlite3.Connection, body_pk: int, star_name: Optional[str], actor: str = "api-admin") -> None:
+    ensure_illumination_columns(con)
+    old = con.execute("SELECT illumination_source_star_name FROM bodies WHERE id = ?", (body_pk,)).fetchone()
+    old_value = None if old is None else old[0]
+    value = (star_name or "").strip()
+    if value.lower() == "auto":
+        value = ""
+    new_value = value or None
+    if old_value == new_value:
+        return
+    con.execute("UPDATE bodies SET illumination_source_star_name = ?, updated_at_utc = ? WHERE id = ?", (new_value, utc_now(), body_pk))
+    con.execute(
+        "INSERT INTO audit_log(entity_type, entity_id, action, old_json, new_json, actor, created_at_utc) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("body", body_pk, "set_illumination_source", json_dumps({"illumination_source_star_name": old_value}), json_dumps({"illumination_source_star_name": new_value}), actor, utc_now()),
+    )
 
 
 def ensure_fit_mode_columns(con: sqlite3.Connection) -> None:
@@ -1283,8 +1315,9 @@ def fit_body(
     con = sqlite_connect(db_path)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA foreign_keys = ON")
+    ensure_illumination_columns(con)
     ensure_fit_mode_columns(con)
-    # ensure_fit_mode_columns() may run ALTER/UPDATE statements for older DBs.
+    # ensure_* migration helpers may run ALTER/UPDATE statements for older DBs.
     # Commit that migration work before the later explicit BEGIN IMMEDIATE,
     # otherwise SQLite can raise: "cannot start a transaction within a transaction".
     con.commit()
@@ -1314,7 +1347,7 @@ def fit_body(
             raise ValueError("No approved/new/needs_check observations for this body")
         raise ValueError("No approved observations for this body")
     observations = [o for _, o in obs_pairs]
-    fitted = model.fit_model(body, observations, use_heading=use_heading, time_weighting=time_weighting, time_half_life_hours=time_half_life_hours)
+    fitted = model.fit_model(body, observations, use_heading=use_heading, time_weighting=time_weighting, time_half_life_hours=time_half_life_hours, system=system)
     summary = model.model_summary_dict(fitted)
     report_label = "database approved + unreviewed observations" if include_unreviewed else "database approved observations"
     report = model.make_report(fitted, system, calibration_path=report_label)
@@ -1371,6 +1404,7 @@ def cleanup_old_fits(con: sqlite3.Connection, body_pk: int, keep_inactive: int =
 
 def model_from_active_fit(con: sqlite3.Connection, body_pk: int, fit_mode: str = "approved") -> Tuple[Dict[str, Any], model.FittedModel, int]:
     con.row_factory = sqlite3.Row
+    ensure_illumination_columns(con)
     frow = con.execute(
         """
         SELECT id, system_id, params_json, fit_score, rms_altitude_deg, rms_heading_deg, time_weighting
@@ -1390,6 +1424,7 @@ def model_from_active_fit(con: sqlite3.Connection, body_pk: int, fit_mode: str =
         spin_sign=int(params["spin_sign"]), lon_sign=int(params["lon_sign"]), orbit_flip=int(params["orbit_flip"]),
         observations=[o for _, o in observations_for_fit(con, fit_id)],
         score=float(frow["fit_score"] or 0.0), time_weighting=bool(frow["time_weighting"]),
+        system=system,
     )
     fitted.rms_altitude = float(frow["rms_altitude_deg"] or 0.0)
     fitted.rms_heading = None if frow["rms_heading_deg"] is None else float(frow["rms_heading_deg"])
