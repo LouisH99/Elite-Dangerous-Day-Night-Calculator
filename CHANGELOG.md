@@ -1,3 +1,11 @@
+## V0.200
+
+- Improved prediction-window fallback behavior.
+- The selected prediction window is now respected for the listed horizon crossings whenever at least one day/night change exists inside that window.
+- If no day/night change exists inside the selected window, the model searches forward up to 30 days and lists the next fallback transitions.
+- If the selected window does not contain a complete day/night cycle, the model searches up to 30 days for the next complete cycle and uses that to calculate sunlight duration and day period.
+- Added prediction metadata for `daylight_summary_source`, `daylight_cycle_extended_beyond_window`, `min_fallback_transitions`, and `max_extended_prediction_hours`.
+
 ## V0.199
 
 - Added explicit illumination-source support for multi-star systems.

@@ -137,7 +137,8 @@
     <div><span>Day period</span><strong>{{ prediction.day_period_sec|duration }}</strong></div>
   </div>
   <h3>Upcoming horizon crossings</h3>
-  {% if prediction.crossings_extended_beyond_window %}<p class="muted">Some listed crossings are outside the selected {{ prediction.prediction_window_hours|num(0) }} h window so the next sun passes/day period can still be shown.</p>{% endif %}
+  {% if prediction.crossings_extended_beyond_window %}<p class="muted">No day/night change was found inside the selected {{ prediction.prediction_window_hours|num(0) }} h window, so the next {{ prediction.min_fallback_transitions }} change(s) are shown from the extended search.</p>{% endif %}
+  {% if prediction.daylight_cycle_extended_beyond_window %}<p class="muted">Sunlight duration and day period were calculated from the next complete cycle found within the {{ prediction.max_extended_prediction_hours|num(0) }} h safety search.</p>{% endif %}
   <div class="table-wrap">
     <table>
       <thead><tr><th>Kind</th><th>UTC time</th><th>From target</th></tr></thead>

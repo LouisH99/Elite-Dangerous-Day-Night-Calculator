@@ -91,6 +91,13 @@ SOLAR_RADIUS_METRES = 695_700_000.0
 # Below this apparent radius, the visual disc edge crossing is practically
 # indistinguishable from the centre-horizon crossing, so keep the report clean.
 VISUAL_DISC_MIN_RADIUS_DEG = 1.0
+# Prediction fallback defaults. The normal user-selected window is respected for
+# the crossing list. If that window has no day/night transition, the next few
+# transitions are searched up to this safety limit. The same extended search is
+# used to calculate sunlight duration/day period when the selected window does
+# not contain a complete cycle.
+DEFAULT_MIN_FALLBACK_TRANSITIONS = 2
+DEFAULT_MAX_EXTENDED_PREDICTION_HOURS = 30.0 * 24.0
 
 # Fitting evaluates the same observation timestamps thousands of times. Cache the
 # recursive inertial sun vectors by system/body/time/orbit convention so the
@@ -1075,41 +1082,87 @@ def find_crossings_for_prediction(
     threshold: float = 0.0,
     prediction_hours: float = 72.0,
     max_crossings: int = 24,
-) -> Tuple[List[Tuple[datetime, str]], List[Tuple[datetime, str]], float, bool]:
-    """Return window crossings plus enough future crossings for display/summary.
+    min_fallback_transitions: int = DEFAULT_MIN_FALLBACK_TRANSITIONS,
+    max_extended_hours: float = DEFAULT_MAX_EXTENDED_PREDICTION_HOURS,
+) -> Tuple[
+    List[Tuple[datetime, str]],
+    List[Tuple[datetime, str]],
+    List[Tuple[datetime, str]],
+    float,
+    bool,
+    bool,
+    str,
+]:
+    """Return crossings for display plus enough data for cycle summaries.
 
-    The public website has two needs:
-      * show the configured prediction window, usually 72 h
-      * still show at least the next two sun passes and try to compute daylight
-        duration/day period even when the passes are just outside that window
+    V0.200 behaviour:
+      * The selected prediction window remains the primary result.
+      * If at least one day/night transition exists inside that window, only
+        window transitions are listed.
+      * If no transition exists in the selected window, search forward up to
+        ``max_extended_hours`` and list the next ``min_fallback_transitions``.
+      * If the selected window does not contain a complete day/night cycle,
+        the extended search is still used silently to calculate sunlight
+        duration and the day period when possible.
 
-    Return value: all_crossings, window_crossings, search_hours, extended.
+    Return value:
+      display_crossings, window_crossings, cycle_crossings, search_hours,
+      listed_crossings_extended, cycle_search_extended, daylight_source
     """
+    prediction_hours = max(0.1, float(prediction_hours))
+    min_fallback_transitions = max(1, int(min_fallback_transitions))
+    max_extended_hours = max(prediction_hours, float(max_extended_hours))
+
     window_crossings = find_crossings(
         model, start, lat, lon, threshold=threshold,
         hours=prediction_hours, max_crossings=max_crossings,
     )
 
-    # Two future passes are useful for the timer/list. Four are often needed to
-    # derive a complete sunrise->sunset and sunrise->sunrise period when the
-    # current time is already between sunrise and sunset.
-    need_more = len(window_crossings) < 4 or daylight_cycle_summary(window_crossings) is None
-    if not need_more:
-        return window_crossings, window_crossings, float(prediction_hours), False
+    window_summary = daylight_cycle_summary(window_crossings)
+    need_display_fallback = len(window_crossings) == 0
+    need_cycle_fallback = window_summary is None
 
-    # Search a wider model period. For normal fast cycles the first window is
-    # enough; this fallback is mostly for polar/seasonal cases or very long days.
-    check_hours = model_horizon_check_hours(model, prediction_hours)
-    extended_hours = min(max(float(prediction_hours), check_hours * 2.0), 365.0 * 24.0)
-    if extended_hours <= float(prediction_hours) + 1e-6:
-        return window_crossings, window_crossings, float(prediction_hours), False
+    if not need_display_fallback and not need_cycle_fallback:
+        return (
+            window_crossings,
+            window_crossings,
+            window_crossings,
+            prediction_hours,
+            False,
+            False,
+            "window",
+        )
 
     extended = find_crossings_adaptive(
         model, start, lat, lon, threshold=threshold,
-        hours=extended_hours, max_crossings=max_crossings,
+        hours=max_extended_hours,
+        max_crossings=max(max_crossings, min_fallback_transitions, 8),
     )
     all_crossings = unique_crossings(window_crossings + extended)
-    return all_crossings, window_crossings, float(extended_hours), True
+
+    if need_display_fallback:
+        display_crossings = all_crossings[:min_fallback_transitions]
+    else:
+        display_crossings = window_crossings
+
+    cycle_crossings = all_crossings
+    cycle_summary = daylight_cycle_summary(cycle_crossings)
+    cycle_search_extended = bool(need_cycle_fallback and cycle_summary is not None)
+    daylight_source = "extended" if cycle_search_extended else ("window" if window_summary is not None else "unknown")
+    listed_extended = any(
+        (ct - start).total_seconds() > prediction_hours * 3600.0 + 1.0
+        for ct, _kind in display_crossings
+    )
+
+    return (
+        display_crossings,
+        window_crossings,
+        cycle_crossings,
+        max_extended_hours,
+        bool(listed_extended),
+        bool(cycle_search_extended),
+        daylight_source,
+    )
 
 
 def daylight_cycle_rows(crossings: List[Tuple[datetime, str]]) -> List[Tuple[datetime, Optional[datetime], Optional[float], Optional[datetime], Optional[float]]]:
@@ -1140,10 +1193,47 @@ def daylight_cycle_rows(crossings: List[Tuple[datetime, str]]) -> List[Tuple[dat
 
 
 def daylight_cycle_summary(crossings: List[Tuple[datetime, str]]) -> Optional[Tuple[float, float]]:
-    """Return first complete daylight duration and sunrise-to-sunrise period."""
-    for _rise_time, _set_time, daylight_seconds, _next_rise, total_day_seconds in daylight_cycle_rows(crossings):
-        if daylight_seconds is not None and total_day_seconds is not None:
-            return daylight_seconds, total_day_seconds
+    """Return the first complete daylight duration and full cycle period.
+
+    Prefer the classic sunrise -> sunset -> sunrise sequence. If the checked
+    window starts during daylight and only contains sunset -> sunrise -> sunset,
+    use that set-to-set cycle instead. This lets V0.200 calculate daylight
+    duration/day period from the next complete cycle even when the user-selected
+    prediction window begins in the middle of a cycle.
+    """
+    crossings = sorted(crossings, key=lambda x: x[0])
+
+    # Rise -> set -> rise.
+    for i, (t0, kind0) in enumerate(crossings):
+        if kind0 != "rise":
+            continue
+        next_set: Optional[datetime] = None
+        next_rise: Optional[datetime] = None
+        for t1, kind1 in crossings[i + 1:]:
+            if next_set is None and kind1 == "set":
+                next_set = t1
+            if next_set is not None and kind1 == "rise":
+                next_rise = t1
+                break
+        if next_set is not None and next_rise is not None:
+            return (next_set - t0).total_seconds(), (next_rise - t0).total_seconds()
+
+    # Set -> rise -> set.  This is the same full cycle shifted by half a day;
+    # daylight is the middle rise->following set and the period is set->set.
+    for i, (t0, kind0) in enumerate(crossings):
+        if kind0 != "set":
+            continue
+        next_rise: Optional[datetime] = None
+        next_set: Optional[datetime] = None
+        for t1, kind1 in crossings[i + 1:]:
+            if next_rise is None and kind1 == "rise":
+                next_rise = t1
+            if next_rise is not None and kind1 == "set":
+                next_set = t1
+                break
+        if next_rise is not None and next_set is not None:
+            return (next_set - next_rise).total_seconds(), (next_set - t0).total_seconds()
+
     return None
 
 
@@ -1356,16 +1446,18 @@ def horizon_status_analysis(
     target_time: datetime,
     lat: float,
     lon: float,
-    centre_crossings: List[Tuple[datetime, str]],
+    window_crossings: List[Tuple[datetime, str]],
+    checked_crossings: List[Tuple[datetime, str]],
     current_altitude_deg: float,
     prediction_hours: float = 72.0,
+    check_hours: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Classify no-crossing cases as continuous day/night or outside-window.
 
     The result is suitable for website/API display. It avoids saying "never"
     and instead reports what was found inside the checked model period.
     """
-    if centre_crossings:
+    if window_crossings:
         return {
             "horizon_mode": "normal",
             "horizon_message": "Horizon transitions found in the prediction window.",
@@ -1375,7 +1467,22 @@ def horizon_status_analysis(
             "has_transition_in_checked_period": True,
         }
 
-    check_hours = model_horizon_check_hours(model, prediction_hours)
+    check_hours = float(check_hours if check_hours is not None else model_horizon_check_hours(model, prediction_hours))
+    state = "day" if current_altitude_deg > 0 else "night"
+    wanted = "sunset" if state == "day" else "sunrise"
+    window = f"the next {float(prediction_hours):.0f} hours"
+    checked = f"the checked model period ({check_hours:.1f} hours)"
+
+    if checked_crossings:
+        return {
+            "horizon_mode": f"no_{wanted}_in_window",
+            "horizon_message": f"No {wanted} was found in {window}. The next transition was found later within {checked}.",
+            "horizon_check_hours": float(check_hours),
+            "cycle_min_sun_altitude_deg": None,
+            "cycle_max_sun_altitude_deg": None,
+            "has_transition_in_checked_period": True,
+        }
+
     check_seconds = max(3600.0, check_hours * 3600.0)
     # Enough samples to detect broad seasonal/polar behaviour without making
     # very long orbital periods expensive.
@@ -1387,10 +1494,6 @@ def horizon_status_analysis(
         a = model.predict(t, lat, lon)[0]
         min_alt = min(min_alt, float(a))
         max_alt = max(max_alt, float(a))
-
-    state = "day" if current_altitude_deg > 0 else "night"
-    window = f"the next {float(prediction_hours):.0f} hours"
-    checked = f"the checked model period ({check_hours:.1f} hours)"
 
     eps = 0.02
     if min_alt > eps:
@@ -1412,14 +1515,13 @@ def horizon_status_analysis(
             "has_transition_in_checked_period": False,
         }
 
-    wanted = "sunset" if state == "day" else "sunrise"
     return {
         "horizon_mode": f"no_{wanted}_in_window",
-        "horizon_message": f"No {wanted} was found in {window}, but the checked model period does cross the horizon later.",
+        "horizon_message": f"No {wanted} was found in {window}. No transition was detected in {checked}, but sampled sun altitude crosses the horizon range; try a longer prediction later if needed.",
         "horizon_check_hours": float(check_hours),
         "cycle_min_sun_altitude_deg": float(min_alt),
         "cycle_max_sun_altitude_deg": float(max_alt),
-        "has_transition_in_checked_period": True,
+        "has_transition_in_checked_period": False,
     }
 
 def calculate_prediction(
@@ -1429,6 +1531,8 @@ def calculate_prediction(
     lat: float,
     lon: float,
     prediction_hours: float = 72.0,
+    min_fallback_transitions: int = DEFAULT_MIN_FALLBACK_TRANSITIONS,
+    max_extended_prediction_hours: float = DEFAULT_MAX_EXTENDED_PREDICTION_HOURS,
 ) -> Dict[str, Any]:
     """Return a JSON-serialisable prediction for a body/lat/lon/time.
 
@@ -1448,7 +1552,15 @@ def calculate_prediction(
     else:
         sun_altitude_trend = "nearly level"
 
-    centre_crossings, window_crossings, crossing_search_hours, crossings_extended = find_crossings_for_prediction(
+    (
+        centre_crossings,
+        window_crossings,
+        cycle_crossings,
+        crossing_search_hours,
+        crossings_extended,
+        cycle_search_extended,
+        daylight_summary_source,
+    ) = find_crossings_for_prediction(
         model,
         target_time,
         lat,
@@ -1456,10 +1568,12 @@ def calculate_prediction(
         threshold=0.0,
         prediction_hours=prediction_hours,
         max_crossings=24,
+        min_fallback_transitions=min_fallback_transitions,
+        max_extended_hours=max_extended_prediction_hours,
     )
-    daylight_summary = daylight_cycle_summary(centre_crossings)
-    next_sunrise = next((t for t, kind in centre_crossings if kind == "rise"), None)
-    next_sunset = next((t for t, kind in centre_crossings if kind == "set"), None)
+    daylight_summary = daylight_cycle_summary(cycle_crossings)
+    next_sunrise = next((t for t, kind in cycle_crossings if kind == "rise"), None)
+    next_sunset = next((t for t, kind in cycle_crossings if kind == "set"), None)
 
     radius = star_angular_radius_deg(system, model.body, target_time) if system else None
     visual_disc_crossings: List[Dict[str, Any]] = []
@@ -1487,8 +1601,10 @@ def calculate_prediction(
         lat,
         lon,
         window_crossings,
+        cycle_crossings,
         alt,
         prediction_hours=prediction_hours,
+        check_hours=crossing_search_hours,
     )
 
     result = {
@@ -1510,6 +1626,12 @@ def calculate_prediction(
         "prediction_window_hours": float(prediction_hours),
         "crossing_search_hours": float(crossing_search_hours),
         "crossings_extended_beyond_window": bool(crossings_extended),
+        "daylight_cycle_extended_beyond_window": bool(cycle_search_extended),
+        "daylight_summary_source": daylight_summary_source,
+        "min_fallback_transitions": int(min_fallback_transitions),
+        "max_extended_prediction_hours": float(max_extended_prediction_hours),
+        "window_horizon_crossing_count": int(len(window_crossings)),
+        "cycle_horizon_crossing_count": int(len(cycle_crossings)),
         "centre_horizon_crossings": [
             {
                 "time_utc": format_utc(ct),

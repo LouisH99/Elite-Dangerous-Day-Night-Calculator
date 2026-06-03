@@ -67,7 +67,7 @@ ALLOWED_QUALITY = {"high", "medium", "low"}
 
 app = FastAPI(
     title="Elite Dangerous Day/Night Calculator API",
-    version="0.199",
+    version="0.200",
     description="Local-first API for systems, bodies, observations, fitting and prediction.",
 )
 
@@ -934,7 +934,7 @@ def start_provisional_fit_worker() -> None:
 def root() -> Dict[str, Any]:
     return {
         "name": "Elite Dangerous Day/Night Calculator API",
-        "version": "0.199",
+        "version": "0.200",
         "db_path": DB_PATH,
         "docs": "/docs",
     }
@@ -1264,7 +1264,16 @@ def get_fit(body_id: int, include_residuals: bool = True, model_mode: str = "app
 
 
 @app.get("/api/bodies/{body_id}/prediction")
-def predict(body_id: int, lat: float, lon: float, time: str, prediction_hours: float = Query(72.0, ge=1.0, le=168.0), model_mode: str = "approved") -> Dict[str, Any]:
+def predict(
+    body_id: int,
+    lat: float,
+    lon: float,
+    time: str,
+    prediction_hours: float = Query(72.0, ge=1.0, le=168.0),
+    model_mode: str = "approved",
+    fallback_transitions: int = Query(model.DEFAULT_MIN_FALLBACK_TRANSITIONS, ge=1, le=12),
+    max_extended_hours: float = Query(model.DEFAULT_MAX_EXTENDED_PREDICTION_HOURS, ge=1.0, le=8760.0),
+) -> Dict[str, Any]:
     con = connect()
     try:
         get_body_row_or_404(con, body_id)
@@ -1272,7 +1281,16 @@ def predict(body_id: int, lat: float, lon: float, time: str, prediction_hours: f
         if mode not in {"approved", "provisional"}:
             raise HTTPException(status_code=400, detail="model_mode must be approved or provisional")
         system, fitted, fit_id = dbmod.model_from_active_fit(con, body_id, fit_mode=mode)
-        prediction = model.calculate_prediction(fitted, system, model.parse_utc(time), lat, lon, prediction_hours=prediction_hours)
+        prediction = model.calculate_prediction(
+            fitted,
+            system,
+            model.parse_utc(time),
+            lat,
+            lon,
+            prediction_hours=prediction_hours,
+            min_fallback_transitions=fallback_transitions,
+            max_extended_prediction_hours=max_extended_hours,
+        )
         prediction["model_mode"] = mode
         prediction.update(fit_review_metadata(con, int(fit_id)))
         with WRITE_LOCK:
