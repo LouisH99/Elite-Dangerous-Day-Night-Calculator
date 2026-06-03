@@ -1,4 +1,29 @@
+## V0.198
+
+- Cleaned imported Razz Racing POI names by removing the `Race Start:` prefix.
+- Cleaned imported Razz Racing POI descriptions so they contain only the race description text.
+- Kept Razz race keys in POI source metadata for future public API lookup support.
+
 # Changelog
+
+## V0.197
+
+- Added an admin-only Razz Racing POI importer at `/control/racing`.
+- Racing import can preview races, parse surface start body/lat/lon from race waypoint data, and import starts as reviewed/hidden POIs for moderation.
+- Added POI source metadata (`source`, `source_id`, `source_url`, `source_label`) so imported race POIs can be updated instead of duplicated.
+- Improved the observation review layout: wider control pages and a second detail row for fit residuals and notes, so long descriptions are no longer squeezed into a tiny table cell.
+
+## V0.196
+
+- The body fit control page now auto-refreshes while a reviewed/provisional fit job is queued or running.
+- Once fitting finishes, the page reloads and shows the updated model without manual refresh.
+- Added `ELITE_DAYNIGHT_ADMIN_FIT_REFRESH_SECONDS` to configure the refresh interval.
+
+## V0.195
+
+- Admin reviewed/provisional refits are now queued in the background instead of blocking the control page.
+- This avoids website/API timeout errors on slower hosts such as Raspberry Pi.
+- Added background fit-job status table on the body fit control page.
 
 ## V0.194
 
@@ -31,3 +56,4 @@ Review workflow improvements.
 - Added observation filters by system, body, submitter, and review status.
 - Added submitter display to the observation review table.
 - Added reviewed/provisional residual columns next to observations.
+- Updated the admin observation API to support these filters and residual fields.
