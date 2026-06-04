@@ -1,12 +1,12 @@
 # Elite Dangerous Day/Night Calculator
 
-Current package version: **V0.206.2**.
+Current package version: **V0.208**.
 
 A community tool for predicting local daylight, sunrise, sunset, and sun elevation on planets and moons in **Elite Dangerous**.
 
 The project lets players add systems/bodies, submit sun observations, review submitted data, fit a prediction model, and use saved Points of Interest (POIs) to quickly check local light conditions.
 
-> **Project status:** early community tool, currently around `V0.206.2`.
+> **Project status:** early community tool, currently around `V0.208`.
 >
 > **Transparency note:** this is a **vibe-coded / AI-assisted project**. A large part of the design, code structure, debugging, and documentation was created with help from ChatGPT. The model, outputs, and implementation should be treated as experimental and should be validated with real observations.
 
@@ -56,9 +56,12 @@ Players can help by submitting surface observations. Reviewers can approve, reje
 - Review, approve, reject, edit, and delete observations
 - Filter observations by system, body, submitter, and status
 - View residuals next to observations
+- View automation shadow-review recommendations for submitted observations
+- Batch-analyse observations for would-approve / candidate / needs-check recommendations
 - Manage POIs
 - Import Razz Racing race starts as POIs from the hidden control area
 - Refit reviewed and provisional models separately
+- Reviewer accounts can queue reviewed/provisional refits without super-admin account-management permissions
 - View audit log
 
 ### Backend / database
@@ -128,6 +131,8 @@ ELITE_DAYNIGHT_DB_WRITE_RETRIES=5
 ELITE_DAYNIGHT_DB_WRITE_RETRY_BASE_SECONDS=0.08
 ELITE_DAYNIGHT_KEEP_INACTIVE_FITS=0
 ELITE_DAYNIGHT_PUBLIC_REFIT_COOLDOWN=60
+ELITE_DAYNIGHT_AUTOMATION_MODE=shadow
+ELITE_DAYNIGHT_AUTOMATION_BATCH_LIMIT=200
 ```
 
 To disable public POI submissions:
@@ -135,6 +140,7 @@ To disable public POI submissions:
 ```bash
 ELITE_DAYNIGHT_PUBLIC_POI_SUBMISSIONS_ENABLED=0
 ELITE_DAYNIGHT_ADMIN_FIT_REFRESH_SECONDS=5
+
 ```
 
 ---
@@ -285,7 +291,7 @@ medium = medium weight
 low    = weak weight
 ```
 
-Optional time weighting can reduce the influence of old observations, but it is not always enabled.
+Optional recent-observation boosting can give newer observations more influence during fitting. It does not reduce older observations below their normal quality weight; instead, the newest observations can receive an automatic boost based on the body day/orbit/rotation period.
 
 ### 4. Illumination source and multi-star systems
 
@@ -389,6 +395,29 @@ Hide racing-only systems
 A racing-only system is one where the tracked target bodies only exist because of Razz Racing POIs and do not yet have observations or active models. This keeps large racing imports from overwhelming the normal prediction-work overview while still allowing the filter to be disabled when needed.
 
 ---
+
+## Automation shadow review
+
+V0.208 adds the first safe automation layer. It is intentionally conservative: the system can analyse observations and store a recommendation, but it does not approve or reject observations automatically.
+
+Automation mode is controlled with:
+
+```bash
+ELITE_DAYNIGHT_AUTOMATION_MODE=off|shadow|candidate|active
+```
+
+In V0.208, `shadow` mode is the intended default. A new or existing observation can be compared against the active reviewed model for that body. The system stores:
+
+- recommendation status such as `shadow_auto_approve`, `auto_candidate`, `needs_check`, `duplicate_or_near_duplicate`, or `blocked`
+- altitude residual against the reviewed model
+- threshold used for the decision
+- reviewed model id used for comparison
+- confidence score at the observation time
+- human-readable reason
+
+Reviewers can filter the observation list by automation recommendation and run a batch analysis for matching observations. All automation decisions are written to the audit log.
+
+No first-model approval or automatic reviewed-model replacement is performed in V0.208. Those are planned as later steps after the public read-only API work.
 
 ## Data review workflow
 
