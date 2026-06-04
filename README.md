@@ -1,12 +1,12 @@
 # Elite Dangerous Day/Night Calculator
 
-Current package version: **V0.209.1**.
+Current package version: **V0.210**.
 
 A community tool for predicting local daylight, sunrise, sunset, and sun elevation on planets and moons in **Elite Dangerous**.
 
 The project lets players add systems/bodies, submit sun observations, review submitted data, fit a prediction model, and use saved Points of Interest (POIs) to quickly check local light conditions.
 
-> **Project status:** early community tool, currently around `V0.209.1`.
+> **Project status:** early community tool, currently around `V0.210`.
 >
 > **Transparency note:** this is a **vibe-coded / AI-assisted project**. A large part of the design, code structure, debugging, and documentation was created with help from ChatGPT. The model, outputs, and implementation should be treated as experimental and should be validated with real observations.
 
@@ -161,12 +161,12 @@ ELITE_DAYNIGHT_AUTOMATION_MODE=shadow
 ELITE_DAYNIGHT_AUTOMATION_BATCH_LIMIT=200
 ```
 
+The private API run scripts set the automation defaults if the variables are not already defined.
+
 To disable public POI submissions:
 
 ```bash
 ELITE_DAYNIGHT_PUBLIC_POI_SUBMISSIONS_ENABLED=0
-
-The private API run scripts set these defaults if the variables are not already defined.
 ```
 
 ---
