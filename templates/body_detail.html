@@ -33,6 +33,7 @@
               <small>
                 {{ conf.used_observations }} obs · effective {{ conf.effective_observations|num(1) }} · RMS {{ conf.fit_rms_altitude_deg|num(2) }}°
                 {% if conf.prediction_distance_hours is not none %} · {{ conf.prediction_distance_hours|num(1) }} h from latest obs{% endif %}
+                {% if conf.freshness_half_life_hours is defined and conf.freshness_half_life_hours is not none %} · freshness half-life {{ conf.freshness_half_life_hours|num(1) }} h{% endif %}
               </small>
               {% if conf.warnings %}<small class="confidence-warnings">Notes: {{ conf.warnings|join('; ') }}</small>{% endif %}
             </div>
@@ -141,6 +142,9 @@
   {% if prediction.fit_uses_unverified_data %}<p class="warn"><b>Provisional model:</b> {{ prediction.fit_data_note }}</p>{% endif %}
   {% if prediction.model_confidence %}
     <p class="notice"><b>Confidence:</b> {{ prediction.model_confidence.level|title }} · {{ prediction.model_confidence.score }}%
+      {% if prediction.model_confidence.freshness_half_life_hours is defined and prediction.model_confidence.freshness_half_life_hours is not none %}
+        <br><span class="muted">Freshness half-life: {{ prediction.model_confidence.freshness_half_life_hours|num(1) }} h{% if prediction.model_confidence.freshness and prediction.model_confidence.freshness.accuracy_factor is not none %} · accuracy factor {{ prediction.model_confidence.freshness.accuracy_factor|num(2) }}×{% endif %}</span>
+      {% endif %}
       {% if prediction.model_confidence.warnings %}<br><span class="muted">{{ prediction.model_confidence.warnings|join('; ') }}</span>{% endif %}
     </p>
   {% endif %}

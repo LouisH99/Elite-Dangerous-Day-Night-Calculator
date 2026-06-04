@@ -11,11 +11,11 @@
   </div>
   {% if is_super_admin %}
   <div class="grid two">
-    <form class="stack-form" method="post" action="/control/bodies/{{ body.id }}/refit">
+    <form class="stack-form" method="post" action="/control/bodies/{{ body.id }}/refit" autocomplete="off">
       <h2>Refit reviewed model</h2>
       <p class="muted">Uses approved observations only. This is the default public model.</p>
-      <label class="check"><input type="checkbox" name="use_heading" value="on"> Use heading constraints</label>
-      <label class="check"><input type="checkbox" name="time_weighting" value="on"> Weight recent observations</label>
+      <label class="check"><input type="checkbox" name="use_heading" value="on"> Use heading constraints <span class="muted">(experimental)</span></label>
+      <label class="check"><input type="checkbox" name="time_weighting" value="on"> Weight recent observations <span class="muted">(optional)</span></label>
       <label>Half-life hours <input type="number" step="0.1" name="time_half_life_hours" value="24"></label>
       <label>Illumination source star
         <select name="illumination_source_star_name">
@@ -25,16 +25,16 @@
           {% endfor %}
         </select>
       </label>
-      <p class="muted small-help">Auto uses parent-chain inference; combined-name bodies like ABC/AB/BC can be overridden here.</p>
+      <p class="muted small-help">Auto uses recursive source geometry for clean parent chains or explicit illumination-source overrides. Bodies with a Null/barycentre before the star use the v15-compatible fitted sun-direction mode.</p>
 
       <button class="primary" type="submit">Refit reviewed model</button>
     </form>
-    <form class="stack-form" method="post" action="/control/bodies/{{ body.id }}/refit">
+    <form class="stack-form" method="post" action="/control/bodies/{{ body.id }}/refit" autocomplete="off">
       <h2>Refit provisional model</h2>
       <p class="muted">Uses approved + new/needs_check observations. It does not replace the reviewed model.</p>
       <input type="hidden" name="include_unreviewed" value="on">
-      <label class="check"><input type="checkbox" name="use_heading" value="on"> Use heading constraints</label>
-      <label class="check"><input type="checkbox" name="time_weighting" value="on"> Weight recent observations</label>
+      <label class="check"><input type="checkbox" name="use_heading" value="on"> Use heading constraints <span class="muted">(experimental)</span></label>
+      <label class="check"><input type="checkbox" name="time_weighting" value="on"> Weight recent observations <span class="muted">(optional)</span></label>
       <label>Half-life hours <input type="number" step="0.1" name="time_half_life_hours" value="24"></label>
       <label>Illumination source star
         <select name="illumination_source_star_name">
@@ -44,7 +44,7 @@
           {% endfor %}
         </select>
       </label>
-      <p class="muted small-help">Auto uses parent-chain inference; combined-name bodies like ABC/AB/BC can be overridden here.</p>
+      <p class="muted small-help">Auto uses recursive source geometry for clean parent chains or explicit illumination-source overrides. Bodies with a Null/barycentre before the star use the v15-compatible fitted sun-direction mode.</p>
 
       <button class="primary" type="submit">Refit provisional model</button>
     </form>
@@ -72,6 +72,9 @@
       {% if fit.model_confidence %}<div><strong>{{ fit.model_confidence.level|title }} · {{ fit.model_confidence.score }}%</strong><span>confidence</span></div>{% endif %}
       <div><strong>{{ fit.created_at_utc|utc }}</strong><span>created</span></div>
     </div>
+    {% if fit.model_confidence %}
+      <p class="muted">Freshness half-life: {{ fit.model_confidence.freshness_half_life_hours|num(1) if fit.model_confidence.freshness_half_life_hours is defined and fit.model_confidence.freshness_half_life_hours is not none else '—' }} h{% if fit.model_confidence.freshness and fit.model_confidence.freshness.accuracy_factor is not none %} · accuracy factor {{ fit.model_confidence.freshness.accuracy_factor|num(2) }}×{% endif %}</p>
+    {% endif %}
     {% if fit.model_confidence and fit.model_confidence.warnings %}
       <p class="muted">Confidence notes: {{ fit.model_confidence.warnings|join('; ') }}</p>
     {% endif %}

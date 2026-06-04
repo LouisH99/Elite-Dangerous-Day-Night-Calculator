@@ -1,3 +1,29 @@
+## V0.206.2
+
+- Fixed the V0.199+ fit regression for bodies whose parent chain contains a Null/barycentre before the illumination star.
+- Added automatic sun-geometry selection:
+  - recursive source geometry for clean star/planet/moon parent chains and explicit illumination-source overrides.
+  - v15-compatible fitted sun-direction geometry for Null/barycentre chains and old fits without geometry metadata.
+- Made legacy geometry v15-compatible: direct star-orbiting bodies still use the parent-star orbital vector, while moons/Null cases use a fitted distant effective sun direction.
+- Stored a `sun_geometry_reason` in fit metadata to make the selected geometry mode easier to audit.
+- Updated admin fit help text to explain when auto uses recursive vs v15-compatible geometry.
+
+## V0.206.1
+
+- Fixed a fitting regression introduced by the V0.199 recursive illumination-source path for bodies where the available orbital geometry does not match Elite's effective daylight behavior.
+- Existing fits without stored geometry metadata now load with the legacy empirical distant-star geometry, preserving old accurate V0.194-era models.
+- New refits automatically try the legacy distant-star geometry first and use it when it clearly explains the observations better.
+- Stored fit parameters now include `sun_geometry_mode` so future predictions use the same geometry mode that was used during fitting.
+- Marked heading constraints as experimental on the admin fit page and disabled browser autocomplete on refit forms to reduce accidental checked-state persistence.
+
+## V0.206
+
+- Added dynamic model-confidence freshness half-life based on estimated day period and fit accuracy.
+- Excellent low-residual models now keep freshness confidence longer, while weak/high-residual models age faster.
+- Limited the positive accuracy boost when a model has too few effective observations or poor time coverage, to reduce overfit confidence.
+- Added freshness details to `model_confidence`, including base half-life, accuracy factor, final half-life, and boost-limiting reason.
+- Added freshness half-life details to the body and admin fit confidence displays.
+
 ## V0.205
 
 - Simplified the public `/systems` overview table.

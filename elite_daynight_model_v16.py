@@ -610,6 +610,93 @@ def orbit_context_label(system: Optional[Dict[str, Any]], body: Dict[str, Any]) 
     return f"target parent is {pname}"
 
 
+def normalize_sun_geometry_mode(value: Optional[str]) -> str:
+    """Normalize stored/user-facing sun geometry mode aliases.
+
+    recursive_source / recursive_star_vector uses the V0.199+ recursive
+    parent-chain illumination vector.
+
+    legacy_distant / legacy_fitted_sun_direction preserves the pre-V0.199
+    v15 behaviour: direct star-orbiting bodies use their parent-star orbital
+    vector, while moons/null-parent bodies fit a stable distant effective sun
+    direction from observations.
+    """
+    mode = str(value or "auto").strip().lower()
+    aliases = {
+        "recursive": "recursive_source",
+        "recursive_star_vector": "recursive_source",
+        "recursive-source": "recursive_source",
+        "legacy": "legacy_distant",
+        "legacy_fitted_sun_direction": "legacy_distant",
+        "legacy-fitted-sun-direction": "legacy_distant",
+        "legacy_fitted_distant_star": "legacy_distant",
+        "legacy-distant": "legacy_distant",
+        "fitted_distant_star": "legacy_distant",
+        "v15": "legacy_distant",
+        "v15_legacy": "legacy_distant",
+    }
+    mode = aliases.get(mode, mode)
+    if mode in {"auto", "recursive_source", "legacy_distant"}:
+        return mode
+    return "auto"
+
+
+def body_parent_chain_has_null(system: Optional[Dict[str, Any]], body: Dict[str, Any]) -> bool:
+    """Return True when the resolved ancestor chain contains a Null/barycentre.
+
+    This is important because many Spansh/Journal exports can describe a moon as
+    moon -> planet -> Null/barycentre -> star.  The recursive physical vector
+    can be useful for clean star/planet/moon chains, but the Null/barycentre
+    branch has caused large regressions on bodies that were accurately handled
+    by the old empirical v15 distant-sun fit.
+    """
+    cur = body
+    seen = set()
+    for _ in range(16):
+        # Stop once a real star is reached. Many real stars themselves orbit a
+        # Null/barycentre, but that does not make the planet/moon-to-star
+        # illumination vector uncertain. The problematic case is a Null between
+        # the target body and the star, such as moon -> planet -> Null.
+        if is_star_body(cur):
+            return False
+        if direct_parent_kind(cur) == "null":
+            return True
+        key = body_name(cur).lower() or str(cur.get("BodyID") or cur.get("bodyId") or id(cur))
+        if key in seen:
+            return False
+        seen.add(key)
+        if system is None:
+            return False
+        parent = direct_parent_body(system, cur)
+        if parent is None:
+            return False
+        cur = parent
+    return False
+
+
+def recommended_sun_geometry_mode(system: Optional[Dict[str, Any]], body: Dict[str, Any]) -> Tuple[str, str]:
+    """Choose a safe default geometry mode for fitting.
+
+    The rule intentionally preserves v15 empirical behaviour for uncertain
+    Null/barycentre chains while allowing the V0.199+ recursive source geometry
+    where it is known to help, such as clean moon-of-planet-around-star systems
+    and explicit illumination-source overrides.
+    """
+    explicit = str(body.get("illumination_source_star_name") or body.get("IlluminationSourceStarName") or "").strip()
+    if explicit and explicit.lower() != "auto":
+        return "recursive_source", "explicit illumination-source override"
+    if system is None:
+        return "legacy_distant", "no system context; preserve empirical v15 geometry"
+    if body_parent_chain_has_null(system, body):
+        return "legacy_distant", "parent chain contains Null/barycentre"
+    kind = direct_parent_kind(body)
+    if kind == "star":
+        return "recursive_source", "direct star parent"
+    if find_parent_star(system, body) is not None:
+        return "recursive_source", "clean parent chain contains real star"
+    return "legacy_distant", "illumination geometry uncertain; preserve empirical v15 geometry"
+
+
 def body_position_inertial(system: Dict[str, Any], body: Dict[str, Any], t: datetime, orbit_flip: int = 1, _seen: Optional[set] = None) -> Optional[np.ndarray]:
     """Approximate barycentric inertial position for a body.
 
@@ -744,6 +831,9 @@ class FittedModel:
     time_half_life_hours: float = 24.0
     time_min_weight: float = 0.05
     system: Optional[Dict[str, Any]] = None
+    # "recursive_source" uses the V0.199+ physical/recursive star-vector path.
+    # "legacy_distant" keeps the pre-V0.199 empirical fitted distant-star vector.
+    sun_geometry_mode: str = "recursive_source"
     def predict(self, t: datetime, lat_deg: float, lon_deg: float) -> Tuple[float, float]:
         return predict_alt_az(self, t, lat_deg, lon_deg)
 
@@ -756,11 +846,21 @@ def body_frame_matrix(alpha: float, beta: float, gamma: float) -> np.ndarray:
 
 def sun_vector_body(model: FittedModel, t: datetime) -> np.ndarray:
     alpha, beta, gamma, phase = model.params
-    s_inertial, _mode, _reason = illumination_vector_inertial(model.system, model.body, t, orbit_flip=model.orbit_flip)
-    if s_inertial is None:
-        # Last-resort legacy fallback. This keeps older/incomplete data usable,
-        # but reports should show Sun-source mode: fallback.
-        s_inertial = np.array([float(model.orbit_flip), 0.0, 0.0])
+    if getattr(model, "sun_geometry_mode", "recursive_source") == "legacy_distant":
+        # Pre-V0.199/v15-compatible mode. Direct star-orbiting bodies use the
+        # parent-star orbital vector, while moons and Null/barycentre cases fit
+        # a stable distant effective sun direction from observations.
+        if body_orbits_star_directly(model.body):
+            r_parent_to_body = orbital_position_parent_to_body(model.body, t)
+            s_inertial = norm(-float(model.orbit_flip) * r_parent_to_body)
+        else:
+            s_inertial = np.array([float(model.orbit_flip), 0.0, 0.0])
+    else:
+        s_inertial, _mode, _reason = illumination_vector_inertial(model.system, model.body, t, orbit_flip=model.orbit_flip)
+        if s_inertial is None:
+            # Last-resort legacy fallback. This keeps older/incomplete data usable,
+            # but reports should show Sun-source mode: fallback.
+            s_inertial = np.array([float(model.orbit_flip), 0.0, 0.0])
     epoch = scan_epoch(model.body)
     dt = (t - epoch).total_seconds()
     rot_period = abs(get_required_float(model.body, "RotationPeriod"))
@@ -799,10 +899,15 @@ def make_model(
     time_half_life_hours: float = 24.0,
     time_min_weight: float = 0.05,
     system: Optional[Dict[str, Any]] = None,
+    sun_geometry_mode: Optional[str] = None,
 ) -> FittedModel:
+    effective_geometry_mode = normalize_sun_geometry_mode(sun_geometry_mode)
+    if effective_geometry_mode == "auto":
+        effective_geometry_mode, _geometry_reason = recommended_sun_geometry_mode(system, body)
     return FittedModel(
         body, params, spin_sign, lon_sign, orbit_flip, score, 0.0, None, observations,
-        time_weighting, time_ref, time_half_life_hours, time_min_weight, system
+        time_weighting, time_ref, time_half_life_hours, time_min_weight, system,
+        effective_geometry_mode,
     )
 
 
@@ -868,7 +973,38 @@ def fit_model(
     time_ref: Optional[datetime] = None,
     time_min_weight: float = 0.05,
     system: Optional[Dict[str, Any]] = None,
+    sun_geometry_mode: str = "recursive_source",
 ) -> FittedModel:
+    sun_geometry_mode = normalize_sun_geometry_mode(sun_geometry_mode)
+    if sun_geometry_mode == "auto":
+        selected_mode, selected_reason = recommended_sun_geometry_mode(system, body)
+        selected = fit_model(
+            body, observations, use_heading=use_heading, seed=seed,
+            time_weighting=time_weighting, time_half_life_hours=time_half_life_hours,
+            time_ref=time_ref, time_min_weight=time_min_weight, system=system,
+            sun_geometry_mode=selected_mode,
+        )
+        # Safety valve: if the selected mode is very poor, try the alternative
+        # and keep it only if it is a major improvement. This catches incomplete
+        # or misleading orbital metadata without making every normal refit twice
+        # as expensive.
+        if selected.rms_altitude > 3.0:
+            alternative_mode = "legacy_distant" if selected_mode == "recursive_source" else "recursive_source"
+            try:
+                alternative = fit_model(
+                    body, observations, use_heading=use_heading, seed=seed,
+                    time_weighting=time_weighting, time_half_life_hours=time_half_life_hours,
+                    time_ref=time_ref, time_min_weight=time_min_weight, system=system,
+                    sun_geometry_mode=alternative_mode,
+                )
+                if alternative.score + 0.5 < selected.score:
+                    return alternative
+            except Exception:
+                pass
+        return selected
+    if sun_geometry_mode not in {"recursive_source", "legacy_distant"}:
+        sun_geometry_mode, _geometry_reason = recommended_sun_geometry_mode(system, body)
+
     # Validate required fields early.
     for key in ("timestamp", "RotationPeriod", "OrbitalPeriod", "SemiMajorAxis"):
         get_required_float(body, key) if key != "timestamp" else scan_epoch(body)
@@ -890,6 +1026,7 @@ def fit_model(
             time_half_life_hours=time_half_life_hours,
             time_min_weight=time_min_weight,
             system=system,
+            sun_geometry_mode=sun_geometry_mode,
         )
         return model_loss(m, use_heading=use_heading)[0]
 
@@ -916,6 +1053,7 @@ def fit_model(
                 time_half_life_hours=time_half_life_hours,
                 time_min_weight=time_min_weight,
                 system=system,
+                sun_geometry_mode=sun_geometry_mode,
             )
             score, rms_alt, rms_head = model_loss(model, use_heading=use_heading)
             model.score = score
@@ -959,6 +1097,7 @@ def fit_model(
                     time_half_life_hours=time_half_life_hours,
                     time_min_weight=time_min_weight,
                     system=system,
+                    sun_geometry_mode=sun_geometry_mode,
                 )
                 score, rms_alt, rms_head = model_loss(model, use_heading=use_heading)
                 model.score = score
@@ -1269,6 +1408,28 @@ def calibration_source_label(calibration_path: Optional[str]) -> str:
     return "manual observation table / unsaved CSV"
 
 
+def model_sun_source_mode_label(fitted: FittedModel) -> str:
+    if getattr(fitted, "sun_geometry_mode", "recursive_source") == "legacy_distant":
+        return "legacy_distant"
+    return sun_source_mode_label(fitted.system, fitted.body)
+
+
+def model_illumination_source_name(fitted: FittedModel) -> str:
+    if getattr(fitted, "sun_geometry_mode", "recursive_source") == "legacy_distant":
+        return "fitted distant-star vector"
+    return illumination_source_name(fitted.system, fitted.body)
+
+
+def model_orbit_context_label(fitted: FittedModel) -> str:
+    return orbit_context_label(fitted.system, fitted.body)
+
+
+def model_sun_vector_source_label(fitted: FittedModel) -> str:
+    if getattr(fitted, "sun_geometry_mode", "recursive_source") == "legacy_distant":
+        return "v15-compatible fitted sun direction"
+    return sun_vector_source_label(fitted.body, fitted.system)
+
+
 def make_report(
     model: FittedModel,
     system: Optional[Dict[str, Any]] = None,
@@ -1289,10 +1450,10 @@ def make_report(
     orb = abs(float(body.get("OrbitalPeriod", 0.0)))
     lines.append(f"Rotation period: {rot:.3f} s ({rot/3600.0:.4f} h)")
     lines.append(f"Orbital period:  {orb:.3f} s ({orb/3600.0:.4f} h)")
-    lines.append(f"Illumination source: {illumination_source_name(system, body) if system else 'unknown'}")
-    lines.append(f"Orbit context: {orbit_context_label(system, body)}")
-    lines.append(f"Sun-source mode: {sun_source_mode_label(system, body)}")
-    lines.append(f"Sun-vector source: {sun_vector_source_label(body, system)}")
+    lines.append(f"Illumination source: {model_illumination_source_name(model)}")
+    lines.append(f"Orbit context: {model_orbit_context_label(model)}")
+    lines.append(f"Sun-source mode: {model_sun_source_mode_label(model)}")
+    lines.append(f"Sun-vector source: {model_sun_vector_source_label(model)}")
     diff_p, sum_p = apparent_mean_periods(body)
     lines.append(f"Mean rotation-orbit beat period: {diff_p:.1f} s ({diff_p/3600.0:.4f} h)")
     lines.append(f"Mean rotation+orbit period:     {sum_p:.1f} s ({sum_p/3600.0:.4f} h)")
@@ -1324,7 +1485,7 @@ def make_report(
 
     if target_time is not None and target_lat is not None and target_lon is not None:
         alt, az = model.predict(target_time, target_lat, target_lon)
-        radius = star_angular_radius_deg(system, body, target_time) if system else None
+        radius = star_angular_radius_deg(system, body, target_time) if (system and getattr(model, "sun_geometry_mode", "recursive_source") != "legacy_distant") else None
         centre_crossings = find_crossings(
             model,
             target_time,
@@ -1409,10 +1570,12 @@ def model_summary_dict(model: FittedModel) -> Dict[str, Any]:
         "time_ref_utc": None if model.time_ref is None else format_utc(model.time_ref),
         "time_half_life_hours": float(model.time_half_life_hours),
         "time_min_weight": float(model.time_min_weight),
-        "illumination_source": illumination_source_name(model.system, model.body),
-        "sun_source_mode": sun_source_mode_label(model.system, model.body),
-        "orbit_context": orbit_context_label(model.system, model.body),
-        "sun_vector_source": sun_vector_source_label(model.body, model.system),
+        "sun_geometry_mode": getattr(model, "sun_geometry_mode", "recursive_source"),
+        "sun_geometry_reason": recommended_sun_geometry_mode(model.system, model.body)[1],
+        "illumination_source": model_illumination_source_name(model),
+        "sun_source_mode": model_sun_source_mode_label(model),
+        "orbit_context": model_orbit_context_label(model),
+        "sun_vector_source": model_sun_vector_source_label(model),
     }
 
 
@@ -1695,6 +1858,101 @@ def confidence_level(score: float) -> str:
     return "very low"
 
 
+def clamp_value(value: float, low: float, high: float) -> float:
+    return max(float(low), min(float(high), float(value)))
+
+
+def confidence_base_half_life_hours(estimated_day_period_hours: Optional[float]) -> Tuple[float, str]:
+    """Return the day-period based freshness half-life used by confidence.
+
+    The old confidence freshness used a broad fixed minimum.  V0.206 keeps the
+    idea that longer local day cycles should age more slowly, but makes the
+    chosen value explicit for website/API consumers.
+    """
+    if estimated_day_period_hours is None or estimated_day_period_hours <= 0:
+        return 24.0 * 7.0, "fallback_7_days"
+    base = clamp_value(3.0 * float(estimated_day_period_hours), 24.0 * 3.0, 24.0 * 30.0)
+    return base, "3x_estimated_day_period_clamped_3_to_30_days"
+
+
+def confidence_accuracy_half_life_factor(
+    rms_altitude_deg: float,
+    max_altitude_error_deg: Optional[float],
+    effective_observations: float,
+    observation_coverage_ratio: Optional[float],
+) -> Tuple[float, str, bool]:
+    """Return how much fit accuracy should stretch/shrink freshness half-life.
+
+    Very accurate models should stay trustworthy for longer because observed
+    drift is smaller.  However, a tiny residual from only a couple of close
+    observations can simply be overfit, so the positive boost is capped until
+    the model has enough effective observations and time coverage.
+    """
+    rms = float(rms_altitude_deg)
+    max_err = None if max_altitude_error_deg is None else float(max_altitude_error_deg)
+
+    if rms <= 0.25 and (max_err is None or max_err <= 1.0):
+        factor, basis = 3.0, "excellent_fit"
+    elif rms <= 0.5 and (max_err is None or max_err <= 2.0):
+        factor, basis = 2.0, "very_good_fit"
+    elif rms <= 1.0:
+        factor, basis = 1.5, "good_fit"
+    elif rms <= 2.0:
+        factor, basis = 1.0, "usable_fit"
+    elif rms <= 4.0:
+        factor, basis = 0.6, "weak_fit"
+    else:
+        factor, basis = 0.35, "bad_fit"
+
+    boost_limited_by_data = False
+    has_enough_data = float(effective_observations) >= 4.0
+    has_enough_coverage = observation_coverage_ratio is not None and float(observation_coverage_ratio) >= 0.30
+    if factor > 1.2 and not (has_enough_data and has_enough_coverage):
+        factor = 1.2
+        boost_limited_by_data = True
+        basis = basis + "_limited_by_observation_data"
+
+    return float(factor), basis, bool(boost_limited_by_data)
+
+
+def confidence_freshness_half_life_hours(
+    estimated_day_period_hours: Optional[float],
+    rms_altitude_deg: float,
+    max_altitude_error_deg: Optional[float],
+    effective_observations: float,
+    observation_coverage_ratio: Optional[float],
+) -> Dict[str, Any]:
+    """Return V0.206 freshness half-life details for model confidence.
+
+    Formula:
+      base = clamp(3 × estimated day period, 3 days, 30 days)
+      final = clamp(base × accuracy_factor, 1 day, 90 days)
+
+    The accuracy factor lets excellent low-residual models age more slowly and
+    weak/high-residual models age faster.
+    """
+    base_hours, base_basis = confidence_base_half_life_hours(estimated_day_period_hours)
+    factor, accuracy_basis, boost_limited = confidence_accuracy_half_life_factor(
+        rms_altitude_deg,
+        max_altitude_error_deg,
+        effective_observations,
+        observation_coverage_ratio,
+    )
+    half_life_hours = clamp_value(base_hours * factor, 24.0, 24.0 * 90.0)
+    return {
+        "day_period_hours": None if estimated_day_period_hours is None else float(estimated_day_period_hours),
+        "base_half_life_hours": float(base_hours),
+        "base_basis": base_basis,
+        "accuracy_factor": float(factor),
+        "accuracy_basis": accuracy_basis,
+        "boost_limited_by_observation_data": bool(boost_limited),
+        "half_life_hours": float(half_life_hours),
+        "basis": "day_period_and_fit_accuracy",
+        "minimum_half_life_hours": 24.0,
+        "maximum_half_life_hours": 24.0 * 90.0,
+    }
+
+
 def estimated_model_day_period_seconds(model: FittedModel) -> Optional[float]:
     """Return a conservative estimate for the model's relevant day/night period.
 
@@ -1796,14 +2054,26 @@ def model_confidence_dict(
         time_coverage_score = 0.2
 
     # 4) Freshness: predictions far from the newest observation become less certain.
+    # V0.206 makes the half-life dynamic: local day period gives the base value,
+    # then fit accuracy stretches or shrinks it. Excellent, well-covered models
+    # age more slowly; weak residuals age faster.
     prediction_distance_hours: Optional[float] = None
     if target_time is not None and newest is not None:
         prediction_distance_hours = abs((target_time - newest).total_seconds()) / 3600.0
+    freshness_details = confidence_freshness_half_life_hours(
+        estimated_day_period_hours,
+        rms_alt,
+        max_alt_error,
+        effective_observations,
+        coverage_ratio,
+    )
+    half_life_hours = float(freshness_details["half_life_hours"])
     if prediction_distance_hours is None:
         freshness_score = 0.75
     else:
-        half_life_hours = max(24.0 * 7.0, 3.0 * (estimated_day_period_hours or 24.0))
         freshness_score = max(0.25, 0.5 ** (prediction_distance_hours / half_life_hours))
+    freshness_details["prediction_distance_hours"] = None if prediction_distance_hours is None else float(prediction_distance_hours)
+    freshness_details["score"] = round(freshness_score * 100.0, 1)
 
     # 5) Review/model safety.  Provisional data is capped below high confidence.
     mode = (model_mode or "approved").strip().lower()
@@ -1813,9 +2083,11 @@ def model_confidence_dict(
 
     # 6) Geometry/source complexity. Explicit/inferred recursive star source is OK;
     # last-resort fallback is more risky.
-    source_mode = sun_source_mode_label(model.system, model.body)
+    source_mode = model_sun_source_mode_label(model)
     if source_mode == "fallback":
         geometry_score = 0.55
+    elif source_mode == "legacy_distant":
+        geometry_score = 0.75
     elif source_mode == "explicit":
         geometry_score = 0.95
     else:
@@ -1847,12 +2119,20 @@ def model_confidence_dict(
         strengths.append("good observation count")
     if span_hours is not None and estimated_day_period_hours and estimated_day_period_hours > 0 and span_hours < 0.2 * estimated_day_period_hours:
         warnings.append("observations cover a short part of the cycle")
-    if prediction_distance_hours is not None and prediction_distance_hours > max(24.0 * 14.0, 6.0 * (estimated_day_period_hours or 24.0)):
+    if prediction_distance_hours is not None and prediction_distance_hours > 2.0 * half_life_hours:
         warnings.append("prediction is far from latest observation")
+    if float(freshness_details.get("accuracy_factor") or 1.0) > 1.2:
+        strengths.append("accurate fit extends freshness")
+    elif float(freshness_details.get("accuracy_factor") or 1.0) < 1.0:
+        warnings.append("fit accuracy shortens freshness")
+    if bool(freshness_details.get("boost_limited_by_observation_data")):
+        warnings.append("freshness boost limited by observation coverage")
     if includes_unreviewed or mode == "provisional":
         warnings.append("includes unreviewed observations")
     if source_mode == "fallback":
         warnings.append("sun-source geometry uses fallback mode")
+    elif source_mode == "legacy_distant":
+        warnings.append("sun-source geometry uses v15-compatible fitted sun-direction mode")
 
     return {
         "score": score,
@@ -1868,10 +2148,14 @@ def model_confidence_dict(
         "newest_observation_utc": None if newest is None else format_utc(newest),
         "oldest_observation_utc": None if oldest is None else format_utc(oldest),
         "prediction_distance_hours": None if prediction_distance_hours is None else float(prediction_distance_hours),
+        "freshness_half_life_hours": float(half_life_hours),
+        "freshness": freshness_details,
         "includes_unreviewed": bool(includes_unreviewed or mode == "provisional"),
         "sun_source_mode": source_mode,
-        "illumination_source": illumination_source_name(model.system, model.body),
-        "orbit_context": orbit_context_label(model.system, model.body),
+        "sun_geometry_mode": getattr(model, "sun_geometry_mode", "recursive_source"),
+        "sun_geometry_reason": recommended_sun_geometry_mode(model.system, model.body)[1],
+        "illumination_source": model_illumination_source_name(model),
+        "orbit_context": model_orbit_context_label(model),
         "component_scores": {
             "fit_quality": round(fit_quality_score * 100.0, 1),
             "observation_count": round(observation_count_score * 100.0, 1),
@@ -1905,6 +2189,7 @@ def fit_model_from_files(
         time_half_life_hours=time_half_life_hours,
         time_ref=time_ref,
         system=system,
+        sun_geometry_mode="auto",
     )
     return system, body, observations, model
 

@@ -67,7 +67,7 @@ ALLOWED_QUALITY = {"high", "medium", "low"}
 
 app = FastAPI(
     title="Elite Dangerous Day/Night Calculator API",
-    version="0.205",
+    version="0.206.2",
     description="Local-first API for systems, bodies, observations, fitting and prediction.",
 )
 
@@ -934,7 +934,7 @@ def start_provisional_fit_worker() -> None:
 def root() -> Dict[str, Any]:
     return {
         "name": "Elite Dangerous Day/Night Calculator API",
-        "version": "0.205",
+        "version": "0.206.2",
         "db_path": DB_PATH,
         "docs": "/docs",
     }
@@ -1410,6 +1410,10 @@ def get_fit(body_id: int, include_residuals: bool = True, model_mode: str = "app
         data.update(review_meta)
         try:
             _system, _fitted, _fit_id = dbmod.model_from_active_fit(con, body_id, fit_mode=mode)
+            # Rebuild the public params summary from the loaded model so legacy
+            # fits created before sun_geometry_mode existed still display the
+            # geometry mode they are now correctly loaded with.
+            data["params"] = model.model_summary_dict(_fitted)
             data["model_confidence"] = model.model_confidence_dict(
                 _fitted,
                 model_mode=mode,

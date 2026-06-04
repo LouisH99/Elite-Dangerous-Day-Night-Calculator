@@ -1347,7 +1347,11 @@ def fit_body(
             raise ValueError("No approved/new/needs_check observations for this body")
         raise ValueError("No approved observations for this body")
     observations = [o for _, o in obs_pairs]
-    fitted = model.fit_model(body, observations, use_heading=use_heading, time_weighting=time_weighting, time_half_life_hours=time_half_life_hours, system=system)
+    fitted = model.fit_model(
+        body, observations, use_heading=use_heading, time_weighting=time_weighting,
+        time_half_life_hours=time_half_life_hours, system=system,
+        sun_geometry_mode="auto",
+    )
     summary = model.model_summary_dict(fitted)
     report_label = "database approved + unreviewed observations" if include_unreviewed else "database approved observations"
     report = model.make_report(fitted, system, calibration_path=report_label)
@@ -1418,6 +1422,13 @@ def model_from_active_fit(con: sqlite3.Connection, body_pk: int, fit_mode: str =
     system, body = raw_system_and_body(con, int(frow["system_id"]), body_pk)
     params = json.loads(frow["params_json"])
     p = params["params"]
+    # Fits created before the V0.199 recursive illumination-source experiment did
+    # not store a geometry mode and were calibrated with the empirical distant-star
+    # vector.  Default missing metadata to legacy_distant so old accurate fits keep
+    # predicting with the same model semantics.
+    sun_geometry_mode = model.normalize_sun_geometry_mode(params.get("sun_geometry_mode") or params.get("illumination_geometry_mode") or "legacy_distant")
+    if sun_geometry_mode == "auto":
+        sun_geometry_mode = "legacy_distant"
     fitted = model.make_model(
         body,
         (float(p["alpha_rad"]), float(p["beta_rad"]), float(p["gamma_rad"]), float(p["phase_rad"])),
@@ -1425,6 +1436,7 @@ def model_from_active_fit(con: sqlite3.Connection, body_pk: int, fit_mode: str =
         observations=[o for _, o in observations_for_fit(con, fit_id)],
         score=float(frow["fit_score"] or 0.0), time_weighting=bool(frow["time_weighting"]),
         system=system,
+        sun_geometry_mode=sun_geometry_mode,
     )
     fitted.rms_altitude = float(frow["rms_altitude_deg"] or 0.0)
     fitted.rms_heading = None if frow["rms_heading_deg"] is None else float(frow["rms_heading_deg"])
