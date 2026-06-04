@@ -1,12 +1,12 @@
 # Elite Dangerous Day/Night Calculator
 
-Current package version: **V0.205**.
+Current package version: **V0.206.2**.
 
 A community tool for predicting local daylight, sunrise, sunset, and sun elevation on planets and moons in **Elite Dangerous**.
 
 The project lets players add systems/bodies, submit sun observations, review submitted data, fit a prediction model, and use saved Points of Interest (POIs) to quickly check local light conditions.
 
-> **Project status:** early community tool, currently around `V0.205`.
+> **Project status:** early community tool, currently around `V0.206.2`.
 >
 > **Transparency note:** this is a **vibe-coded / AI-assisted project**. A large part of the design, code structure, debugging, and documentation was created with help from ChatGPT. The model, outputs, and implementation should be treated as experimental and should be validated with real observations.
 
@@ -37,6 +37,7 @@ Players can help by submitting surface observations. Reviewers can approve, reje
 
 - Search systems already in the local database with autocomplete
 - Filter the systems overview by reviewed model, provisional model, observations, needs-observations, confidence, and racing-only status
+- Cleaner systems overview with observation totals and less technical clutter
 - Import systems/bodies from Spansh
 - View predictable bodies only
 - Predict day/night for manual coordinates
@@ -357,6 +358,7 @@ Each prediction includes a practical confidence estimate. The score is not a for
 - number and quality-weighted count of observations
 - observation time spread compared with the estimated day cycle
 - time distance between the prediction and the newest observation
+- a dynamic freshness half-life based on estimated day period and fit accuracy
 - reviewed vs provisional data
 - sun-source/orbit geometry mode
 
@@ -368,7 +370,7 @@ Medium · 67%
 Low · 42%
 ```
 
-The detailed confidence object is also returned in prediction responses for future public API use.
+The detailed confidence object is also returned in prediction responses for future public API use. It includes a `freshness` block showing the estimated day period, base half-life, accuracy factor, final half-life, and whether an excellent-fit boost was limited because the model still lacks enough observations or cycle coverage.
 
 ### System overview filters
 
