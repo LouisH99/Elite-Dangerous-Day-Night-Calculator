@@ -1,12 +1,12 @@
 # Elite Dangerous Day/Night Calculator
 
-Current package version: **V0.208**.
+Current package version: **V0.209.1**.
 
 A community tool for predicting local daylight, sunrise, sunset, and sun elevation on planets and moons in **Elite Dangerous**.
 
 The project lets players add systems/bodies, submit sun observations, review submitted data, fit a prediction model, and use saved Points of Interest (POIs) to quickly check local light conditions.
 
-> **Project status:** early community tool, currently around `V0.208`.
+> **Project status:** early community tool, currently around `V0.209.1`.
 >
 > **Transparency note:** this is a **vibe-coded / AI-assisted project**. A large part of the design, code structure, debugging, and documentation was created with help from ChatGPT. The model, outputs, and implementation should be treated as experimental and should be validated with real observations.
 
@@ -37,6 +37,7 @@ Players can help by submitting surface observations. Reviewers can approve, reje
 
 - Search systems already in the local database with autocomplete
 - Filter the systems overview by reviewed model, provisional model, observations, needs-observations, confidence, and racing-only status
+- Systems overview health now uses the same current confidence/note logic as predictions
 - Cleaner systems overview with observation totals and less technical clutter
 - Import systems/bodies from Spansh
 - View predictable bodies only
@@ -47,6 +48,30 @@ Players can help by submitting surface observations. Reviewers can approve, reje
 - Submit POIs for review, if public POI submissions are enabled
 - Try a provisional model when unreviewed observations exist
 - Beginner-friendly help text for new users
+- Public read-only prediction API at `/public/api/v1/prediction`
+- Prediction lookup by system/body/coordinates, public POI name, or Razz Racing race key
+
+### Public prediction API
+
+The package includes a read-only public API focused on day/night prediction, not general planetary data.
+
+Main endpoint:
+
+```text
+/public/api/v1/prediction
+```
+
+Supported lookup modes:
+
+- system/body plus latitude/longitude
+- public approved POI name
+- Razz Racing race key such as `RAZZAFRAG03`
+
+The API returns prediction data, model confidence, a short model note when attention is needed, and a needs-observations flag. Full usage examples are in:
+
+```text
+PUBLIC_API.md
+```
 
 ### Hidden control area
 
@@ -131,6 +156,7 @@ ELITE_DAYNIGHT_DB_WRITE_RETRIES=5
 ELITE_DAYNIGHT_DB_WRITE_RETRY_BASE_SECONDS=0.08
 ELITE_DAYNIGHT_KEEP_INACTIVE_FITS=0
 ELITE_DAYNIGHT_PUBLIC_REFIT_COOLDOWN=60
+ELITE_DAYNIGHT_ADMIN_FIT_REFRESH_SECONDS=5
 ELITE_DAYNIGHT_AUTOMATION_MODE=shadow
 ELITE_DAYNIGHT_AUTOMATION_BATCH_LIMIT=200
 ```
@@ -139,8 +165,8 @@ To disable public POI submissions:
 
 ```bash
 ELITE_DAYNIGHT_PUBLIC_POI_SUBMISSIONS_ENABLED=0
-ELITE_DAYNIGHT_ADMIN_FIT_REFRESH_SECONDS=5
 
+The private API run scripts set these defaults if the variables are not already defined.
 ```
 
 ---
