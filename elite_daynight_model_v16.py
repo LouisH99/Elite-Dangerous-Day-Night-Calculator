@@ -2266,9 +2266,17 @@ def model_confidence_dict(
         warnings.append("few observations")
     elif effective_observations >= 6.0:
         strengths.append("good observation count")
-    if span_hours is not None and estimated_day_period_hours and estimated_day_period_hours > 0 and span_hours < 0.2 * estimated_day_period_hours:
+    coverage_too_short = bool(
+        span_hours is not None
+        and estimated_day_period_hours
+        and estimated_day_period_hours > 0
+        and span_hours < 0.2 * estimated_day_period_hours
+    )
+    if coverage_too_short:
         warnings.append("observations cover a short part of the cycle")
-    if prediction_distance_hours is not None and prediction_distance_hours > 2.0 * half_life_hours:
+    prediction_old = bool(prediction_distance_hours is not None and prediction_distance_hours > half_life_hours)
+    prediction_very_old = bool(prediction_distance_hours is not None and prediction_distance_hours > 2.0 * half_life_hours)
+    if prediction_very_old:
         warnings.append("prediction is far from latest observation")
     if float(freshness_details.get("accuracy_factor") or 1.0) > 1.2:
         strengths.append("accurate fit extends freshness")
@@ -2282,6 +2290,24 @@ def model_confidence_dict(
         warnings.append("sun-source geometry uses fallback mode")
     elif source_mode == "legacy_distant":
         warnings.append("sun-source geometry uses v15-compatible fitted sun-direction mode")
+
+    # Single short user-facing note for website/public API.  Keep this empty for
+    # healthy models so normal users are not overwhelmed by diagnostic details.
+    note = ""
+    if rms_alt > 4.0 or (max_alt_error is not None and max_alt_error > 5.0):
+        note = "Fit residuals are high."
+    elif used_observations < 4:
+        note = f"Only {used_observations} reviewed observation{'s' if used_observations != 1 else ''}."
+    elif coverage_too_short:
+        note = "Observation time coverage is too short."
+    elif prediction_old and prediction_distance_hours is not None:
+        age_days = prediction_distance_hours / 24.0
+        if age_days >= 2.0:
+            note = f"Newest observation was {age_days:.0f} days ago."
+        else:
+            note = f"Newest observation was {prediction_distance_hours:.0f} hours ago."
+    elif source_mode == "fallback":
+        note = "Sun-source geometry is uncertain."
 
     return {
         "score": score,
@@ -2305,6 +2331,7 @@ def model_confidence_dict(
         "sun_geometry_reason": recommended_sun_geometry_mode(model.system, model.body)[1],
         "illumination_source": model_illumination_source_name(model),
         "orbit_context": model_orbit_context_label(model),
+        "note": note,
         "component_scores": {
             "fit_quality": round(fit_quality_score * 100.0, 1),
             "observation_count": round(observation_count_score * 100.0, 1),

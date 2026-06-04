@@ -1,3 +1,19 @@
+## V0.209.1
+
+- Fixed the systems overview health badges so they use the same current model-confidence and model-note logic as body predictions.
+- Systems with short observation coverage or stale observations now show as needing observations instead of healthy.
+- Added a Medium confidence filter/status bucket to the systems overview.
+- Body fit confidence without an explicit prediction now uses the current UTC time for freshness, reducing before/after prediction inconsistencies.
+
+## V0.209
+
+- Added public read-only prediction API namespace under `/public/api/v1`.
+- Added `/public/api/v1/health`, `/public/api/v1/prediction`, and `/public/api/v1/docs`.
+- Public prediction lookup now supports system/body/coordinates, public POI name, and Razz Racing race key.
+- Public prediction responses include compact prediction data, model confidence, a single short model note, and a needs-observations flag.
+- Added `PUBLIC_API.md` with usage examples and response/error formats.
+- Body pages now show the single short model note instead of long confidence warning lists.
+
 ## V0.208.1
 
 - Added automation environment defaults to the private API run scripts.

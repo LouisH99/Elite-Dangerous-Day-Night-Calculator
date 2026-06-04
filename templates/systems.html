@@ -40,6 +40,7 @@
         <select name="confidence">
           <option value="" {% if not filters.confidence or filters.confidence == 'all' %}selected{% endif %}>Any</option>
           <option value="high" {% if filters.confidence == 'high' %}selected{% endif %}>High</option>
+          <option value="medium" {% if filters.confidence == 'medium' %}selected{% endif %}>Medium</option>
           <option value="low" {% if filters.confidence == 'low' %}selected{% endif %}>Low / very low</option>
         </select>
       </label>
@@ -81,9 +82,11 @@
               <span class="badge badge-muted">racing only</span>
             {% elif s.needs_observations_body_count %}
               <span class="badge badge-warn">needs obs</span>
-              {% if s.low_confidence_body_count %}<span class="badge badge-danger">low</span>{% endif %}
+              {% if s.low_confidence_body_count %}<span class="badge badge-danger">low</span>{% elif s.medium_confidence_body_count %}<span class="badge badge-warn">medium</span>{% endif %}
             {% elif s.low_confidence_body_count %}
               <span class="badge badge-danger">low</span>
+            {% elif s.medium_confidence_body_count %}
+              <span class="badge badge-warn">medium</span>
             {% elif s.high_confidence_body_count %}
               <span class="badge badge-ok">healthy</span>
             {% elif s.observation_count %}

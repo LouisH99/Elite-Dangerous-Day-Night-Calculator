@@ -23,7 +23,7 @@ from urllib.parse import urlencode, quote
 
 import httpx
 from fastapi import FastAPI, Form, Query, Request
-from fastapi.responses import HTMLResponse, RedirectResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, PlainTextResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.sessions import SessionMiddleware
@@ -61,7 +61,7 @@ PUBLIC_POI_SUBMISSIONS_ENABLED = env_bool("ELITE_DAYNIGHT_PUBLIC_POI_SUBMISSIONS
 
 app = FastAPI(
     title="Elite Dangerous Day/Night Calculator Website",
-    version="0.208.1",
+    version="0.209.1",
     docs_url=None,
     redoc_url=None,
     openapi_url=None,
@@ -217,6 +217,383 @@ async def noindex_control_routes(request: Request, call_next):
 async def robots_txt() -> PlainTextResponse:
     return PlainTextResponse("User-agent: *\nDisallow: /control\n")
 
+PUBLIC_API_VERSION = "v1"
+
+
+def public_api_error(code: str, message: str, status_code: int = 400, **extra: Any) -> JSONResponse:
+    payload: Dict[str, Any] = {
+        "api_version": PUBLIC_API_VERSION,
+        "error": {
+            "code": code,
+            "message": message,
+        },
+    }
+    for key, value in extra.items():
+        if value is not None:
+            payload["error"][key] = value
+    return JSONResponse(payload, status_code=status_code)
+
+
+def public_db_connect() -> sqlite3.Connection:
+    con = sqlite3.connect(DB_PATH, timeout=SQLITE_TIMEOUT_SECONDS)
+    con.row_factory = sqlite3.Row
+    con.execute("PRAGMA foreign_keys = ON")
+    con.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
+    return con
+
+
+def public_row_dict(row: sqlite3.Row) -> Dict[str, Any]:
+    return {key: row[key] for key in row.keys()}
+
+
+def public_body_suffix(full_body_name: str, system_name: str) -> str:
+    full = str(full_body_name or "").strip()
+    sysname = str(system_name or "").strip()
+    if sysname and full.lower().startswith(sysname.lower()):
+        return full[len(sysname):].strip()
+    return full
+
+
+def public_compact_token(value: str) -> str:
+    return "".join(ch.lower() for ch in str(value or "").strip() if ch.isalnum())
+
+
+def public_body_matches(row: sqlite3.Row, requested: str) -> bool:
+    req = str(requested or "").strip()
+    if not req:
+        return False
+    keys = set(row.keys())
+    name_key = "body_name" if "body_name" in keys else "name"
+    name = str(row[name_key] or "").strip()
+    system_name = str(row["system_name"] or "").strip()
+    if name.lower() == req.lower():
+        return True
+    if system_name and not req.lower().startswith(system_name.lower()):
+        if name.lower() == f"{system_name} {req}".strip().lower():
+            return True
+    suffix = public_body_suffix(name, system_name)
+    return suffix.lower() == req.lower() or public_compact_token(suffix) == public_compact_token(req)
+
+
+def public_match_summary(row: sqlite3.Row) -> Dict[str, Any]:
+    d = public_row_dict(row)
+    return {
+        "system_name": d.get("system_name"),
+        "body_name": d.get("body_name") or d.get("name"),
+        "poi_name": d.get("poi_name"),
+        "race_key": d.get("source_id") or "",
+    }
+
+
+def public_resolve_body(system_name: str, body_name_value: str) -> tuple[Optional[Dict[str, Any]], Optional[JSONResponse]]:
+    con = public_db_connect()
+    try:
+        systems = con.execute(
+            "SELECT * FROM systems WHERE lower(name) = lower(?) ORDER BY name LIMIT 2",
+            (str(system_name or "").strip(),),
+        ).fetchall()
+        if not systems:
+            return None, public_api_error("not_found", "System not found.", 404)
+        if len(systems) > 1:
+            return None, public_api_error("ambiguous_system", "Multiple systems matched that name.", 400)
+        system = systems[0]
+        bodies = con.execute(
+            """
+            SELECT b.*, s.name AS system_name
+              FROM bodies b JOIN systems s ON s.id = b.system_id
+             WHERE b.system_id = ?
+             ORDER BY COALESCE(b.body_id, 999999), b.name
+            """,
+            (system["id"],),
+        ).fetchall()
+        matches = [b for b in bodies if public_body_matches(b, body_name_value)]
+        if not matches:
+            return None, public_api_error("not_found", "Body not found in the requested system.", 404)
+        if len(matches) > 1:
+            return None, public_api_error(
+                "ambiguous_body",
+                "Multiple bodies matched that name. Use the full body name.",
+                400,
+                matches=[{"system_name": m["system_name"], "body_name": m["name"]} for m in matches[:10]],
+            )
+        b = public_row_dict(matches[0])
+        return {
+            "body_id": int(b["id"]),
+            "system_name": b.get("system_name"),
+            "body_name": b.get("name"),
+        }, None
+    finally:
+        con.close()
+
+
+def public_resolve_poi(poi_name: str, system_name: str = "", body_name_value: str = "") -> tuple[Optional[Dict[str, Any]], Optional[JSONResponse]]:
+    con = public_db_connect()
+    try:
+        rows = con.execute(
+            """
+            SELECT p.*, p.name AS poi_name, b.name AS body_name, b.id AS body_pk,
+                   s.name AS system_name, s.id AS system_pk
+              FROM body_pois p
+              JOIN bodies b ON b.id = p.body_id
+              JOIN systems s ON s.id = b.system_id
+             WHERE p.is_public = 1
+               AND p.review_status = 'approved'
+               AND lower(p.name) = lower(?)
+             ORDER BY lower(s.name), lower(b.name), lower(p.name), p.id
+            """,
+            (str(poi_name or "").strip(),),
+        ).fetchall()
+        if system_name.strip():
+            rows = [r for r in rows if str(r["system_name"]).lower() == system_name.strip().lower()]
+        if body_name_value.strip():
+            rows = [r for r in rows if public_body_matches(r, body_name_value)]
+        if not rows:
+            return None, public_api_error("not_found", "POI not found.", 404)
+        if len(rows) > 1:
+            return None, public_api_error(
+                "ambiguous_poi",
+                "Multiple POIs matched that name. Add system and body to disambiguate.",
+                400,
+                matches=[public_match_summary(r) for r in rows[:10]],
+            )
+        r = public_row_dict(rows[0])
+        return {
+            "body_id": int(r["body_id"]),
+            "system_name": r.get("system_name"),
+            "body_name": r.get("body_name"),
+            "poi_name": r.get("poi_name"),
+            "race_key": r.get("source_id") or "",
+            "lat": float(r["lat"]),
+            "lon": float(r["lon"]),
+        }, None
+    finally:
+        con.close()
+
+
+def public_resolve_race_key(race_key: str) -> tuple[Optional[Dict[str, Any]], Optional[JSONResponse]]:
+    con = public_db_connect()
+    try:
+        rows = con.execute(
+            """
+            SELECT p.*, p.name AS poi_name, b.name AS body_name, b.id AS body_pk,
+                   s.name AS system_name, s.id AS system_pk
+              FROM body_pois p
+              JOIN bodies b ON b.id = p.body_id
+              JOIN systems s ON s.id = b.system_id
+             WHERE p.is_public = 1
+               AND p.review_status = 'approved'
+               AND lower(COALESCE(p.source_id, '')) = lower(?)
+               AND (
+                    p.source = 'razz_racing_api'
+                    OR lower(COALESCE(p.source_label, '')) LIKE '%razz%'
+                    OR lower(COALESCE(p.source, '')) LIKE '%racing%'
+               )
+             ORDER BY p.id
+            """,
+            (str(race_key or "").strip(),),
+        ).fetchall()
+        if not rows:
+            return None, public_api_error("not_found", "Race key not found.", 404)
+        if len(rows) > 1:
+            return None, public_api_error(
+                "ambiguous_race_key",
+                "Multiple POIs matched that race key.",
+                400,
+                matches=[public_match_summary(r) for r in rows[:10]],
+            )
+        r = public_row_dict(rows[0])
+        return {
+            "body_id": int(r["body_id"]),
+            "system_name": r.get("system_name"),
+            "body_name": r.get("body_name"),
+            "poi_name": r.get("poi_name"),
+            "race_key": r.get("source_id") or "",
+            "lat": float(r["lat"]),
+            "lon": float(r["lon"]),
+        }, None
+    finally:
+        con.close()
+
+
+def public_confidence_summary(conf: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "score": int(conf.get("score") or 0),
+        "level": conf.get("level") or "unknown",
+        "fit_rms_altitude_deg": conf.get("fit_rms_altitude_deg"),
+        "max_altitude_residual_deg": conf.get("max_altitude_residual_deg"),
+        "used_observations": conf.get("used_observations"),
+        "newest_observation_utc": conf.get("newest_observation_utc"),
+        "prediction_time_from_newest_observation_hours": conf.get("prediction_distance_hours"),
+        "model_mode": conf.get("model_mode") or "approved",
+        "note": conf.get("note") or "",
+    }
+
+
+def public_observation_need(conf: Dict[str, Any]) -> Dict[str, Any]:
+    note = str(conf.get("note") or "").strip()
+    try:
+        score = float(conf.get("score") or 0.0)
+    except Exception:
+        score = 0.0
+    try:
+        rms = float(conf.get("fit_rms_altitude_deg") or 0.0)
+    except Exception:
+        rms = 0.0
+    try:
+        used = int(conf.get("used_observations") or 0)
+    except Exception:
+        used = 0
+    needs = bool(note) or score < 65.0
+    if not needs:
+        level = "none"
+    elif score < 40.0 or rms > 4.0 or used < 3:
+        level = "high"
+    elif score < 65.0 or used < 4:
+        level = "medium"
+    else:
+        level = "low"
+    return {"needs_observations": bool(needs), "level": level}
+
+
+@app.get("/public/api/v1/health")
+async def public_api_health() -> Dict[str, Any]:
+    return {"api_version": PUBLIC_API_VERSION, "ok": True, "service": "Elite Dangerous Day/Night Calculator public prediction API"}
+
+
+@app.get("/public/api/v1/docs", response_class=PlainTextResponse)
+async def public_api_docs() -> PlainTextResponse:
+    docs_path = os.path.join(BASE_DIR, "PUBLIC_API.md")
+    try:
+        with open(docs_path, "r", encoding="utf-8") as f:
+            return PlainTextResponse(f.read())
+    except OSError:
+        return PlainTextResponse("Public API documentation is not available in this package.", status_code=404)
+
+
+@app.get("/public/api/v1/prediction")
+async def public_api_prediction(
+    system: str = Query(""),
+    body: str = Query(""),
+    lat: Optional[str] = Query(None),
+    lon: Optional[str] = Query(None),
+    poi: str = Query(""),
+    race_key: str = Query(""),
+    time: str = Query(""),
+    prediction_hours: float = Query(72.0, ge=1.0, le=168.0),
+    model_mode: str = Query("approved"),
+) -> Any:
+    mode = (model_mode or "approved").strip().lower()
+    if mode not in {"approved", "provisional"}:
+        return public_api_error("bad_request", "model_mode must be approved or provisional.")
+
+    has_race = bool(race_key.strip())
+    has_poi = bool(poi.strip())
+    has_manual = bool(system.strip() or body.strip() or lat not in (None, "") or lon not in (None, "")) and not has_poi
+    if has_race and (has_poi or has_manual):
+        return public_api_error("bad_request", "Use exactly one target type: race_key, poi, or system/body/lat/lon.")
+    if not has_race and not has_poi and not has_manual:
+        return public_api_error("bad_request", "Provide race_key, poi, or system/body/lat/lon.")
+
+    target: Optional[Dict[str, Any]] = None
+    error: Optional[JSONResponse] = None
+    query_type = "manual"
+    if has_race:
+        query_type = "race_key"
+        target, error = public_resolve_race_key(race_key)
+    elif has_poi:
+        query_type = "poi"
+        target, error = public_resolve_poi(poi, system, body)
+    else:
+        if not system.strip() or not body.strip():
+            return public_api_error("bad_request", "system and body are required for manual coordinate predictions.")
+        if lat in (None, "") or lon in (None, ""):
+            return public_api_error("missing_coordinates", "lat and lon are required for manual coordinate predictions.")
+        try:
+            lat_value = float(str(lat).strip())
+            lon_value = float(str(lon).strip())
+        except Exception:
+            return public_api_error("invalid_coordinates", "lat and lon must be numbers.")
+        if lat_value < -90 or lat_value > 90:
+            return public_api_error("invalid_coordinates", "lat must be between -90 and 90.")
+        if lon_value < -180 or lon_value > 180:
+            return public_api_error("invalid_coordinates", "lon must be between -180 and 180.")
+        target, error = public_resolve_body(system, body)
+        if target is not None:
+            target["lat"] = lat_value
+            target["lon"] = lon_value
+    if error is not None:
+        return error
+    if target is None:
+        return public_api_error("not_found", "Prediction target could not be resolved.", 404)
+
+    target_time = time.strip() or now_utc_iso()
+    try:
+        prediction = await api_request(
+            "GET",
+            f"/api/bodies/{int(target['body_id'])}/prediction",
+            params={
+                "lat": float(target["lat"]),
+                "lon": float(target["lon"]),
+                "time": target_time,
+                "prediction_hours": float(prediction_hours),
+                "model_mode": mode,
+            },
+        )
+    except ApiError as exc:
+        detail = exc.detail or "Prediction failed."
+        if "No active approved fit" in detail or "No active" in detail:
+            return public_api_error("no_reviewed_model" if mode == "approved" else "model_unavailable", detail, 404)
+        if "timestamp" in detail.lower() or "time" in detail.lower():
+            return public_api_error("invalid_time", detail, 400)
+        return public_api_error("prediction_failed", detail, 502)
+
+    conf = prediction.get("model_confidence") or {}
+    public_conf = public_confidence_summary(conf)
+    observation_need = public_observation_need(conf)
+    warnings = []
+    if mode == "provisional":
+        warnings.append("Using provisional model. This model may include unreviewed observations.")
+    if prediction.get("crossings_extended_beyond_window"):
+        warnings.append("No day/night transition was found inside the requested window; fallback search was used.")
+
+    response = {
+        "api_version": PUBLIC_API_VERSION,
+        "query": {
+            "type": query_type,
+            "system": system.strip() or None,
+            "body": body.strip() or None,
+            "poi": poi.strip() or None,
+            "race_key": race_key.strip() or None,
+            "time_utc": prediction.get("target_time_utc"),
+            "prediction_hours": float(prediction_hours),
+            "model_mode": mode,
+        },
+        "target": {
+            "system_name": target.get("system_name"),
+            "body_name": target.get("body_name"),
+            "poi_name": target.get("poi_name"),
+            "race_key": target.get("race_key") or None,
+            "lat": float(target["lat"]),
+            "lon": float(target["lon"]),
+        },
+        "prediction": {
+            "time_utc": prediction.get("target_time_utc"),
+            "sun_altitude_deg": prediction.get("sun_altitude_deg"),
+            "sun_heading_deg": prediction.get("sun_heading_deg"),
+            "is_day": str(prediction.get("centre_state") or "").upper() == "DAY",
+            "state": str(prediction.get("centre_state") or "").lower(),
+            "sun_motion": prediction.get("sun_altitude_trend"),
+            "next_sunrise_utc": prediction.get("next_sunrise_utc"),
+            "next_sunset_utc": prediction.get("next_sunset_utc"),
+            "sunlight_duration_seconds": prediction.get("sunlight_duration_sec"),
+            "day_period_seconds": prediction.get("day_period_sec"),
+        },
+        "model_confidence": public_conf,
+        "observation_need": observation_need,
+        "warnings": warnings,
+    }
+    return response
+
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request) -> HTMLResponse:
     health = await api_request("GET", "/health")
@@ -274,7 +651,7 @@ async def systems(
         "has_observations": query_flag(has_observations),
         "confidence": (confidence or "").strip().lower(),
     }
-    if filters["confidence"] not in {"", "all", "high", "low"}:
+    if filters["confidence"] not in {"", "all", "high", "medium", "low"}:
         filters["confidence"] = ""
     params = {"q": q, "limit": 100, **filters}
     data = await api_request("GET", "/api/systems/search", params=params)

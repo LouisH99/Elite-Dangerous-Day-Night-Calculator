@@ -71,7 +71,7 @@ ALLOWED_QUALITY = {"high", "medium", "low"}
 
 app = FastAPI(
     title="Elite Dangerous Day/Night Calculator API",
-    version="0.208.1",
+    version="0.209.1",
     description="Local-first API for systems, bodies, observations, fitting and prediction.",
 )
 
@@ -1223,7 +1223,7 @@ def start_provisional_fit_worker() -> None:
 def root() -> Dict[str, Any]:
     return {
         "name": "Elite Dangerous Day/Night Calculator API",
-        "version": "0.208.1",
+        "version": "0.209.1",
         "db_path": DB_PATH,
         "docs": "/docs",
     }
@@ -1291,6 +1291,125 @@ def summary() -> Dict[str, Any]:
     return {"counts": counts, "observed_body_count": observed_count, "tracked_body_count": tracked_count, "tracked_bodies": [row_to_dict(r) for r in rows], "bodies_with_observations": [row_to_dict(r) for r in rows if int(r["observations"] or 0) > 0]}
 
 
+def enrich_system_search_model_health(con: sqlite3.Connection, system_rows: List[Dict[str, Any]]) -> None:
+    """Update /systems health counters from the real confidence implementation.
+
+    The SQL-only overview can see RMS/counts, but it cannot evaluate dynamic
+    freshness, time-coverage notes, or legacy geometry exactly like a prediction.
+    This helper keeps the overview and body page in sync by loading each active
+    reviewed fit and calling model_confidence_dict for the current UTC time.
+    """
+    if not system_rows:
+        return
+    system_ids = [int(r["id"]) for r in system_rows if r.get("id") is not None]
+    if not system_ids:
+        return
+    placeholders = ",".join("?" for _ in system_ids)
+    body_rows = con.execute(
+        f"""
+        WITH obs AS (
+            SELECT body_id, COUNT(*) AS observations
+              FROM observations
+             WHERE target_type = 'sun'
+             GROUP BY body_id
+        ), active_approved AS (
+            SELECT body_id, id AS approved_fit_id
+              FROM fits
+             WHERE is_active = 1 AND fit_mode = 'approved' AND fit_status = 'ok'
+        ), active_provisional AS (
+            SELECT body_id, id AS provisional_fit_id
+              FROM fits
+             WHERE is_active = 1 AND fit_mode = 'provisional' AND fit_status = 'ok'
+        ), poi AS (
+            SELECT body_id,
+                   COUNT(*) AS poi_count,
+                   SUM(CASE WHEN source = 'razz_racing_api'
+                              OR lower(COALESCE(source_label, '')) LIKE '%razz racing%'
+                              OR lower(COALESCE(source, '')) LIKE '%racing%'
+                            THEN 1 ELSE 0 END) AS racing_poi_count
+              FROM body_pois
+             GROUP BY body_id
+        )
+        SELECT b.system_id, b.id AS body_id, b.tracked_for_prediction,
+               COALESCE(obs.observations, 0) AS observations,
+               active_approved.approved_fit_id,
+               active_provisional.provisional_fit_id,
+               COALESCE(poi.poi_count, 0) AS poi_count,
+               COALESCE(poi.racing_poi_count, 0) AS racing_poi_count
+          FROM bodies b
+          LEFT JOIN obs ON obs.body_id = b.id
+          LEFT JOIN active_approved ON active_approved.body_id = b.id
+          LEFT JOIN active_provisional ON active_provisional.body_id = b.id
+          LEFT JOIN poi ON poi.body_id = b.id
+         WHERE b.system_id IN ({placeholders})
+        """,
+        system_ids,
+    ).fetchall()
+
+    by_system: Dict[int, List[sqlite3.Row]] = {}
+    for row in body_rows:
+        by_system.setdefault(int(row["system_id"]), []).append(row)
+
+    target_time = model.parse_utc(dbmod.utc_now())
+    for system_row in system_rows:
+        sid = int(system_row.get("id"))
+        high = medium = low = needs = 0
+        for b in by_system.get(sid, []):
+            observations = int(b["observations"] or 0)
+            poi_count = int(b["poi_count"] or 0)
+            racing_poi_count = int(b["racing_poi_count"] or 0)
+            approved_fit_id = b["approved_fit_id"]
+            provisional_fit_id = b["provisional_fit_id"]
+            is_tracked = bool(
+                int(b["tracked_for_prediction"] or 0)
+                or observations > 0
+                or approved_fit_id is not None
+                or provisional_fit_id is not None
+                or poi_count > 0
+            )
+            is_racing_only = bool(
+                poi_count > 0
+                and racing_poi_count == poi_count
+                and observations == 0
+                and approved_fit_id is None
+                and provisional_fit_id is None
+            )
+            if not is_tracked or is_racing_only:
+                continue
+            if approved_fit_id is None:
+                needs += 1
+                low += 1
+                continue
+            try:
+                _system, fitted, fit_id = dbmod.model_from_active_fit(con, int(b["body_id"]), fit_mode="approved")
+                review_meta = fit_review_metadata(con, int(fit_id))
+                conf = model.model_confidence_dict(
+                    fitted,
+                    target_time=target_time,
+                    model_mode="approved",
+                    includes_unreviewed=bool(review_meta.get("fit_uses_unverified_data")),
+                )
+                score = float(conf.get("score") or 0.0)
+                level = str(conf.get("level") or "").strip().lower()
+                note = str(conf.get("note") or "").strip()
+            except Exception:
+                score = 0.0
+                level = "low"
+                note = "Model confidence could not be calculated."
+            if note or score < 65.0:
+                needs += 1
+            if level == "high" and not note:
+                high += 1
+            elif level == "medium":
+                medium += 1
+            else:
+                low += 1
+        system_row["high_confidence_body_count"] = high
+        system_row["medium_confidence_body_count"] = medium
+        system_row["low_confidence_body_count"] = low
+        system_row["needs_observations_body_count"] = needs
+
+
 @app.get("/api/systems/search")
 def search_systems(
     q: str = Query("", description="Local database search"),
@@ -1300,17 +1419,18 @@ def search_systems(
     needs_observations: bool = False,
     has_provisional_model: bool = False,
     has_observations: bool = False,
-    confidence: str = Query("", description="Filter by confidence: high or low"),
+    confidence: str = Query("", description="Filter by confidence: high, medium, or low"),
 ) -> Dict[str, Any]:
     """Search local systems with lightweight model-health/filter counters.
 
-    The public website uses this for the /systems overview.  The confidence and
-    observation-need flags are intentionally cheap SQL heuristics for filtering;
-    detailed per-prediction confidence still comes from model_confidence_dict.
+    The public website uses this for the /systems overview.  Basic model/POI
+    counters are aggregated in SQL, then active reviewed models are rechecked
+    with the same confidence/observation-need logic used by predictions so the
+    overview does not show a stale/short-coverage model as healthy.
     """
     confidence_filter = (confidence or "").strip().lower()
-    if confidence_filter not in {"", "all", "high", "low"}:
-        raise HTTPException(status_code=400, detail="confidence must be high, low, all, or empty")
+    if confidence_filter not in {"", "all", "high", "medium", "low"}:
+        raise HTTPException(status_code=400, detail="confidence must be high, medium, low, all, or empty")
 
     con = connect()
     try:
@@ -1424,6 +1544,7 @@ def search_systems(
                        COALESCE(SUM(body_flags.needs_observations), 0) AS needs_observations_body_count,
                        COALESCE(SUM(body_flags.high_confidence), 0) AS high_confidence_body_count,
                        COALESCE(SUM(body_flags.low_confidence), 0) AS low_confidence_body_count,
+                       0 AS medium_confidence_body_count,
                        COALESCE(SUM(body_flags.poi_count), 0) AS poi_count,
                        COALESCE(SUM(body_flags.racing_poi_count), 0) AS racing_poi_count,
                        COALESCE(SUM(body_flags.is_racing_only), 0) AS racing_only_body_count,
@@ -1448,22 +1569,31 @@ def search_systems(
             sql += " AND system_is_racing_only = 0"
         if has_reviewed_model:
             sql += " AND approved_model_count > 0"
-        if needs_observations:
-            sql += " AND needs_observations_body_count > 0"
         if has_provisional_model:
             sql += " AND provisional_model_count > 0"
         if has_observations:
             sql += " AND observed_body_count > 0"
-        if confidence_filter == "high":
-            sql += " AND high_confidence_body_count > 0"
-        elif confidence_filter == "low":
-            sql += " AND low_confidence_body_count > 0"
+        # needs_observations and confidence are applied after the rows are
+        # enriched with the current model_confidence_dict output.  This keeps the
+        # systems page consistent with body/prediction pages, especially for
+        # dynamic freshness and short observation-coverage notes.
+        post_filtering = bool(needs_observations or confidence_filter in {"high", "medium", "low"})
         sql += " ORDER BY name LIMIT ?"
-        params.append(limit)
-        rows = con.execute(sql, params).fetchall()
+        params.append(1000 if post_filtering else limit)
+        rows = [row_to_dict(r) for r in con.execute(sql, params).fetchall()]
+        enrich_system_search_model_health(con, rows)
+        if needs_observations:
+            rows = [r for r in rows if int(r.get("needs_observations_body_count") or 0) > 0]
+        if confidence_filter == "high":
+            rows = [r for r in rows if int(r.get("high_confidence_body_count") or 0) > 0]
+        elif confidence_filter == "medium":
+            rows = [r for r in rows if int(r.get("medium_confidence_body_count") or 0) > 0]
+        elif confidence_filter == "low":
+            rows = [r for r in rows if int(r.get("low_confidence_body_count") or 0) > 0]
+        rows = rows[:limit]
     finally:
         con.close()
-    return {"results": [row_to_dict(r) for r in rows]}
+    return {"results": rows}
 
 
 @app.get("/api/spansh/search")
@@ -1705,6 +1835,7 @@ def get_fit(body_id: int, include_residuals: bool = True, model_mode: str = "app
             data["params"] = model.model_summary_dict(_fitted)
             data["model_confidence"] = model.model_confidence_dict(
                 _fitted,
+                target_time=model.parse_utc(dbmod.utc_now()),
                 model_mode=mode,
                 includes_unreviewed=bool(review_meta.get("fit_uses_unverified_data")),
             )
