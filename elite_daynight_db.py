@@ -9,7 +9,7 @@ It intentionally stores only the fields needed for:
   * observation review and residual auditing
   * later parent/neighbor modelling
 
-It does NOT store full current-system/Spansh JSON, journal events, factions,
+It does NOT store full source/Spansh JSON, journal events, factions,
 materials, station data, raw Status.json snapshots, or full raw body blobs.
 
 Keep this file in the same folder as elite_daynight_model_v16.py.
@@ -20,6 +20,7 @@ import argparse
 import csv
 import hashlib
 import json
+import math
 import os
 import sqlite3
 import tempfile
@@ -381,6 +382,38 @@ def _float_or_none(value: Any) -> Optional[float]:
     return parse_optional_float(value)
 
 
+def _axis_tilt_radians_to_degrees(value: Any) -> Optional[float]:
+    """Convert Spansh axis_tilt values to degrees.
+
+    Spansh body detail uses radians for ``axis_tilt`` while Journal/ED UI
+    values are shown in degrees. Older imports accidentally stored the Spansh
+    value directly in the ``axial_tilt_deg`` database column. Keep Journal-style
+    ``AxialTilt`` values as degrees, but convert the Spansh key explicitly.
+    """
+    v = parse_optional_float(value)
+    if v is None:
+        return None
+    # Be defensive for hand-made/test data: a value outside the valid radian
+    # range but inside a plausible degree range is already degrees. Real Spansh
+    # values should be radians here.
+    if abs(v) > (2.0 * math.pi) and abs(v) <= 360.0:
+        return v
+    return math.degrees(v)
+
+
+def _body_axial_tilt_degrees(body: Dict[str, Any]) -> Optional[float]:
+    """Return axial tilt in degrees from Journal-like or Spansh-like body data."""
+    direct = get_any(body, "AxialTilt", "axial_tilt_deg", default=None)
+    if direct not in (None, ""):
+        return parse_optional_float(direct)
+    raw = body.get("rawSpanshBody") or {}
+    if isinstance(raw, dict) and raw.get("axis_tilt") not in (None, ""):
+        return _axis_tilt_radians_to_degrees(raw.get("axis_tilt"))
+    if body.get("axis_tilt") not in (None, ""):
+        return _axis_tilt_radians_to_degrees(body.get("axis_tilt"))
+    return None
+
+
 def _set_if_value(d: Dict[str, Any], key: str, value: Any) -> None:
     if value not in (None, ""):
         d[key] = value
@@ -481,7 +514,6 @@ def convert_spansh_body_to_journal(raw: Dict[str, Any], system_address: Optional
         "Periapsis": "arg_of_periapsis",
         "MeanAnomaly": "mean_anomaly",
         "AscendingNode": "ascending_node",
-        "AxialTilt": "axis_tilt",
         "MassEM": "earth_masses",
         "SurfaceTemperature": "surface_temperature",
         "SurfacePressure": "surface_pressure",
@@ -491,6 +523,11 @@ def convert_spansh_body_to_journal(raw: Dict[str, Any], system_address: Optional
     }
     for journal_key, spansh_key in field_map.items():
         _set_if_value(d, journal_key, _float_or_none(raw.get(spansh_key) if spansh_key in raw else raw.get(journal_key)))
+    # Spansh axis_tilt is radians; Journal/ED UI AxialTilt is degrees.
+    if raw.get("axis_tilt") not in (None, ""):
+        _set_if_value(d, "AxialTilt", _axis_tilt_radians_to_degrees(raw.get("axis_tilt")))
+    else:
+        _set_if_value(d, "AxialTilt", _float_or_none(raw.get("AxialTilt")))
     _set_if_value(d, "Atmosphere", raw.get("atmosphere") or raw.get("Atmosphere") or "")
     _set_if_value(d, "Luminosity", raw.get("luminosity_class") or raw.get("Luminosity") or "")
     landable = raw.get("is_landable") if "is_landable" in raw else raw.get("Landable")
@@ -890,7 +927,7 @@ def import_system_json(db_path: str, json_path: str) -> int:
             parse_optional_float(coords.get("x")),
             parse_optional_float(coords.get("y")),
             parse_optional_float(coords.get("z")),
-            str(source.get("dataSource") or source.get("createdBy") or "current-system JSON"),
+            str(source.get("dataSource") or source.get("createdBy") or "compact system JSON"),
             os.path.basename(json_path),
             str(source.get("createdAtUtc") or source.get("created_at") or ""),
             now,
@@ -963,7 +1000,7 @@ def import_system_json(db_path: str, json_path: str) -> int:
                 parse_optional_float(get_any(b, "Periapsis", default=raw.get("arg_of_periapsis"))),
                 parse_optional_float(get_any(b, "MeanAnomaly", default=None)),
                 parse_optional_float(get_any(b, "AscendingNode", default=None)),
-                parse_optional_float(get_any(b, "AxialTilt", default=raw.get("axis_tilt"))),
+                _body_axial_tilt_degrees(b),
                 str(get_any(b, "timestamp", "Timestamp", default="") or ""),
                 now,
                 bpk,
@@ -1529,8 +1566,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--db", default="elite_daynight.db", help="SQLite database path")
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("init", help="Create/update the compact database schema")
-    ps = sub.add_parser("import-system-json", help="Import only relevant system/body fields from JSON")
-    ps.add_argument("--json", required=True)
     po = sub.add_parser("import-observations", help="Import observation CSV rows for a selected body")
     po.add_argument("--csv", required=True); po.add_argument("--system-name", required=True); po.add_argument("--body-name", required=True)
     po.add_argument("--system-address", type=int); po.add_argument("--review-status", default="new", choices=["new", "approved", "rejected", "needs_check", "corrected"])
@@ -1558,8 +1593,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = p.parse_args(argv)
     if args.cmd == "init":
         init_db(args.db); print(f"Initialised {args.db}")
-    elif args.cmd == "import-system-json":
-        sid = import_system_json(args.db, args.json); print(f"Imported compact system id {sid}: {args.json}")
     elif args.cmd == "import-observations":
         n = import_observations_csv(args.db, args.csv, args.system_name, args.body_name, args.system_address, args.review_status, args.observer_name, args.source)
         print(f"Imported/updated {n} observation rows from {args.csv}")
