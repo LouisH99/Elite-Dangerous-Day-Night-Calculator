@@ -68,5 +68,22 @@
     <input type="hidden" name="review_status" value="rejected"><input type="hidden" name="next_url" value="/control/observations/{{ obs.id }}/edit">
   </form>
   {% if is_super_admin %}<form id="delete-form" method="post" action="/control/observations/{{ obs.id }}/delete"></form>{% endif %}
+
+</section>
+<section class="card">
+  <h2>Automation recommendation</h2>
+  {% if obs.auto_review_status %}
+    <p><span class="badge {{ obs.auto_review_status|auto_review_badge }}">{{ obs.auto_review_status }}</span>
+    {% if obs.auto_review_model_id %}<span class="muted">model #{{ obs.auto_review_model_id }}</span>{% endif %}</p>
+    <p>
+      {% if obs.auto_review_residual_altitude_deg is not none %}residual {{ obs.auto_review_residual_altitude_deg|num(3) }}°{% endif %}
+      {% if obs.auto_review_threshold_deg is not none %} / threshold {{ obs.auto_review_threshold_deg|num(2) }}°{% endif %}
+      {% if obs.auto_review_confidence_score is not none %} / confidence {{ obs.auto_review_confidence_score|num(0) }}%{% endif %}
+    </p>
+    <p class="muted">{{ obs.auto_review_reason|dash }}</p>
+    <p class="muted">Analysed {{ obs.auto_reviewed_at_utc|utc }}</p>
+  {% else %}
+    <p class="muted">This observation has not been analysed by automation yet.</p>
+  {% endif %}
 </section>
 {% endblock %}

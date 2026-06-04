@@ -1,3 +1,30 @@
+## V0.208.1
+
+- Added automation environment defaults to the private API run scripts.
+- `run_private_api.bat` and `run_private_api.sh` now set `ELITE_DAYNIGHT_AUTOMATION_MODE=shadow` and `ELITE_DAYNIGHT_AUTOMATION_BATCH_LIMIT=200` when those variables are not already defined.
+
+## V0.208
+
+- Added conservative observation-automation shadow mode.
+- New observations are analysed against the active reviewed model when available, but review status is not changed automatically.
+- Added automation metadata fields for observations: status, reason, reviewed model id, altitude residual, threshold, confidence score, and analysis timestamp.
+- Added future-facing fit metadata fields: `fit_origin` and `auto_fit_reason`.
+- Added reviewer-visible automation recommendations on the observation review list and edit page.
+- Added automation filters for unanalysed, would-auto-approve, auto-candidate, needs-check, duplicate/near-duplicate, blocked, and large-residual observations.
+- Added a reviewer/admin batch action to analyse matching observations in shadow mode.
+- Added audit-log entries for automation shadow decisions.
+- Added `ELITE_DAYNIGHT_AUTOMATION_MODE=off|shadow|candidate|active`; V0.208 implements shadow/candidate analysis only and does not auto-approve.
+
+## V0.207
+
+- Reviewers can now queue reviewed and provisional model refits from the hidden control area.
+- Super-admin-only restrictions remain for account management and destructive actions.
+- Removed the manual half-life field from the refit UI.
+- Replaced old time-weighting wording with optional recent-observation boosting.
+- Recent boosting keeps old observations at their normal quality weight and boosts newer observations up to 2x.
+- The recent-boost time scale is calculated automatically from the estimated day period, then orbital period, then rotation period, with a safe fallback.
+- Stored fit metadata now records the weighting mode and boost-scale details for audit/API use.
+
 ## V0.206.2
 
 - Fixed the V0.199+ fit regression for bodies whose parent chain contains a Null/barycentre before the illumination star.

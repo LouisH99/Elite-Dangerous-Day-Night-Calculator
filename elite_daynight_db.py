@@ -72,7 +72,7 @@ except Exception as exc:  # pragma: no cover
         f"Import error: {exc}"
     ) from exc
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 MODEL_VERSION = "v16"
 
 SPANSH_API_BASE = "https://www.spansh.co.uk/api"
@@ -821,6 +821,8 @@ def init_db(db_path: str) -> None:
     con.execute("CREATE INDEX IF NOT EXISTS idx_audit_log_actor ON audit_log(actor)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_audit_log_action ON audit_log(action)")
     ensure_illumination_columns(con)
+    ensure_fit_mode_columns(con)
+    ensure_automation_columns(con)
     con.execute("INSERT OR REPLACE INTO schema_meta(key, value) VALUES (?, ?)", ("schema_version", str(SCHEMA_VERSION)))
     con.execute("INSERT OR REPLACE INTO schema_meta(key, value) VALUES (?, ?)", ("model_version", MODEL_VERSION))
     con.commit()
@@ -1207,6 +1209,33 @@ def statuses_for_fit_mode(fit_mode: str) -> Tuple[str, ...]:
     return ("approved",)
 
 
+def ensure_automation_columns(con: sqlite3.Connection) -> None:
+    """Add V0.208 automation metadata columns to older databases."""
+    obs_cols = {r[1] for r in con.execute("PRAGMA table_info(observations)").fetchall()}
+    if "auto_review_status" not in obs_cols:
+        con.execute("ALTER TABLE observations ADD COLUMN auto_review_status TEXT")
+    if "auto_review_reason" not in obs_cols:
+        con.execute("ALTER TABLE observations ADD COLUMN auto_review_reason TEXT")
+    if "auto_review_model_id" not in obs_cols:
+        con.execute("ALTER TABLE observations ADD COLUMN auto_review_model_id INTEGER REFERENCES fits(id) ON DELETE SET NULL")
+    if "auto_review_residual_altitude_deg" not in obs_cols:
+        con.execute("ALTER TABLE observations ADD COLUMN auto_review_residual_altitude_deg REAL")
+    if "auto_review_threshold_deg" not in obs_cols:
+        con.execute("ALTER TABLE observations ADD COLUMN auto_review_threshold_deg REAL")
+    if "auto_review_confidence_score" not in obs_cols:
+        con.execute("ALTER TABLE observations ADD COLUMN auto_review_confidence_score REAL")
+    if "auto_reviewed_at_utc" not in obs_cols:
+        con.execute("ALTER TABLE observations ADD COLUMN auto_reviewed_at_utc TEXT")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_observations_auto_review ON observations(auto_review_status)")
+
+    fit_cols = {r[1] for r in con.execute("PRAGMA table_info(fits)").fetchall()}
+    if "fit_origin" not in fit_cols:
+        con.execute("ALTER TABLE fits ADD COLUMN fit_origin TEXT NOT NULL DEFAULT 'manual'")
+    if "auto_fit_reason" not in fit_cols:
+        con.execute("ALTER TABLE fits ADD COLUMN auto_fit_reason TEXT")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_fits_origin ON fits(fit_origin)")
+
+
 def observation_fingerprint_for_body(
     con: sqlite3.Connection,
     body_pk: int,
@@ -1232,7 +1261,8 @@ def observation_fingerprint_for_body(
         "statuses": list(statuses),
         "use_heading": bool(use_heading),
         "time_weighting": bool(time_weighting),
-        "time_half_life_hours": round(float(time_half_life_hours), 6),
+        "time_weighting_mode": "recent_boost" if time_weighting else "off",
+        "fit_weighting_version": 2,
         "observations": [
             {
                 "id": int(r["id"] if isinstance(r, sqlite3.Row) else r[0]),
@@ -1317,6 +1347,7 @@ def fit_body(
     con.execute("PRAGMA foreign_keys = ON")
     ensure_illumination_columns(con)
     ensure_fit_mode_columns(con)
+    ensure_automation_columns(con)
     # ensure_* migration helpers may run ALTER/UPDATE statements for older DBs.
     # Commit that migration work before the later explicit BEGIN IMMEDIATE,
     # otherwise SQLite can raise: "cannot start a transaction within a transaction".
@@ -1350,6 +1381,7 @@ def fit_body(
     fitted = model.fit_model(
         body, observations, use_heading=use_heading, time_weighting=time_weighting,
         time_half_life_hours=time_half_life_hours, system=system,
+        time_weighting_mode="recent_boost", recent_boost_max=2.0,
         sun_geometry_mode="auto",
     )
     summary = model.model_summary_dict(fitted)
@@ -1429,13 +1461,23 @@ def model_from_active_fit(con: sqlite3.Connection, body_pk: int, fit_mode: str =
     sun_geometry_mode = model.normalize_sun_geometry_mode(params.get("sun_geometry_mode") or params.get("illumination_geometry_mode") or "legacy_distant")
     if sun_geometry_mode == "auto":
         sun_geometry_mode = "legacy_distant"
+    stored_time_weighting = bool(frow["time_weighting"])
+    stored_weighting_mode = str(params.get("time_weighting_mode") or ("decay" if stored_time_weighting else "off"))
+    recent_boost_scale = params.get("recent_boost_scale_hours")
+    if recent_boost_scale is None and isinstance(params.get("recent_boost_scale"), dict):
+        recent_boost_scale = params.get("recent_boost_scale", {}).get("boost_scale_hours")
+    fit_observations = [o for _, o in observations_for_fit(con, fit_id)]
     fitted = model.make_model(
         body,
         (float(p["alpha_rad"]), float(p["beta_rad"]), float(p["gamma_rad"]), float(p["phase_rad"])),
         spin_sign=int(params["spin_sign"]), lon_sign=int(params["lon_sign"]), orbit_flip=int(params["orbit_flip"]),
-        observations=[o for _, o in observations_for_fit(con, fit_id)],
-        score=float(frow["fit_score"] or 0.0), time_weighting=bool(frow["time_weighting"]),
+        observations=fit_observations,
+        score=float(frow["fit_score"] or 0.0), time_weighting=stored_time_weighting,
+        time_ref=model.observation_time_reference(fit_observations) if stored_time_weighting else None,
         system=system,
+        time_weighting_mode=stored_weighting_mode,
+        recent_boost_max=float(params.get("recent_boost_max") or 2.0),
+        recent_boost_scale_hours=None if recent_boost_scale in (None, "") else float(recent_boost_scale),
         sun_geometry_mode=sun_geometry_mode,
     )
     fitted.rms_altitude = float(frow["rms_altitude_deg"] or 0.0)

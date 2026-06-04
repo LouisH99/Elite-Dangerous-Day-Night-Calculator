@@ -185,16 +185,105 @@ def recency_time_weight(
     return max(float(minimum), float(w))
 
 
+def fit_recent_boost_scale_details(body: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Return the automatic time scale used for recent-observation boosting.
+
+    V0.207 removes manual half-life tuning from the reviewer UI.  When a
+    reviewer enables recent boosting, old observations keep their normal quality
+    weight and newer observations receive a bonus.  The boost fades over a
+    period derived from the body's estimated local day cycle, falling back to
+    orbital period, rotation period, then 24 h when metadata is incomplete.
+    """
+    period_hours = 24.0
+    basis = "fallback_24h"
+
+    if body is not None:
+        try:
+            diff_p, sum_p = apparent_mean_periods(body)
+            day_candidates = []
+            for value in (diff_p, sum_p):
+                v = float(value)
+                if math.isfinite(v) and v > 0:
+                    day_candidates.append(v / 3600.0)
+            if day_candidates:
+                period_hours = max(1.0 / 60.0, min(day_candidates))
+                basis = "estimated_day_period"
+            else:
+                orbital = abs(float(body.get("OrbitalPeriod", 0.0) or 0.0)) / 3600.0
+                rotation = abs(float(body.get("RotationPeriod", 0.0) or 0.0)) / 3600.0
+                if orbital > 0 and math.isfinite(orbital):
+                    period_hours = orbital
+                    basis = "orbital_period"
+                elif rotation > 0 and math.isfinite(rotation):
+                    period_hours = rotation
+                    basis = "rotation_period"
+        except Exception:
+            pass
+
+    scale_hours = clamp_value(2.0 * float(period_hours), 12.0, 24.0 * 30.0)
+    return {
+        "characteristic_period_hours": float(period_hours),
+        "boost_scale_hours": float(scale_hours),
+        "basis": basis,
+        "minimum_scale_hours": 12.0,
+        "maximum_scale_hours": 24.0 * 30.0,
+    }
+
+
+def recent_observation_boost(
+    obs_time: datetime,
+    ref_time: Optional[datetime],
+    body: Optional[Dict[str, Any]] = None,
+    max_boost: float = 2.0,
+    boost_scale_hours: Optional[float] = None,
+) -> float:
+    """Return a multiplicative boost for newer observations.
+
+    The newest observation receives up to ``max_boost``.  Older observations
+    smoothly return to 1.0x, so good old observations are never discarded.
+    """
+    if ref_time is None:
+        return 1.0
+    try:
+        max_boost = max(1.0, float(max_boost))
+    except Exception:
+        max_boost = 2.0
+    if max_boost <= 1.0:
+        return 1.0
+    if boost_scale_hours is None or boost_scale_hours <= 0:
+        boost_scale_hours = float(fit_recent_boost_scale_details(body)["boost_scale_hours"])
+    age_hours = max(0.0, (ref_time - obs_time).total_seconds() / 3600.0)
+    boost = 1.0 + (max_boost - 1.0) * math.exp(-age_hours / max(float(boost_scale_hours), 1e-9))
+    return max(1.0, min(max_boost, float(boost)))
+
+
 def combined_observation_weight(
     obs: "Observation",
     time_weighting: bool = False,
     time_ref: Optional[datetime] = None,
     time_half_life_hours: float = 24.0,
     time_min_weight: float = 0.05,
+    body: Optional[Dict[str, Any]] = None,
+    time_weighting_mode: str = "recent_boost",
+    recent_boost_max: float = 2.0,
+    recent_boost_scale_hours: Optional[float] = None,
 ) -> float:
     w = quality_weight(obs.quality)
     if time_weighting:
-        w *= recency_time_weight(obs.timestamp_utc, time_ref, time_half_life_hours, time_min_weight)
+        mode = (time_weighting_mode or "recent_boost").strip().lower()
+        if mode in {"decay", "legacy_decay", "half_life"}:
+            # Backwards-compatible support for old stored fits that were created
+            # with the former half-life decay weighting.  New V0.207 fits use
+            # recent_boost instead.
+            w *= recency_time_weight(obs.timestamp_utc, time_ref, time_half_life_hours, time_min_weight)
+        else:
+            w *= recent_observation_boost(
+                obs.timestamp_utc,
+                time_ref,
+                body=body,
+                max_boost=recent_boost_max,
+                boost_scale_hours=recent_boost_scale_hours,
+            )
     return w
 
 
@@ -831,6 +920,9 @@ class FittedModel:
     time_half_life_hours: float = 24.0
     time_min_weight: float = 0.05
     system: Optional[Dict[str, Any]] = None
+    time_weighting_mode: str = "recent_boost"
+    recent_boost_max: float = 2.0
+    recent_boost_scale_hours: Optional[float] = None
     # "recursive_source" uses the V0.199+ physical/recursive star-vector path.
     # "legacy_distant" keeps the pre-V0.199 empirical fitted distant-star vector.
     sun_geometry_mode: str = "recursive_source"
@@ -899,15 +991,33 @@ def make_model(
     time_half_life_hours: float = 24.0,
     time_min_weight: float = 0.05,
     system: Optional[Dict[str, Any]] = None,
+    time_weighting_mode: str = "recent_boost",
+    recent_boost_max: float = 2.0,
+    recent_boost_scale_hours: Optional[float] = None,
     sun_geometry_mode: Optional[str] = None,
 ) -> FittedModel:
     effective_geometry_mode = normalize_sun_geometry_mode(sun_geometry_mode)
     if effective_geometry_mode == "auto":
         effective_geometry_mode, _geometry_reason = recommended_sun_geometry_mode(system, body)
     return FittedModel(
-        body, params, spin_sign, lon_sign, orbit_flip, score, 0.0, None, observations,
-        time_weighting, time_ref, time_half_life_hours, time_min_weight, system,
-        effective_geometry_mode,
+        body=body,
+        params=params,
+        spin_sign=spin_sign,
+        lon_sign=lon_sign,
+        orbit_flip=orbit_flip,
+        score=score,
+        rms_altitude=0.0,
+        rms_heading=None,
+        observations=observations,
+        time_weighting=time_weighting,
+        time_ref=time_ref,
+        time_half_life_hours=time_half_life_hours,
+        time_min_weight=time_min_weight,
+        system=system,
+        time_weighting_mode=time_weighting_mode,
+        recent_boost_max=recent_boost_max,
+        recent_boost_scale_hours=recent_boost_scale_hours,
+        sun_geometry_mode=effective_geometry_mode,
     )
 
 
@@ -925,6 +1035,10 @@ def model_loss(model: FittedModel, use_heading: bool = True, horizon_for_night_d
             time_ref=model.time_ref,
             time_half_life_hours=model.time_half_life_hours,
             time_min_weight=model.time_min_weight,
+            body=model.body,
+            time_weighting_mode=getattr(model, "time_weighting_mode", "recent_boost"),
+            recent_boost_max=getattr(model, "recent_boost_max", 2.0),
+            recent_boost_scale_hours=getattr(model, "recent_boost_scale_hours", None),
         )
         alt, az = model.predict(obs.timestamp_utc, obs.lat, obs.lon)
         target = obs.target_altitude
@@ -973,6 +1087,8 @@ def fit_model(
     time_ref: Optional[datetime] = None,
     time_min_weight: float = 0.05,
     system: Optional[Dict[str, Any]] = None,
+    time_weighting_mode: str = "recent_boost",
+    recent_boost_max: float = 2.0,
     sun_geometry_mode: str = "recursive_source",
 ) -> FittedModel:
     sun_geometry_mode = normalize_sun_geometry_mode(sun_geometry_mode)
@@ -982,6 +1098,7 @@ def fit_model(
             body, observations, use_heading=use_heading, seed=seed,
             time_weighting=time_weighting, time_half_life_hours=time_half_life_hours,
             time_ref=time_ref, time_min_weight=time_min_weight, system=system,
+            time_weighting_mode=time_weighting_mode, recent_boost_max=recent_boost_max,
             sun_geometry_mode=selected_mode,
         )
         # Safety valve: if the selected mode is very poor, try the alternative
@@ -995,6 +1112,7 @@ def fit_model(
                     body, observations, use_heading=use_heading, seed=seed,
                     time_weighting=time_weighting, time_half_life_hours=time_half_life_hours,
                     time_ref=time_ref, time_min_weight=time_min_weight, system=system,
+                    time_weighting_mode=time_weighting_mode, recent_boost_max=recent_boost_max,
                     sun_geometry_mode=alternative_mode,
                 )
                 if alternative.score + 0.5 < selected.score:
@@ -1012,6 +1130,9 @@ def fit_model(
     best_model: Optional[FittedModel] = None
     rng = random.Random(seed)
     effective_time_ref = observation_time_reference(observations, time_ref) if time_weighting else None
+    recent_boost_scale_hours: Optional[float] = None
+    if time_weighting and (time_weighting_mode or "recent_boost").strip().lower() not in {"decay", "legacy_decay", "half_life"}:
+        recent_boost_scale_hours = float(fit_recent_boost_scale_details(body)["boost_scale_hours"])
 
     def split_candidate(x: Iterable[float]) -> Tuple[float, float, float, float]:
         vals = [float(v) for v in x]
@@ -1026,6 +1147,9 @@ def fit_model(
             time_half_life_hours=time_half_life_hours,
             time_min_weight=time_min_weight,
             system=system,
+            time_weighting_mode=time_weighting_mode,
+            recent_boost_max=recent_boost_max,
+            recent_boost_scale_hours=recent_boost_scale_hours,
             sun_geometry_mode=sun_geometry_mode,
         )
         return model_loss(m, use_heading=use_heading)[0]
@@ -1053,6 +1177,9 @@ def fit_model(
                 time_half_life_hours=time_half_life_hours,
                 time_min_weight=time_min_weight,
                 system=system,
+                time_weighting_mode=time_weighting_mode,
+                recent_boost_max=recent_boost_max,
+                recent_boost_scale_hours=recent_boost_scale_hours,
                 sun_geometry_mode=sun_geometry_mode,
             )
             score, rms_alt, rms_head = model_loss(model, use_heading=use_heading)
@@ -1097,6 +1224,9 @@ def fit_model(
                     time_half_life_hours=time_half_life_hours,
                     time_min_weight=time_min_weight,
                     system=system,
+                    time_weighting_mode=time_weighting_mode,
+                    recent_boost_max=recent_boost_max,
+                    recent_boost_scale_hours=recent_boost_scale_hours,
                     sun_geometry_mode=sun_geometry_mode,
                 )
                 score, rms_alt, rms_head = model_loss(model, use_heading=use_heading)
@@ -1132,7 +1262,15 @@ def residual_rows(model: FittedModel) -> List[Tuple[Observation, float, float, O
         # Only show heading residuals when headings were actually used in the fit.
         head_err = wrap180(az - obs.heading) if (obs.heading is not None and model.rms_heading is not None) else None
         eff_w = combined_observation_weight(
-            obs, model.time_weighting, model.time_ref, model.time_half_life_hours, model.time_min_weight
+            obs,
+            model.time_weighting,
+            model.time_ref,
+            model.time_half_life_hours,
+            model.time_min_weight,
+            body=model.body,
+            time_weighting_mode=getattr(model, "time_weighting_mode", "recent_boost"),
+            recent_boost_max=getattr(model, "recent_boost_max", 2.0),
+            recent_boost_scale_hours=getattr(model, "recent_boost_scale_hours", None),
         )
         rows.append((obs, alt, az, alt_err, head_err, eff_w))
     return rows
@@ -1463,9 +1601,15 @@ def make_report(
     lines.append(f"RMS altitude residual: {model.rms_altitude:.3f}°")
     if model.time_weighting:
         ref_s = format_utc(model.time_ref) if model.time_ref else "latest observation"
-        lines.append(f"Time weighting: ON, reference {ref_s}, half-life {model.time_half_life_hours:.2f} h, minimum multiplier {model.time_min_weight:.2f}")
+        mode = getattr(model, "time_weighting_mode", "recent_boost")
+        if str(mode).lower() in {"decay", "legacy_decay", "half_life"}:
+            lines.append(f"Legacy time weighting: ON, reference {ref_s}, half-life {model.time_half_life_hours:.2f} h, minimum multiplier {model.time_min_weight:.2f}")
+        else:
+            details = fit_recent_boost_scale_details(model.body)
+            scale_h = getattr(model, "recent_boost_scale_hours", None) or details["boost_scale_hours"]
+            lines.append(f"Recent-observation boost: ON, reference {ref_s}, newest observations up to {getattr(model, 'recent_boost_max', 2.0):.2f}x, scale {scale_h:.2f} h ({details['basis']})")
     else:
-        lines.append("Time weighting: OFF; all observation ages use only quality weights.")
+        lines.append("Recent-observation boost: OFF; all observation ages use only quality weights.")
     if model.rms_heading is not None:
         lines.append(f"RMS heading residual:  {model.rms_heading:.3f}°")
     lines.append(f"Fit score: {model.score:.3f}")
@@ -1567,9 +1711,14 @@ def model_summary_dict(model: FittedModel) -> Dict[str, Any]:
             "phase_deg": float(deg(p)),
         },
         "time_weighting": bool(model.time_weighting),
+        "time_weighting_mode": getattr(model, "time_weighting_mode", "recent_boost"),
+        "recent_observation_boost": bool(model.time_weighting and str(getattr(model, "time_weighting_mode", "recent_boost")).lower() not in {"decay", "legacy_decay", "half_life"}),
         "time_ref_utc": None if model.time_ref is None else format_utc(model.time_ref),
-        "time_half_life_hours": float(model.time_half_life_hours),
+        "time_half_life_hours": None if str(getattr(model, "time_weighting_mode", "recent_boost")).lower() not in {"decay", "legacy_decay", "half_life"} else float(model.time_half_life_hours),
         "time_min_weight": float(model.time_min_weight),
+        "recent_boost_max": float(getattr(model, "recent_boost_max", 2.0)),
+        "recent_boost_scale_hours": None if getattr(model, "recent_boost_scale_hours", None) is None else float(getattr(model, "recent_boost_scale_hours")),
+        "recent_boost_scale": fit_recent_boost_scale_details(model.body),
         "sun_geometry_mode": getattr(model, "sun_geometry_mode", "recursive_source"),
         "sun_geometry_reason": recommended_sun_geometry_mode(model.system, model.body)[1],
         "illumination_source": model_illumination_source_name(model),

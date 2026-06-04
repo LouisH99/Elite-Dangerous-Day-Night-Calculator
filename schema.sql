@@ -111,7 +111,7 @@ CREATE TABLE fits (
             includes_unreviewed INTEGER NOT NULL DEFAULT 0,
             used_statuses_json TEXT,
             created_at_utc TEXT NOT NULL
-        );;
+        , fit_origin TEXT NOT NULL DEFAULT 'manual', auto_fit_reason TEXT);;
 CREATE TABLE observations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             obs_hash TEXT NOT NULL UNIQUE,
@@ -133,7 +133,7 @@ CREATE TABLE observations (
             review_status TEXT NOT NULL DEFAULT 'new',
             created_at_utc TEXT NOT NULL,
             updated_at_utc TEXT NOT NULL
-        );;
+        , auto_review_status TEXT, auto_review_reason TEXT, auto_review_model_id INTEGER REFERENCES fits(id) ON DELETE SET NULL, auto_review_residual_altitude_deg REAL, auto_review_threshold_deg REAL, auto_review_confidence_score REAL, auto_reviewed_at_utc TEXT);;
 CREATE TABLE prediction_cache (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             body_id INTEGER NOT NULL REFERENCES bodies(id) ON DELETE CASCADE,
@@ -181,5 +181,6 @@ CREATE INDEX idx_body_pois_review ON body_pois(review_status);;
 CREATE INDEX idx_background_fit_jobs_body_created ON background_fit_jobs(body_id, requested_at_utc DESC);;
 CREATE INDEX idx_background_fit_jobs_status ON background_fit_jobs(status);;
 CREATE INDEX idx_background_fit_jobs_body_mode_status ON background_fit_jobs(body_id, fit_mode, status);;
-DELETE FROM "sqlite_sequence";;
+CREATE INDEX idx_observations_auto_review ON observations(auto_review_status);;
+CREATE INDEX idx_fits_origin ON fits(fit_origin);;
 COMMIT;;

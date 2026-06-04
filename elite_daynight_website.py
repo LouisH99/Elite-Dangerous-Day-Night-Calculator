@@ -61,7 +61,7 @@ PUBLIC_POI_SUBMISSIONS_ENABLED = env_bool("ELITE_DAYNIGHT_PUBLIC_POI_SUBMISSIONS
 
 app = FastAPI(
     title="Elite Dangerous Day/Night Calculator Website",
-    version="0.206.2",
+    version="0.208.1",
     docs_url=None,
     redoc_url=None,
     openapi_url=None,
@@ -878,6 +878,19 @@ def review_badge_class(status: str) -> str:
 templates.env.filters["review_badge"] = review_badge_class
 
 
+def auto_review_badge_class(status: str) -> str:
+    return {
+        "shadow_auto_approve": "badge-ok",
+        "auto_candidate": "badge-warn",
+        "needs_check": "badge-danger",
+        "duplicate_or_near_duplicate": "badge-warn",
+        "blocked": "badge-muted",
+    }.get((status or "").lower(), "badge-muted")
+
+
+templates.env.filters["auto_review_badge"] = auto_review_badge_class
+
+
 def validate_new_password(password: str, confirm: str) -> Optional[str]:
     if password != confirm:
         return "Passwords do not match."
@@ -1184,6 +1197,7 @@ async def admin_observations(
     system_name: str = Query(""),
     body_name: str = Query(""),
     observer_name: str = Query(""),
+    automation: str = Query("all"),
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
 ):
@@ -1198,6 +1212,8 @@ async def admin_observations(
         params["body_name"] = body_name.strip()
     if observer_name.strip():
         params["observer_name"] = observer_name.strip()
+    if automation and automation != "all":
+        params["automation"] = automation.strip().lower()
     data = await api_request("GET", "/api/admin/observations", params=params)
     summary = await api_request("GET", "/api/summary")
     filter_qs = urlencode({
@@ -1205,6 +1221,7 @@ async def admin_observations(
         "system_name": system_name,
         "body_name": body_name,
         "observer_name": observer_name,
+        "automation": automation,
         "limit": limit,
         "offset": offset,
     })
@@ -1213,6 +1230,7 @@ async def admin_observations(
         "system_name": system_name,
         "body_name": body_name,
         "observer_name": observer_name,
+        "automation": automation,
         "limit": limit,
     })
     return render(
@@ -1224,6 +1242,7 @@ async def admin_observations(
             "system_name": system_name,
             "body_name": body_name,
             "observer_name": observer_name,
+            "automation": automation,
             "limit": limit,
             "offset": offset,
             "summary": summary,
@@ -1231,6 +1250,31 @@ async def admin_observations(
             "base_filter_qs": base_filter_qs,
         },
     )
+
+
+@app.post("/control/observations/automation/analyze")
+async def admin_analyze_observations(
+    request: Request,
+    status: str = Form("new"),
+    system_name: str = Form(""),
+    body_name: str = Form(""),
+    observer_name: str = Form(""),
+    limit: int = Form(100),
+    next_url: str = Form("/control/observations"),
+):
+    if not admin_logged_in(request):
+        return admin_redirect(request)
+    params: Dict[str, Any] = {"status": status, "limit": max(1, min(int(limit), 500)), "actor": request.session.get("admin_user", "automation")}
+    if system_name.strip():
+        params["system_name"] = system_name.strip()
+    if body_name.strip():
+        params["body_name"] = body_name.strip()
+    if observer_name.strip():
+        params["observer_name"] = observer_name.strip()
+    result = await api_request("POST", "/api/admin/observations/automation/analyze", params=params)
+    analysed = int(result.get("analysed") or 0)
+    sep = "&" if "?" in next_url else "?"
+    return RedirectResponse(f"{next_url}{sep}message=Automation%20analysed%20{analysed}%20observations", status_code=303)
 
 
 @app.post("/control/observations/{observation_id}/review")
@@ -1485,21 +1529,19 @@ async def admin_refit_body(
     use_heading: str = Form(""),
     time_weighting: str = Form(""),
     include_unreviewed: str = Form(""),
-    time_half_life_hours: float = Form(24.0),
     illumination_source_star_name: str = Form(""),
 ):
-    redirect = require_super_admin(request)
+    redirect = require_admin(request)
     if redirect:
         return redirect
     payload = {
         "use_heading": bool(use_heading),
         "time_weighting": bool(time_weighting),
-        "time_half_life_hours": time_half_life_hours,
         "include_unreviewed": bool(include_unreviewed),
         "force_refit": True,
         "background": True,
         "illumination_source_star_name": illumination_source_star_name,
-        "actor": request.session.get("admin_user", "control-super"),
+        "actor": request.session.get("admin_user", "control-admin"),
     }
     await api_request("POST", f"/api/admin/bodies/{body_id}/refit", json_body=payload)
     return RedirectResponse(f"/control/bodies/{body_id}/fit?message=Fit%20queued.%20Refresh%20this%20page%20to%20see%20progress.", status_code=303)

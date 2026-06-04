@@ -26,10 +26,27 @@
     <label>Submitter
       <input name="observer_name" value="{{ observer_name }}" placeholder="optional name">
     </label>
+    <label>Automation
+      <select name="automation">
+        {% for a in ['all','unanalysed','shadow_auto_approve','auto_candidate','needs_check','duplicate_or_near_duplicate','blocked','large_residual'] %}
+          <option value="{{ a }}" {% if automation == a %}selected{% endif %}>{{ a }}</option>
+        {% endfor %}
+      </select>
+    </label>
     <label>Limit
       <input name="limit" type="number" min="1" max="500" value="{{ limit }}">
     </label>
     <button type="submit">Filter</button>
+  </form>
+  <form class="inline-form wrap" method="post" action="/control/observations/automation/analyze">
+    <input type="hidden" name="status" value="{{ status }}">
+    <input type="hidden" name="system_name" value="{{ system_name }}">
+    <input type="hidden" name="body_name" value="{{ body_name }}">
+    <input type="hidden" name="observer_name" value="{{ observer_name }}">
+    <input type="hidden" name="limit" value="{{ limit }}">
+    <input type="hidden" name="next_url" value="/control/observations?{{ filter_qs }}">
+    <button class="small" type="submit">Analyse automation recommendations</button>
+    <span class="muted">Shadow mode only: this fills recommendations and does not change review status.</span>
   </form>
 </section>
 
@@ -55,7 +72,10 @@
       {% for o in observations %}
       <tr class="review-main-row {% if o.approved_altitude_error_deg is not none and (o.approved_altitude_error_deg|abs) > 5 %}bad-row{% endif %}">
         <td>#{{ o.id }}</td>
-        <td><span class="badge {{ o.review_status|review_badge }}">{{ o.review_status }}</span></td>
+        <td>
+          <span class="badge {{ o.review_status|review_badge }}">{{ o.review_status }}</span>
+          {% if o.auto_review_status %}<br><span class="badge {{ o.auto_review_status|auto_review_badge }}">{{ o.auto_review_status }}</span>{% endif %}
+        </td>
         <td>{{ o.system_name }}<br><b>{{ o.body_name }}</b></td>
         <td>{{ o.observer_name|dash }}</td>
         <td>{{ o.timestamp_utc|utc }}<br><span class="muted">submitted {{ o.created_at_utc|utc }}</span></td>
@@ -101,6 +121,21 @@
                   <span class="muted">provisional —</span>
                 {% endif %}
               </p>
+            </div>
+            <div class="automation-detail">
+              <b>Automation recommendation</b>
+              {% if o.auto_review_status %}
+                <p><span class="badge {{ o.auto_review_status|auto_review_badge }}">{{ o.auto_review_status }}</span>
+                {% if o.auto_review_model_id %}<span class="muted">model #{{ o.auto_review_model_id }}</span>{% endif %}</p>
+                <p>
+                  {% if o.auto_review_residual_altitude_deg is not none %}residual {{ o.auto_review_residual_altitude_deg|num(3) }}°{% endif %}
+                  {% if o.auto_review_threshold_deg is not none %} / threshold {{ o.auto_review_threshold_deg|num(2) }}°{% endif %}
+                  {% if o.auto_review_confidence_score is not none %} / confidence {{ o.auto_review_confidence_score|num(0) }}%{% endif %}
+                </p>
+                <p class="muted">{{ o.auto_review_reason|dash }}</p>
+              {% else %}
+                <p class="muted">Not analysed yet.</p>
+              {% endif %}
             </div>
             <div class="note-detail">
               <b>Note</b>

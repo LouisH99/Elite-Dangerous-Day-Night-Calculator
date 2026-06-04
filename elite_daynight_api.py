@@ -50,6 +50,10 @@ RAZZ_RACING_LIST_URL = os.environ.get("ELITE_DAYNIGHT_RAZZ_RACING_LIST_URL", "ht
 RAZZ_RACING_DATA_URL_PREFIX = os.environ.get("ELITE_DAYNIGHT_RAZZ_RACING_DATA_URL_PREFIX", "https://razzserver.com/razapis/getTTData/LEADERBOARD%3C%7C%3E")
 DB_WRITE_RETRIES = int(os.environ.get("ELITE_DAYNIGHT_DB_WRITE_RETRIES", "5"))
 DB_WRITE_RETRY_BASE_SECONDS = float(os.environ.get("ELITE_DAYNIGHT_DB_WRITE_RETRY_BASE_SECONDS", "0.08"))
+# V0.208 automation is deliberately conservative.  In shadow mode it only
+# calculates and stores recommendations; it never changes review_status.
+AUTOMATION_MODE = os.environ.get("ELITE_DAYNIGHT_AUTOMATION_MODE", "shadow").strip().lower()
+AUTOMATION_BATCH_LIMIT = int(os.environ.get("ELITE_DAYNIGHT_AUTOMATION_BATCH_LIMIT", "200"))
 
 WRITE_LOCK = threading.RLock()
 
@@ -67,7 +71,7 @@ ALLOWED_QUALITY = {"high", "medium", "low"}
 
 app = FastAPI(
     title="Elite Dangerous Day/Night Calculator API",
-    version="0.206.2",
+    version="0.208.1",
     description="Local-first API for systems, bodies, observations, fitting and prediction.",
 )
 
@@ -335,6 +339,28 @@ def ensure_runtime_migrations(con: sqlite3.Connection) -> None:
     con.execute("CREATE INDEX IF NOT EXISTS idx_body_pois_body_public ON body_pois(body_id, is_public, review_status)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_body_pois_name ON body_pois(name)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_body_pois_review ON body_pois(review_status)")
+    obs_cols = {r[1] for r in con.execute("PRAGMA table_info(observations)").fetchall()}
+    if "auto_review_status" not in obs_cols:
+        con.execute("ALTER TABLE observations ADD COLUMN auto_review_status TEXT")
+    if "auto_review_reason" not in obs_cols:
+        con.execute("ALTER TABLE observations ADD COLUMN auto_review_reason TEXT")
+    if "auto_review_model_id" not in obs_cols:
+        con.execute("ALTER TABLE observations ADD COLUMN auto_review_model_id INTEGER REFERENCES fits(id) ON DELETE SET NULL")
+    if "auto_review_residual_altitude_deg" not in obs_cols:
+        con.execute("ALTER TABLE observations ADD COLUMN auto_review_residual_altitude_deg REAL")
+    if "auto_review_threshold_deg" not in obs_cols:
+        con.execute("ALTER TABLE observations ADD COLUMN auto_review_threshold_deg REAL")
+    if "auto_review_confidence_score" not in obs_cols:
+        con.execute("ALTER TABLE observations ADD COLUMN auto_review_confidence_score REAL")
+    if "auto_reviewed_at_utc" not in obs_cols:
+        con.execute("ALTER TABLE observations ADD COLUMN auto_reviewed_at_utc TEXT")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_observations_auto_review ON observations(auto_review_status)")
+    fit_cols = {r[1] for r in con.execute("PRAGMA table_info(fits)").fetchall()}
+    if "fit_origin" not in fit_cols:
+        con.execute("ALTER TABLE fits ADD COLUMN fit_origin TEXT NOT NULL DEFAULT 'manual'")
+    if "auto_fit_reason" not in fit_cols:
+        con.execute("ALTER TABLE fits ADD COLUMN auto_fit_reason TEXT")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_fits_origin ON fits(fit_origin)")
     if hasattr(dbmod, "ensure_illumination_columns"):
         dbmod.ensure_illumination_columns(con)
     if hasattr(dbmod, "ensure_fit_mode_columns"):
@@ -548,6 +574,13 @@ def observation_public_dict(row: sqlite3.Row) -> Dict[str, Any]:
         "provisional_altitude_error_deg",
         "provisional_heading_error_deg",
         "provisional_effective_weight",
+        "auto_review_status",
+        "auto_review_reason",
+        "auto_review_model_id",
+        "auto_review_residual_altitude_deg",
+        "auto_review_threshold_deg",
+        "auto_review_confidence_score",
+        "auto_reviewed_at_utc",
     ):
         if key in d:
             out[key] = d.get(key)
@@ -602,6 +635,262 @@ def insert_audit(con: sqlite3.Connection, entity_type: str, entity_id: int, acti
     con.execute(
         "INSERT INTO audit_log(entity_type, entity_id, action, old_json, new_json, created_at_utc, actor) VALUES (?, ?, ?, ?, ?, ?, ?)",
         (entity_type, entity_id, action, None if old is None else dbmod.json_dumps(old), None if new is None else dbmod.json_dumps(new), dbmod.utc_now(), actor),
+    )
+
+
+def automation_mode() -> str:
+    mode = (AUTOMATION_MODE or "off").strip().lower()
+    if mode not in {"off", "shadow", "candidate", "active"}:
+        return "shadow"
+    return mode
+
+
+def automation_threshold_for_quality(quality: str, predicted_altitude: Optional[float]) -> float:
+    q = (quality or "medium").strip().lower()
+    if q == "high":
+        threshold = 1.0
+    elif q == "low":
+        threshold = 3.0
+    else:
+        threshold = 2.0
+    # Horizon observations are very sensitive to tiny time/location differences.
+    if predicted_altitude is not None and abs(float(predicted_altitude)) < 3.0:
+        threshold += 0.5
+    return float(threshold)
+
+
+def _target_altitude_from_observation_row(row: sqlite3.Row) -> Optional[float]:
+    obs_type = str(row["observation"] or "").strip().lower()
+    if obs_type in {"sunrise", "sunset", "horizon", "rise", "set"}:
+        return 0.0
+    if obs_type in {"elevation", "altitude", "sun_altitude", "alt"}:
+        return None if row["elevation"] is None else float(row["elevation"])
+    return None
+
+
+def _duplicate_or_near_duplicate(con: sqlite3.Connection, obs_row: sqlite3.Row) -> Optional[int]:
+    try:
+        obs_dt = model.parse_utc(str(obs_row["timestamp_utc"]))
+    except Exception:
+        return None
+    rows = con.execute(
+        """
+        SELECT id, timestamp_utc, lat, lon, elevation
+          FROM observations
+         WHERE body_id = ? AND id <> ? AND target_type = 'sun'
+         ORDER BY created_at_utc DESC LIMIT 300
+        """,
+        (int(obs_row["body_id"]), int(obs_row["id"])),
+    ).fetchall()
+    for other in rows:
+        try:
+            other_dt = model.parse_utc(str(other["timestamp_utc"]))
+        except Exception:
+            continue
+        dt_seconds = abs((obs_dt - other_dt).total_seconds())
+        if dt_seconds > 180.0:
+            continue
+        if abs(float(obs_row["lat"]) - float(other["lat"])) > 0.002:
+            continue
+        if abs(float(obs_row["lon"]) - float(other["lon"])) > 0.002:
+            continue
+        a = obs_row["elevation"]
+        b = other["elevation"]
+        if a is not None and b is not None and abs(float(a) - float(b)) > 0.75:
+            continue
+        return int(other["id"])
+    return None
+
+
+def evaluate_observation_automation(
+    con: sqlite3.Connection,
+    observation_id: int,
+    *,
+    persist: bool = True,
+    actor: str = "automation",
+) -> Dict[str, Any]:
+    """Calculate a conservative V0.208 automation recommendation.
+
+    This function is intentionally shadow/candidate oriented.  It does not
+    change review_status, even when the recommendation says an observation
+    would be safe to approve.
+    """
+    row = con.execute(
+        """
+        SELECT o.*, s.name AS system_name, b.name AS body_name
+          FROM observations o
+          JOIN systems s ON s.id = o.system_id
+          JOIN bodies b ON b.id = o.body_id
+         WHERE o.id = ?
+        """,
+        (observation_id,),
+    ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Observation not found")
+
+    now = dbmod.utc_now()
+    decision: Dict[str, Any] = {
+        "observation_id": int(row["id"]),
+        "body_id": int(row["body_id"]),
+        "mode": automation_mode(),
+        "auto_review_status": "blocked",
+        "auto_review_reason": "Automation is disabled." if automation_mode() == "off" else "Not evaluated yet.",
+        "auto_review_model_id": None,
+        "auto_review_residual_altitude_deg": None,
+        "auto_review_threshold_deg": None,
+        "auto_review_confidence_score": None,
+        "auto_reviewed_at_utc": now,
+    }
+
+    if automation_mode() == "off":
+        if persist:
+            _store_observation_automation_decision(con, row, decision, actor)
+        return decision
+
+    target_alt = _target_altitude_from_observation_row(row)
+    if target_alt is None:
+        decision["auto_review_status"] = "blocked"
+        decision["auto_review_reason"] = "Only sun elevation/horizon observations can be analysed automatically."
+        if persist:
+            _store_observation_automation_decision(con, row, decision, actor)
+        return decision
+
+    duplicate_id = _duplicate_or_near_duplicate(con, row)
+    if duplicate_id is not None:
+        decision["auto_review_status"] = "duplicate_or_near_duplicate"
+        decision["auto_review_reason"] = f"Very similar observation already exists as #{duplicate_id}. Human review recommended."
+        if persist:
+            _store_observation_automation_decision(con, row, decision, actor)
+        return decision
+
+    try:
+        _system, fitted, fit_id = dbmod.model_from_active_fit(con, int(row["body_id"]), fit_mode="approved")
+    except Exception as exc:
+        decision["auto_review_status"] = "blocked"
+        decision["auto_review_reason"] = f"No active reviewed model is available for comparison: {exc}"
+        if persist:
+            _store_observation_automation_decision(con, row, decision, actor)
+        return decision
+
+    try:
+        obs_dt = model.parse_utc(str(row["timestamp_utc"]))
+        predicted_alt, predicted_heading = fitted.predict(obs_dt, float(row["lat"]), float(row["lon"]))
+    except Exception as exc:
+        decision["auto_review_status"] = "blocked"
+        decision["auto_review_reason"] = f"Could not predict this observation: {exc}"
+        decision["auto_review_model_id"] = int(fit_id)
+        if persist:
+            _store_observation_automation_decision(con, row, decision, actor)
+        return decision
+
+    residual = float(predicted_alt) - float(target_alt)
+    threshold = automation_threshold_for_quality(str(row["quality"] or "medium"), predicted_alt)
+    confidence = model.model_confidence_dict(fitted, target_time=obs_dt, model_mode="approved", includes_unreviewed=False)
+    confidence_score = float(confidence.get("score") or 0.0)
+    sun_mode = str(confidence.get("sun_source_mode") or "")
+    geometry_mode = str(confidence.get("sun_geometry_mode") or "")
+    abs_residual = abs(residual)
+
+    decision.update({
+        "auto_review_model_id": int(fit_id),
+        "auto_review_residual_altitude_deg": float(residual),
+        "auto_review_threshold_deg": float(threshold),
+        "auto_review_confidence_score": confidence_score,
+        "predicted_altitude_deg": float(predicted_alt),
+        "submitted_altitude_deg": float(target_alt),
+        "predicted_heading_deg": float(predicted_heading),
+        "confidence_level": confidence.get("level"),
+        "sun_source_mode": sun_mode,
+        "sun_geometry_mode": geometry_mode,
+    })
+
+    if sun_mode == "fallback" or "fallback" in geometry_mode.lower():
+        if abs_residual <= threshold:
+            decision["auto_review_status"] = "auto_candidate"
+            decision["auto_review_reason"] = (
+                f"Residual {abs_residual:.2f}° is within threshold {threshold:.2f}°, "
+                "but sun-source geometry is fallback/uncertain. Reviewer confirmation recommended."
+            )
+        else:
+            decision["auto_review_status"] = "needs_check"
+            decision["auto_review_reason"] = (
+                f"Residual {abs_residual:.2f}° exceeds threshold {threshold:.2f}° and geometry is fallback/uncertain."
+            )
+    elif confidence_score < 65.0:
+        if abs_residual <= threshold:
+            decision["auto_review_status"] = "auto_candidate"
+            decision["auto_review_reason"] = (
+                f"Residual {abs_residual:.2f}° is within threshold {threshold:.2f}°, "
+                f"but model confidence is only {confidence_score:.0f}%. Reviewer confirmation recommended."
+            )
+        else:
+            decision["auto_review_status"] = "needs_check"
+            decision["auto_review_reason"] = (
+                f"Residual {abs_residual:.2f}° exceeds threshold {threshold:.2f}°; model confidence is {confidence_score:.0f}%."
+            )
+    elif abs_residual <= threshold and confidence_score >= 85.0:
+        decision["auto_review_status"] = "shadow_auto_approve"
+        decision["auto_review_reason"] = (
+            f"Would auto-approve in active mode: residual {abs_residual:.2f}° <= threshold {threshold:.2f}° "
+            f"against high-confidence reviewed model #{fit_id} ({confidence_score:.0f}%)."
+        )
+    elif abs_residual <= threshold:
+        decision["auto_review_status"] = "auto_candidate"
+        decision["auto_review_reason"] = (
+            f"Residual {abs_residual:.2f}° <= threshold {threshold:.2f}° against reviewed model #{fit_id}. "
+            f"Model confidence {confidence_score:.0f}%; reviewer confirmation recommended."
+        )
+    else:
+        decision["auto_review_status"] = "needs_check"
+        decision["auto_review_reason"] = (
+            f"Residual {abs_residual:.2f}° exceeds threshold {threshold:.2f}° against reviewed model #{fit_id}."
+        )
+
+    if persist:
+        _store_observation_automation_decision(con, row, decision, actor)
+    return decision
+
+
+def _store_observation_automation_decision(
+    con: sqlite3.Connection,
+    old_row: sqlite3.Row,
+    decision: Dict[str, Any],
+    actor: str = "automation",
+) -> None:
+    con.execute(
+        """
+        UPDATE observations
+           SET auto_review_status = ?,
+               auto_review_reason = ?,
+               auto_review_model_id = ?,
+               auto_review_residual_altitude_deg = ?,
+               auto_review_threshold_deg = ?,
+               auto_review_confidence_score = ?,
+               auto_reviewed_at_utc = ?
+         WHERE id = ?
+        """,
+        (
+            decision.get("auto_review_status"),
+            decision.get("auto_review_reason"),
+            decision.get("auto_review_model_id"),
+            decision.get("auto_review_residual_altitude_deg"),
+            decision.get("auto_review_threshold_deg"),
+            decision.get("auto_review_confidence_score"),
+            decision.get("auto_reviewed_at_utc") or dbmod.utc_now(),
+            int(old_row["id"]),
+        ),
+    )
+    insert_audit(
+        con,
+        "observation",
+        int(old_row["id"]),
+        "automation_shadow_review",
+        {
+            "review_status": old_row["review_status"],
+            "auto_review_status": old_row["auto_review_status"] if "auto_review_status" in old_row.keys() else None,
+        },
+        decision,
+        actor,
     )
 
 
@@ -934,7 +1223,7 @@ def start_provisional_fit_worker() -> None:
 def root() -> Dict[str, Any]:
     return {
         "name": "Elite Dangerous Day/Night Calculator API",
-        "version": "0.206.2",
+        "version": "0.208.1",
         "db_path": DB_PATH,
         "docs": "/docs",
     }
@@ -1536,6 +1825,11 @@ def add_observation(body_id: int, req: ObservationCreate) -> Dict[str, Any]:
             ).fetchone()
             public_row = observation_public_dict(row)
             insert_audit(con, "observation", int(row["id"]), "api_upsert_observation", None, public_row, req.observer_name or "api")
+            try:
+                decision = evaluate_observation_automation(con, int(row["id"]), persist=True, actor="automation")
+                public_row.update(decision)
+            except Exception as exc:
+                public_row["automation_error"] = str(exc)
             con.commit()
         except sqlite3.OperationalError as exc:
             raise http_error_from_exception(exc)
@@ -1951,6 +2245,7 @@ def list_observations(
     system_id: Optional[int] = None,
     system_name: Optional[str] = None,
     observer_name: Optional[str] = None,
+    automation: Optional[str] = Query(None, description="auto review filter"),
     limit: int = Query(100, ge=1, le=1000),
     offset: int = Query(0, ge=0),
 ) -> Dict[str, Any]:
@@ -1976,6 +2271,15 @@ def list_observations(
         if observer_name:
             clauses.append("lower(coalesce(o.observer_name, '')) LIKE lower(?)")
             params.append(f"%{observer_name.strip()}%")
+        automation_filter = (automation or "").strip().lower()
+        if automation_filter and automation_filter != "all":
+            if automation_filter == "unanalysed":
+                clauses.append("(o.auto_review_status IS NULL OR o.auto_review_status = '')")
+            elif automation_filter == "large_residual":
+                clauses.append("o.auto_review_residual_altitude_deg IS NOT NULL AND abs(o.auto_review_residual_altitude_deg) > COALESCE(o.auto_review_threshold_deg, 3.0)")
+            else:
+                clauses.append("o.auto_review_status = ?")
+                params.append(automation_filter)
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
         rows = con.execute(
             f"""
@@ -2017,6 +2321,81 @@ def list_observations(
     finally:
         con.close()
     return {"results": [observation_public_dict(r) for r in rows], "limit": limit, "offset": offset}
+
+
+@app.post("/api/admin/observations/automation/analyze")
+def analyze_observation_automation_batch(
+    status: Optional[str] = Query("new"),
+    body_id: Optional[int] = None,
+    body_name: Optional[str] = None,
+    system_id: Optional[int] = None,
+    system_name: Optional[str] = None,
+    observer_name: Optional[str] = None,
+    limit: int = Query(100, ge=1, le=1000),
+    actor: str = Query("automation"),
+) -> Dict[str, Any]:
+    """Analyse existing observations and store shadow/candidate decisions.
+
+    This is an admin/reviewer helper.  It does not change observation
+    review_status; it only fills the auto_review_* columns and audit log.
+    """
+    max_limit = min(int(limit), max(1, AUTOMATION_BATCH_LIMIT))
+    with WRITE_LOCK:
+        con = connect_write()
+        try:
+            clauses = []
+            params: List[Any] = []
+            if status and str(status).strip().lower() != "all":
+                clauses.append("o.review_status = ?")
+                params.append(str(status).strip().lower())
+            if body_id is not None:
+                clauses.append("o.body_id = ?")
+                params.append(body_id)
+            if body_name:
+                clauses.append("lower(b.name) LIKE lower(?)")
+                params.append(f"%{body_name.strip()}%")
+            if system_id is not None:
+                clauses.append("o.system_id = ?")
+                params.append(system_id)
+            if system_name:
+                clauses.append("lower(s.name) LIKE lower(?)")
+                params.append(f"%{system_name.strip()}%")
+            if observer_name:
+                clauses.append("lower(coalesce(o.observer_name, '')) LIKE lower(?)")
+                params.append(f"%{observer_name.strip()}%")
+            where = " WHERE " + " AND ".join(clauses) if clauses else ""
+            rows = con.execute(
+                f"""
+                SELECT o.id
+                  FROM observations o
+                  JOIN systems s ON s.id = o.system_id
+                  JOIN bodies b ON b.id = o.body_id
+                  {where}
+                 ORDER BY o.created_at_utc DESC, o.id DESC
+                 LIMIT ?
+                """,
+                params + [max_limit],
+            ).fetchall()
+            decisions: List[Dict[str, Any]] = []
+            counts: Dict[str, int] = {}
+            for r in rows:
+                try:
+                    decision = evaluate_observation_automation(con, int(r["id"]), persist=True, actor=actor or "automation")
+                except Exception as exc:
+                    decision = {"observation_id": int(r["id"]), "auto_review_status": "blocked", "auto_review_reason": str(exc)}
+                decisions.append(decision)
+                key = str(decision.get("auto_review_status") or "unknown")
+                counts[key] = counts.get(key, 0) + 1
+            con.commit()
+            return {
+                "analysed": len(decisions),
+                "limit": max_limit,
+                "mode": automation_mode(),
+                "status_counts": counts,
+                "results": decisions,
+            }
+        finally:
+            con.close()
 
 
 @app.get("/api/admin/observations/{observation_id}")
@@ -2098,8 +2477,20 @@ def patch_observation(observation_id: int, req: ObservationPatch) -> Dict[str, A
                 (observation_id,),
             ).fetchone()
             insert_audit(con, "observation", observation_id, "api_patch_observation", observation_public_dict(old), observation_public_dict(row), "api-admin")
+            try:
+                evaluate_observation_automation(con, int(observation_id), persist=True, actor="automation")
+            except Exception:
+                pass
             con.commit()
-            return observation_public_dict(row)
+            refreshed = con.execute(
+                """
+                SELECT o.*, s.name AS system_name, b.name AS body_name
+                  FROM observations o JOIN systems s ON s.id = o.system_id JOIN bodies b ON b.id = o.body_id
+                 WHERE o.id = ?
+                """,
+                (observation_id,),
+            ).fetchone()
+            return observation_public_dict(refreshed)
         except sqlite3.IntegrityError as exc:
             raise HTTPException(status_code=409, detail=f"Patch conflicts with an existing observation: {exc}")
         finally:
