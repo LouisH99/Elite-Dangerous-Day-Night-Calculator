@@ -1,3 +1,18 @@
+## V0.213
+
+- Fixed system/body list queries so extra active fit rows cannot make one imported target body appear twice.
+- Hardened body imports and startup maintenance against duplicate same-system body names.
+- Provisional model confidence is no longer hard-capped at 70%; it remains flagged/penalized for unreviewed data but now varies with fit quality, coverage, and freshness.
+- Added a POI transition cache for day/night crossing searches.
+- Private API predictions can now use the cache by passing `poi_id` to `/api/bodies/{body_id}/prediction`.
+- Added `/api/pois/{poi_id}/prediction` for direct cache-aware POI predictions.
+- Public POI and Razz Racing race-key predictions now pass `poi_id` through to the private API cache.
+- Public prediction responses expose only a compact `prediction.cache_hit` boolean; detailed cache diagnostics stay private.
+- Cached POI predictions still calculate current sun altitude and heading live; only horizon-transition searches are reused.
+- Cache entries are invalidated by active fit id, model mode, POI coordinates, threshold, and cache version.
+- Extended POI transition caches now refresh after 24 hours or when less than 14 days of extended coverage remain, so long seasonal dark/light periods keep rolling forward.
+- Added private API run-script defaults for POI cache window, refresh margin, extended refresh margin, and max cached crossings.
+
 ## V0.212
 
 - Ported the v0.213 calculation performance work onto the V0.211 UI baseline.

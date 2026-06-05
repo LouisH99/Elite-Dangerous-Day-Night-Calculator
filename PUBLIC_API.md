@@ -179,7 +179,8 @@ Example shape:
     "next_sunrise_utc": "2026-06-05T01:20:00Z",
     "next_sunset_utc": "2026-06-04T18:44:00Z",
     "sunlight_duration_seconds": 21600.0,
-    "day_period_seconds": 86400.0
+    "day_period_seconds": 86400.0,
+    "cache_hit": true
   },
   "model_confidence": {
     "score": 86,
@@ -202,6 +203,8 @@ Example shape:
 
 
 `target.body_id` and `target.poi_id` are local IDs from this Day/Night Calculator database. `poi_id` is `null` for manual system/body/coordinate predictions and set for POI or race-key predictions.
+
+`prediction.cache_hit` is `true` only when a saved POI/race-key prediction reused an existing POI transition cache. It is `false` for manual coordinate predictions, cache misses, refreshes, or disabled cache. Current sun altitude and heading are always calculated live; the cache only reuses stored horizon-transition searches.
 
 `model_confidence.note` is intentionally a single short note. It is empty when the model is healthy. When the model needs attention, it gives one short reason such as:
 

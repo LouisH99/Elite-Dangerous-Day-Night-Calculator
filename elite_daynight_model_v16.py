@@ -1832,6 +1832,98 @@ def find_crossings_for_prediction(
     )
 
 
+def find_crossings_for_prediction_from_cache(
+    cached_crossings: List[Tuple[datetime, str]],
+    start: datetime,
+    prediction_hours: float = 72.0,
+    max_crossings: int = 24,
+    min_fallback_transitions: int = DEFAULT_MIN_FALLBACK_TRANSITIONS,
+    cached_search_hours: Optional[float] = None,
+    cached_search_meta: Optional[Dict[str, Any]] = None,
+) -> Tuple[
+    List[Tuple[datetime, str]],
+    List[Tuple[datetime, str]],
+    List[Tuple[datetime, str]],
+    float,
+    bool,
+    bool,
+    str,
+    Dict[str, Any],
+]:
+    """Build prediction crossing data from precomputed POI transitions.
+
+    The live sun altitude/heading is still calculated separately.  This helper
+    only replaces the expensive horizon-crossing scan when the API has a valid
+    POI transition cache for the active fit and coordinates.
+    """
+    prediction_hours = max(0.1, float(prediction_hours))
+    min_fallback_transitions = max(1, int(min_fallback_transitions))
+    horizon_seconds = prediction_hours * 3600.0
+    end = start + timedelta(hours=prediction_hours)
+    future_crossings = unique_crossings([
+        (ct, kind)
+        for ct, kind in cached_crossings
+        if (ct - start).total_seconds() >= -1.0
+    ])
+    window_crossings = [
+        (ct, kind)
+        for ct, kind in future_crossings
+        if ct <= end + timedelta(seconds=1.0)
+    ][:max_crossings]
+
+    window_summary = daylight_cycle_summary(window_crossings)
+    need_display_fallback = len(window_crossings) == 0
+    need_cycle_fallback = window_summary is None
+
+    if need_display_fallback:
+        display_crossings = future_crossings[:min_fallback_transitions]
+    else:
+        display_crossings = window_crossings
+
+    cycle_crossings = future_crossings[:max(max_crossings, min_fallback_transitions, 8)]
+    cycle_summary = daylight_cycle_summary(cycle_crossings)
+    cycle_search_extended = bool(need_cycle_fallback and cycle_summary is not None)
+    daylight_source = "cache_extended" if cycle_search_extended else ("cache_window" if window_summary is not None else "cache_unknown")
+    listed_extended = any((ct - start).total_seconds() > horizon_seconds + 1.0 for ct, _kind in display_crossings)
+
+    normal_meta = {
+        "step_seconds": None,
+        "samples": 0,
+        "refinements": 0,
+        "early_stop": False,
+        "adaptive_enabled": bool(ADAPTIVE_NORMAL_SEARCH),
+        "cache_hit": True,
+    }
+    extended_meta = {
+        "step_seconds": None,
+        "parallel_enabled": False,
+        "workers": 0,
+        "samples": 0,
+        "refinements": 0,
+        "chunks": 0,
+        "parallel_error": None,
+        "cache_hit": True,
+    }
+    if cached_search_meta:
+        normal_meta["cached_normal"] = cached_search_meta.get("normal", {})
+        extended_meta["cached_extended"] = cached_search_meta.get("extended", {})
+    search_meta = {
+        "normal": normal_meta,
+        "extended": extended_meta,
+        "transition_cache": "hit",
+    }
+    return (
+        display_crossings,
+        window_crossings,
+        cycle_crossings,
+        float(cached_search_hours if cached_search_hours is not None else prediction_hours),
+        bool(listed_extended),
+        bool(cycle_search_extended),
+        daylight_source,
+        search_meta,
+    )
+
+
 def daylight_cycle_rows(crossings: List[Tuple[datetime, str]]) -> List[Tuple[datetime, Optional[datetime], Optional[float], Optional[datetime], Optional[float]]]:
     """Return sunrise-based daylight/day-cycle summaries.
 
@@ -2243,6 +2335,9 @@ def calculate_prediction(
     prediction_hours: float = 72.0,
     min_fallback_transitions: int = DEFAULT_MIN_FALLBACK_TRANSITIONS,
     max_extended_prediction_hours: float = DEFAULT_MAX_EXTENDED_PREDICTION_HOURS,
+    cached_crossings: Optional[List[Tuple[datetime, str]]] = None,
+    cached_crossing_search_hours: Optional[float] = None,
+    cached_search_meta: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Return a JSON-serialisable prediction for a body/lat/lon/time.
 
@@ -2262,26 +2357,46 @@ def calculate_prediction(
     else:
         sun_altitude_trend = "nearly level"
 
-    (
-        centre_crossings,
-        window_crossings,
-        cycle_crossings,
-        crossing_search_hours,
-        crossings_extended,
-        cycle_search_extended,
-        daylight_summary_source,
-        search_meta,
-    ) = find_crossings_for_prediction(
-        model,
-        target_time,
-        lat,
-        lon,
-        threshold=0.0,
-        prediction_hours=prediction_hours,
-        max_crossings=24,
-        min_fallback_transitions=min_fallback_transitions,
-        max_extended_hours=max_extended_prediction_hours,
-    )
+    if cached_crossings is not None:
+        (
+            centre_crossings,
+            window_crossings,
+            cycle_crossings,
+            crossing_search_hours,
+            crossings_extended,
+            cycle_search_extended,
+            daylight_summary_source,
+            search_meta,
+        ) = find_crossings_for_prediction_from_cache(
+            cached_crossings,
+            target_time,
+            prediction_hours=prediction_hours,
+            max_crossings=24,
+            min_fallback_transitions=min_fallback_transitions,
+            cached_search_hours=cached_crossing_search_hours,
+            cached_search_meta=cached_search_meta,
+        )
+    else:
+        (
+            centre_crossings,
+            window_crossings,
+            cycle_crossings,
+            crossing_search_hours,
+            crossings_extended,
+            cycle_search_extended,
+            daylight_summary_source,
+            search_meta,
+        ) = find_crossings_for_prediction(
+            model,
+            target_time,
+            lat,
+            lon,
+            threshold=0.0,
+            prediction_hours=prediction_hours,
+            max_crossings=24,
+            min_fallback_transitions=min_fallback_transitions,
+            max_extended_hours=max_extended_prediction_hours,
+        )
     daylight_summary = daylight_cycle_summary(cycle_crossings)
     next_sunrise = next((t for t, kind in cycle_crossings if kind == "rise"), None)
     next_sunset = next((t for t, kind in cycle_crossings if kind == "set"), None)
@@ -2354,6 +2469,7 @@ def calculate_prediction(
         "extended_search_samples": int(search_meta.get("extended", {}).get("samples") or 0),
         "extended_search_refinements": int(search_meta.get("extended", {}).get("refinements") or 0),
         "extended_search_parallel_error": search_meta.get("extended", {}).get("parallel_error"),
+        "transition_cache_status": str(search_meta.get("transition_cache") or "miss"),
         "window_horizon_crossing_count": int(len(window_crossings)),
         "cycle_horizon_crossing_count": int(len(cycle_crossings)),
         "centre_horizon_crossings": [
@@ -2610,11 +2726,12 @@ def model_confidence_dict(
     freshness_details["prediction_distance_hours"] = None if prediction_distance_hours is None else float(prediction_distance_hours)
     freshness_details["score"] = round(freshness_score * 100.0, 1)
 
-    # 5) Review/model safety.  Provisional data is capped below high confidence.
+    # 5) Review/model safety. Provisional data is flagged and mildly penalized,
+    # but the final score should still move with fit quality and coverage.
     mode = (model_mode or "approved").strip().lower()
     review_safety_score = 1.0
     if includes_unreviewed or mode == "provisional":
-        review_safety_score = 0.65
+        review_safety_score = 0.75
 
     # 6) Geometry/source complexity. Explicit/inferred recursive star source is OK;
     # last-resort fallback is more risky.
@@ -2636,8 +2753,6 @@ def model_confidence_dict(
         + 0.10 * ((review_safety_score * 0.7) + (geometry_score * 0.3))
     ) * 100.0
 
-    if includes_unreviewed or mode == "provisional":
-        raw_score = min(raw_score, 70.0)
     score = int(round(max(0.0, min(100.0, raw_score))))
 
     warnings: List[str] = []

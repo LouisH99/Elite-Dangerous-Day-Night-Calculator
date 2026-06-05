@@ -61,7 +61,7 @@ PUBLIC_POI_SUBMISSIONS_ENABLED = env_bool("ELITE_DAYNIGHT_PUBLIC_POI_SUBMISSIONS
 
 app = FastAPI(
     title="Elite Dangerous Day/Night Calculator Website",
-    version="0.212",
+    version="0.213",
     docs_url=None,
     redoc_url=None,
     openapi_url=None,
@@ -535,16 +535,19 @@ async def public_api_prediction(
 
     target_time = time.strip() or now_utc_iso()
     try:
+        prediction_params = {
+            "lat": float(target["lat"]),
+            "lon": float(target["lon"]),
+            "time": target_time,
+            "prediction_hours": float(prediction_hours),
+            "model_mode": mode,
+        }
+        if target.get("poi_id") not in (None, ""):
+            prediction_params["poi_id"] = int(target["poi_id"])
         prediction = await api_request(
             "GET",
             f"/api/bodies/{int(target['body_id'])}/prediction",
-            params={
-                "lat": float(target["lat"]),
-                "lon": float(target["lon"]),
-                "time": target_time,
-                "prediction_hours": float(prediction_hours),
-                "model_mode": mode,
-            },
+            params=prediction_params,
         )
     except ApiError as exc:
         detail = exc.detail or "Prediction failed."
@@ -596,6 +599,7 @@ async def public_api_prediction(
             "next_sunset_utc": prediction.get("next_sunset_utc"),
             "sunlight_duration_seconds": prediction.get("sunlight_duration_sec"),
             "day_period_seconds": prediction.get("day_period_sec"),
+            "cache_hit": str((prediction.get("poi_transition_cache") or {}).get("status") or "").lower() == "hit",
         },
         "model_confidence": public_conf,
         "observation_need": observation_need,
@@ -911,10 +915,13 @@ async def body_detail(
         fit_error = exc.detail
     target_time = time.strip() or now_utc_iso()
     if lat_value is not None and lon_value is not None and fit is not None:
+        prediction_params = {"lat": lat_value, "lon": lon_value, "time": target_time, "prediction_hours": prediction_hours_value, "model_mode": model_mode}
+        if selected_poi is not None and selected_poi.get("id") not in (None, ""):
+            prediction_params["poi_id"] = int(selected_poi["id"])
         prediction = await api_request(
             "GET",
             f"/api/bodies/{body_id}/prediction",
-            params={"lat": lat_value, "lon": lon_value, "time": target_time, "prediction_hours": prediction_hours_value, "model_mode": model_mode},
+            params=prediction_params,
         )
     prediction_json = json.dumps(prediction or {}, ensure_ascii=False)
     return render(

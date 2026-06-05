@@ -144,6 +144,26 @@ CREATE TABLE prediction_cache (
             prediction_json TEXT NOT NULL,
             created_at_utc TEXT NOT NULL
         );;
+CREATE TABLE poi_transition_cache (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            poi_id INTEGER NOT NULL,
+            body_id INTEGER NOT NULL REFERENCES bodies(id) ON DELETE CASCADE,
+            fit_id INTEGER NOT NULL REFERENCES fits(id) ON DELETE CASCADE,
+            model_mode TEXT NOT NULL DEFAULT 'approved',
+            lat REAL NOT NULL,
+            lon REAL NOT NULL,
+            threshold_deg REAL NOT NULL DEFAULT 0.0,
+            cache_version TEXT NOT NULL,
+            window_start_utc TEXT NOT NULL,
+            window_end_utc TEXT NOT NULL,
+            checked_until_utc TEXT NOT NULL,
+            requested_lookahead_hours REAL NOT NULL,
+            max_extended_hours REAL NOT NULL,
+            transitions_json TEXT NOT NULL,
+            search_meta_json TEXT,
+            created_at_utc TEXT NOT NULL,
+            refreshed_at_utc TEXT NOT NULL
+        );;
 CREATE TABLE schema_meta (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
@@ -163,6 +183,7 @@ CREATE TABLE systems (
         );;
 CREATE INDEX idx_systems_name ON systems(name COLLATE NOCASE);;
 CREATE INDEX idx_bodies_system_name ON bodies(system_id, name COLLATE NOCASE);;
+CREATE UNIQUE INDEX idx_bodies_system_name_norm_unique ON bodies(system_id, lower(trim(name)));;
 CREATE INDEX idx_bodies_parent ON bodies(system_id, parent_body_id);;
 CREATE INDEX idx_observations_body_status ON observations(body_id, review_status);;
 CREATE INDEX idx_observations_time ON observations(timestamp_utc);;
@@ -178,6 +199,9 @@ CREATE INDEX idx_body_pois_source ON body_pois(source, source_id);;
 CREATE INDEX idx_body_pois_body_public ON body_pois(body_id, is_public, review_status);;
 CREATE INDEX idx_body_pois_name ON body_pois(name);;
 CREATE INDEX idx_body_pois_review ON body_pois(review_status);;
+CREATE INDEX idx_poi_transition_cache_lookup ON poi_transition_cache(poi_id, fit_id, model_mode, cache_version);;
+CREATE INDEX idx_poi_transition_cache_body_fit ON poi_transition_cache(body_id, fit_id);;
+CREATE INDEX idx_poi_transition_cache_checked ON poi_transition_cache(checked_until_utc);;
 CREATE INDEX idx_background_fit_jobs_body_created ON background_fit_jobs(body_id, requested_at_utc DESC);;
 CREATE INDEX idx_background_fit_jobs_status ON background_fit_jobs(status);;
 CREATE INDEX idx_background_fit_jobs_body_mode_status ON background_fit_jobs(body_id, fit_mode, status);;

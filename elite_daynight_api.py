@@ -21,6 +21,7 @@ import threading
 import time
 import queue
 import urllib.parse
+from datetime import timedelta
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Query
@@ -45,11 +46,45 @@ def env_bool(name: str, default: bool = True) -> bool:
     return value.strip().lower() not in {"0", "false", "no", "off", "disabled"}
 
 
+def env_float(name: str, default: float, low: Optional[float] = None, high: Optional[float] = None) -> float:
+    try:
+        value = float(os.environ.get(name, str(default)))
+    except Exception:
+        value = float(default)
+    if low is not None:
+        value = max(float(low), value)
+    if high is not None:
+        value = min(float(high), value)
+    return float(value)
+
+
+def env_int(name: str, default: int, low: Optional[int] = None, high: Optional[int] = None) -> int:
+    try:
+        value = int(float(os.environ.get(name, str(default))))
+    except Exception:
+        value = int(default)
+    if low is not None:
+        value = max(int(low), value)
+    if high is not None:
+        value = min(int(high), value)
+    return int(value)
+
+
 PUBLIC_POI_SUBMISSIONS_ENABLED = env_bool("ELITE_DAYNIGHT_PUBLIC_POI_SUBMISSIONS_ENABLED", True)
 RAZZ_RACING_LIST_URL = os.environ.get("ELITE_DAYNIGHT_RAZZ_RACING_LIST_URL", "https://razzserver.com/razapis/getTTList/LEADERBOARD")
 RAZZ_RACING_DATA_URL_PREFIX = os.environ.get("ELITE_DAYNIGHT_RAZZ_RACING_DATA_URL_PREFIX", "https://razzserver.com/razapis/getTTData/LEADERBOARD%3C%7C%3E")
 DB_WRITE_RETRIES = int(os.environ.get("ELITE_DAYNIGHT_DB_WRITE_RETRIES", "5"))
 DB_WRITE_RETRY_BASE_SECONDS = float(os.environ.get("ELITE_DAYNIGHT_DB_WRITE_RETRY_BASE_SECONDS", "0.08"))
+POI_TRANSITION_CACHE_ENABLED = env_bool("ELITE_DAYNIGHT_POI_TRANSITION_CACHE_ENABLED", True)
+POI_TRANSITION_CACHE_VERSION = "v1"
+POI_CACHE_NORMAL_LOOKAHEAD_HOURS = env_float("ELITE_DAYNIGHT_POI_CACHE_NORMAL_LOOKAHEAD_HOURS", 72.0, 1.0, 8760.0)
+POI_CACHE_PREFETCH_HOURS = env_float("ELITE_DAYNIGHT_POI_CACHE_PREFETCH_HOURS", 24.0, 0.0, 8760.0)
+POI_CACHE_PAST_MARGIN_HOURS = env_float("ELITE_DAYNIGHT_POI_CACHE_PAST_MARGIN_HOURS", 1.0, 0.0, 168.0)
+POI_CACHE_REFRESH_MARGIN_HOURS = env_float("ELITE_DAYNIGHT_POI_CACHE_REFRESH_MARGIN_HOURS", 6.0, 0.0, 8760.0)
+POI_CACHE_EXTENDED_REFRESH_MARGIN_HOURS = env_float("ELITE_DAYNIGHT_POI_CACHE_EXTENDED_REFRESH_MARGIN_HOURS", 336.0, 0.0, 8760.0)
+POI_CACHE_MAX_AGE_HOURS = env_float("ELITE_DAYNIGHT_POI_CACHE_MAX_AGE_HOURS", 24.0, 0.0, 8760.0)
+POI_CACHE_MAX_EXTENDED_HOURS = env_float("ELITE_DAYNIGHT_POI_CACHE_MAX_EXTENDED_HOURS", model.DEFAULT_MAX_EXTENDED_PREDICTION_HOURS, 1.0, 8760.0)
+POI_CACHE_MAX_CROSSINGS = env_int("ELITE_DAYNIGHT_POI_CACHE_MAX_CROSSINGS", 512, 8, 5000)
 # V0.208 automation is deliberately conservative.  In shadow mode it only
 # calculates and stores recommendations; it never changes review_status.
 AUTOMATION_MODE = os.environ.get("ELITE_DAYNIGHT_AUTOMATION_MODE", "shadow").strip().lower()
@@ -71,7 +106,7 @@ ALLOWED_QUALITY = {"high", "medium", "low"}
 
 app = FastAPI(
     title="Elite Dangerous Day/Night Calculator API",
-    version="0.212",
+    version="0.213",
     description="Local-first API for systems, bodies, observations, fitting and prediction.",
 )
 
@@ -401,6 +436,38 @@ def ensure_runtime_migrations(con: sqlite3.Connection) -> None:
     con.execute("CREATE INDEX IF NOT EXISTS idx_background_fit_jobs_body_created ON background_fit_jobs(body_id, requested_at_utc DESC)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_background_fit_jobs_status ON background_fit_jobs(status)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_background_fit_jobs_body_mode_status ON background_fit_jobs(body_id, fit_mode, status)")
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS poi_transition_cache (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            poi_id INTEGER NOT NULL,
+            body_id INTEGER NOT NULL REFERENCES bodies(id) ON DELETE CASCADE,
+            fit_id INTEGER NOT NULL REFERENCES fits(id) ON DELETE CASCADE,
+            model_mode TEXT NOT NULL DEFAULT 'approved',
+            lat REAL NOT NULL,
+            lon REAL NOT NULL,
+            threshold_deg REAL NOT NULL DEFAULT 0.0,
+            cache_version TEXT NOT NULL,
+            window_start_utc TEXT NOT NULL,
+            window_end_utc TEXT NOT NULL,
+            checked_until_utc TEXT NOT NULL,
+            requested_lookahead_hours REAL NOT NULL,
+            max_extended_hours REAL NOT NULL,
+            transitions_json TEXT NOT NULL,
+            search_meta_json TEXT,
+            created_at_utc TEXT NOT NULL,
+            refreshed_at_utc TEXT NOT NULL
+        )
+        """
+    )
+    con.execute("CREATE INDEX IF NOT EXISTS idx_poi_transition_cache_lookup ON poi_transition_cache(poi_id, fit_id, model_mode, cache_version)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_poi_transition_cache_body_fit ON poi_transition_cache(body_id, fit_id)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_poi_transition_cache_checked ON poi_transition_cache(checked_until_utc)")
+    if hasattr(dbmod, "dedupe_duplicate_bodies"):
+        dbmod.dedupe_duplicate_bodies(con)
+    if hasattr(dbmod, "dedupe_active_fits"):
+        dbmod.dedupe_active_fits(con)
+    con.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_bodies_system_name_norm_unique ON bodies(system_id, lower(trim(name)))")
 
 
 def connect() -> sqlite3.Connection:
@@ -629,6 +696,319 @@ def get_poi_row_or_404(con: sqlite3.Connection, poi_id: int) -> sqlite3.Row:
     if not row:
         raise HTTPException(status_code=404, detail=f"POI id not found: {poi_id}")
     return row
+
+
+def poi_transition_cache_lookup(
+    con: sqlite3.Connection,
+    poi_id: int,
+    body_id: int,
+    fit_id: int,
+    model_mode: str,
+    lat: float,
+    lon: float,
+    threshold_deg: float = 0.0,
+) -> Optional[sqlite3.Row]:
+    return con.execute(
+        """
+        SELECT *
+          FROM poi_transition_cache
+         WHERE poi_id = ?
+           AND body_id = ?
+           AND fit_id = ?
+           AND model_mode = ?
+           AND cache_version = ?
+           AND ABS(lat - ?) < 0.000001
+           AND ABS(lon - ?) < 0.000001
+           AND ABS(threshold_deg - ?) < 0.000001
+         ORDER BY refreshed_at_utc DESC, id DESC
+         LIMIT 1
+        """,
+        (poi_id, body_id, fit_id, model_mode, POI_TRANSITION_CACHE_VERSION, lat, lon, threshold_deg),
+    ).fetchone()
+
+
+def serialize_transition_crossings(crossings: List[tuple[Any, str]]) -> str:
+    return dbmod.json_dumps([
+        {"time_utc": model.format_utc(t), "kind": str(kind)}
+        for t, kind in crossings
+    ])
+
+
+def parse_transition_crossings(value: str) -> List[tuple[Any, str]]:
+    try:
+        rows = json.loads(value or "[]")
+    except Exception:
+        rows = []
+    out = []
+    for item in rows:
+        try:
+            kind = str(item.get("kind") or "").strip().lower()
+            if kind not in {"rise", "set"}:
+                continue
+            out.append((model.parse_utc(str(item.get("time_utc"))), kind))
+        except Exception:
+            continue
+    return model.unique_crossings(out)
+
+
+def parse_cache_json(value: Optional[str]) -> Dict[str, Any]:
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(value)
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+def cache_checked_until(row: sqlite3.Row) -> Any:
+    return model.parse_utc(str(row["checked_until_utc"]))
+
+
+def poi_transition_cache_is_usable(row: sqlite3.Row, target_dt: Any, prediction_hours: float, max_extended_hours: float) -> tuple[bool, str]:
+    try:
+        window_start = model.parse_utc(str(row["window_start_utc"]))
+        checked_until = cache_checked_until(row)
+    except Exception:
+        return False, "bad_cache_timestamp"
+    if target_dt < window_start:
+        return False, "target_before_cache_window"
+    requested_end = target_dt + timedelta(hours=float(prediction_hours))
+    if checked_until < requested_end:
+        return False, "cache_does_not_cover_requested_window"
+
+    crossings = parse_transition_crossings(str(row["transitions_json"]))
+    future_crossings = [
+        (ct, kind)
+        for ct, kind in crossings
+        if (ct - target_dt).total_seconds() >= -1.0
+    ]
+    window_crossings = [
+        (ct, kind)
+        for ct, kind in future_crossings
+        if ct <= requested_end + timedelta(seconds=1.0)
+    ]
+    needs_extended_context = len(window_crossings) == 0 or model.daylight_cycle_summary(window_crossings) is None
+    if needs_extended_context:
+        if len(future_crossings) >= 1 and model.daylight_cycle_summary(future_crossings) is not None:
+            return True, "usable"
+        # If the cache has no future crossings, it still proves continuous
+        # day/night through checked_until.  Reuse it for the covered window and
+        # let crossing_search_hours report the actual remaining checked span.
+        return True, "usable"
+    return True, "usable"
+
+
+def poi_transition_cache_soft_refresh_reason(row: sqlite3.Row, target_dt: Any, prediction_hours: float) -> Optional[str]:
+    try:
+        window_end = model.parse_utc(str(row["window_end_utc"]))
+        checked_until = cache_checked_until(row)
+        refreshed_at = model.parse_utc(str(row["refreshed_at_utc"]))
+    except Exception:
+        return "bad_cache_timestamp"
+    if POI_CACHE_MAX_AGE_HOURS > 0:
+        age_hours = (model.parse_utc(dbmod.utc_now()) - refreshed_at).total_seconds() / 3600.0
+        if age_hours > POI_CACHE_MAX_AGE_HOURS:
+            return "soft_refresh_age"
+    remaining_hours = (checked_until - target_dt).total_seconds() / 3600.0
+    extended_cache = checked_until > window_end + timedelta(hours=1.0)
+    if extended_cache:
+        if remaining_hours < POI_CACHE_EXTENDED_REFRESH_MARGIN_HOURS:
+            return "soft_refresh_extended_margin"
+        return None
+    soft_floor = max(float(prediction_hours), POI_CACHE_NORMAL_LOOKAHEAD_HOURS) + POI_CACHE_REFRESH_MARGIN_HOURS
+    if remaining_hours < soft_floor:
+        return "soft_refresh_margin"
+    return None
+
+
+def poi_transition_cache_needs_soft_refresh(row: sqlite3.Row, target_dt: Any, prediction_hours: float) -> bool:
+    return poi_transition_cache_soft_refresh_reason(row, target_dt, prediction_hours) is not None
+
+
+def build_poi_transition_cache_payload(
+    fitted: model.FittedModel,
+    target_dt: Any,
+    lat: float,
+    lon: float,
+    prediction_hours: float,
+    fallback_transitions: int,
+    max_extended_hours: float,
+) -> Dict[str, Any]:
+    normal_lookahead = max(float(prediction_hours), POI_CACHE_NORMAL_LOOKAHEAD_HOURS) + POI_CACHE_PREFETCH_HOURS
+    window_start = target_dt - timedelta(hours=POI_CACHE_PAST_MARGIN_HOURS)
+    search_hours = normal_lookahead + POI_CACHE_PAST_MARGIN_HOURS
+    # Extended coverage is requested relative to target_dt, but the cache scan
+    # starts slightly before target_dt so near-present crossings remain useful.
+    # Include that past margin or continuous-day/night POIs will refresh forever
+    # because checked_until ends just short of target_dt + max_extended_hours.
+    target_extended_hours = min(float(max_extended_hours), POI_CACHE_MAX_EXTENDED_HOURS)
+    cache_max_extended = max(search_hours, target_extended_hours + POI_CACHE_PAST_MARGIN_HOURS)
+    (
+        _display_crossings,
+        _window_crossings,
+        cycle_crossings,
+        crossing_search_hours,
+        _crossings_extended,
+        _cycle_search_extended,
+        _daylight_summary_source,
+        search_meta,
+    ) = model.find_crossings_for_prediction(
+        fitted,
+        window_start,
+        lat,
+        lon,
+        threshold=0.0,
+        prediction_hours=search_hours,
+        max_crossings=POI_CACHE_MAX_CROSSINGS,
+        min_fallback_transitions=fallback_transitions,
+        max_extended_hours=cache_max_extended,
+    )
+    window_end = window_start + timedelta(hours=search_hours)
+    checked_until = window_start + timedelta(hours=crossing_search_hours)
+    crossings = model.unique_crossings(cycle_crossings)
+    return {
+        "window_start_utc": model.format_utc(window_start),
+        "window_end_utc": model.format_utc(window_end),
+        "checked_until_utc": model.format_utc(checked_until),
+        "requested_lookahead_hours": float(search_hours),
+        "max_extended_hours": float(cache_max_extended),
+        "transitions_json": serialize_transition_crossings(crossings),
+        "search_meta_json": dbmod.json_dumps(search_meta),
+        "crossing_count": int(len(crossings)),
+    }
+
+
+def store_poi_transition_cache(
+    con: sqlite3.Connection,
+    poi_id: int,
+    body_id: int,
+    fit_id: int,
+    model_mode: str,
+    lat: float,
+    lon: float,
+    payload: Dict[str, Any],
+    threshold_deg: float = 0.0,
+) -> sqlite3.Row:
+    now = dbmod.utc_now()
+    with WRITE_LOCK:
+        begin_write_transaction(con)
+        con.execute(
+            """
+            DELETE FROM poi_transition_cache
+             WHERE poi_id = ? AND fit_id = ? AND model_mode = ? AND cache_version = ?
+            """,
+            (poi_id, fit_id, model_mode, POI_TRANSITION_CACHE_VERSION),
+        )
+        cur = con.execute(
+            """
+            INSERT INTO poi_transition_cache(
+                poi_id, body_id, fit_id, model_mode, lat, lon, threshold_deg,
+                cache_version, window_start_utc, window_end_utc, checked_until_utc,
+                requested_lookahead_hours, max_extended_hours, transitions_json,
+                search_meta_json, created_at_utc, refreshed_at_utc
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                poi_id,
+                body_id,
+                fit_id,
+                model_mode,
+                lat,
+                lon,
+                threshold_deg,
+                POI_TRANSITION_CACHE_VERSION,
+                payload["window_start_utc"],
+                payload["window_end_utc"],
+                payload["checked_until_utc"],
+                payload["requested_lookahead_hours"],
+                payload["max_extended_hours"],
+                payload["transitions_json"],
+                payload.get("search_meta_json"),
+                now,
+                now,
+            ),
+        )
+        con.commit()
+    return con.execute("SELECT * FROM poi_transition_cache WHERE id = ?", (int(cur.lastrowid),)).fetchone()
+
+
+def get_or_refresh_poi_transition_cache(
+    con: sqlite3.Connection,
+    poi_row: sqlite3.Row,
+    fitted: model.FittedModel,
+    fit_id: int,
+    model_mode: str,
+    target_dt: Any,
+    prediction_hours: float,
+    fallback_transitions: int,
+    max_extended_hours: float,
+) -> tuple[Optional[List[tuple[Any, str]]], Optional[float], Optional[Dict[str, Any]], Dict[str, Any]]:
+    if not POI_TRANSITION_CACHE_ENABLED:
+        return None, None, None, {"status": "disabled", "enabled": False}
+
+    poi_id = int(poi_row["id"])
+    body_id = int(poi_row["body_id"])
+    lat = float(poi_row["lat"])
+    lon = float(poi_row["lon"])
+    threshold_deg = 0.0
+    row = poi_transition_cache_lookup(con, poi_id, body_id, int(fit_id), model_mode, lat, lon, threshold_deg)
+    refresh_reason = "miss"
+    if row is not None:
+        usable, reason = poi_transition_cache_is_usable(row, target_dt, prediction_hours, max_extended_hours)
+        soft_reason = poi_transition_cache_soft_refresh_reason(row, target_dt, prediction_hours) if usable else None
+        if usable and soft_reason is None:
+            checked_until = cache_checked_until(row)
+            return (
+                parse_transition_crossings(str(row["transitions_json"])),
+                max(float(prediction_hours), (checked_until - target_dt).total_seconds() / 3600.0),
+                parse_cache_json(row["search_meta_json"]),
+                {
+                    "status": "hit",
+                    "enabled": True,
+                    "poi_id": poi_id,
+                    "fit_id": int(fit_id),
+                    "model_mode": model_mode,
+                    "cache_version": POI_TRANSITION_CACHE_VERSION,
+                    "window_start_utc": row["window_start_utc"],
+                    "window_end_utc": row["window_end_utc"],
+                    "checked_until_utc": row["checked_until_utc"],
+                    "refreshed_at_utc": row["refreshed_at_utc"],
+                    "crossing_count": len(parse_transition_crossings(str(row["transitions_json"]))),
+                },
+            )
+        refresh_reason = soft_reason or reason
+
+    payload = build_poi_transition_cache_payload(
+        fitted,
+        target_dt,
+        lat,
+        lon,
+        prediction_hours,
+        fallback_transitions,
+        max_extended_hours,
+    )
+    row = store_poi_transition_cache(con, poi_id, body_id, int(fit_id), model_mode, lat, lon, payload, threshold_deg)
+    checked_until = cache_checked_until(row)
+    return (
+        parse_transition_crossings(str(row["transitions_json"])),
+        max(float(prediction_hours), (checked_until - target_dt).total_seconds() / 3600.0),
+        parse_cache_json(row["search_meta_json"]),
+        {
+            "status": "refreshed" if refresh_reason != "miss" else "miss_refreshed",
+            "enabled": True,
+            "refresh_reason": refresh_reason,
+            "poi_id": poi_id,
+            "fit_id": int(fit_id),
+            "model_mode": model_mode,
+            "cache_version": POI_TRANSITION_CACHE_VERSION,
+            "window_start_utc": row["window_start_utc"],
+            "window_end_utc": row["window_end_utc"],
+            "checked_until_utc": row["checked_until_utc"],
+            "refreshed_at_utc": row["refreshed_at_utc"],
+            "crossing_count": int(payload.get("crossing_count") or 0),
+        },
+    )
 
 
 def insert_audit(con: sqlite3.Connection, entity_type: str, entity_id: int, action: str, old: Optional[Dict[str, Any]], new: Optional[Dict[str, Any]], actor: str = "api") -> None:
@@ -1223,7 +1603,7 @@ def start_provisional_fit_worker() -> None:
 def root() -> Dict[str, Any]:
     return {
         "name": "Elite Dangerous Day/Night Calculator API",
-        "version": "0.212",
+        "version": "0.213",
         "db_path": DB_PATH,
         "docs": "/docs",
     }
@@ -1265,9 +1645,23 @@ def summary() -> Dict[str, Any]:
                        SUM(CASE WHEN review_status IN ('new','needs_check') THEN 1 ELSE 0 END) AS unreviewed
                   FROM observations GROUP BY body_id
             ), active_approved AS (
-                SELECT * FROM fits WHERE is_active = 1 AND fit_mode = 'approved'
+                SELECT f.*
+                  FROM fits f
+                  JOIN (
+                        SELECT body_id, MAX(id) AS id
+                          FROM fits
+                         WHERE is_active = 1 AND fit_mode = 'approved' AND fit_status = 'ok'
+                         GROUP BY body_id
+                  ) latest ON latest.id = f.id
             ), active_provisional AS (
-                SELECT * FROM fits WHERE is_active = 1 AND fit_mode = 'provisional'
+                SELECT f.*
+                  FROM fits f
+                  JOIN (
+                        SELECT body_id, MAX(id) AS id
+                          FROM fits
+                         WHERE is_active = 1 AND fit_mode = 'provisional' AND fit_status = 'ok'
+                         GROUP BY body_id
+                  ) latest ON latest.id = f.id
             )
             SELECT s.name AS system_name, b.id AS body_pk, b.name AS body_name,
                    COALESCE(obs.observations, 0) AS observations,
@@ -1313,13 +1707,15 @@ def enrich_system_search_model_health(con: sqlite3.Connection, system_rows: List
              WHERE target_type = 'sun'
              GROUP BY body_id
         ), active_approved AS (
-            SELECT body_id, id AS approved_fit_id
+            SELECT body_id, MAX(id) AS approved_fit_id
               FROM fits
              WHERE is_active = 1 AND fit_mode = 'approved' AND fit_status = 'ok'
+             GROUP BY body_id
         ), active_provisional AS (
-            SELECT body_id, id AS provisional_fit_id
+            SELECT body_id, MAX(id) AS provisional_fit_id
               FROM fits
              WHERE is_active = 1 AND fit_mode = 'provisional' AND fit_status = 'ok'
+             GROUP BY body_id
         ), poi AS (
             SELECT body_id,
                    COUNT(*) AS poi_count,
@@ -1444,11 +1840,23 @@ def search_systems(
                  WHERE target_type = 'sun'
                  GROUP BY body_id
             ), active_approved AS (
-                SELECT * FROM fits
-                 WHERE is_active = 1 AND fit_mode = 'approved' AND fit_status = 'ok'
+                SELECT f.*
+                  FROM fits f
+                  JOIN (
+                        SELECT body_id, MAX(id) AS id
+                          FROM fits
+                         WHERE is_active = 1 AND fit_mode = 'approved' AND fit_status = 'ok'
+                         GROUP BY body_id
+                  ) latest ON latest.id = f.id
             ), active_provisional AS (
-                SELECT * FROM fits
-                 WHERE is_active = 1 AND fit_mode = 'provisional' AND fit_status = 'ok'
+                SELECT f.*
+                  FROM fits f
+                  JOIN (
+                        SELECT body_id, MAX(id) AS id
+                          FROM fits
+                         WHERE is_active = 1 AND fit_mode = 'provisional' AND fit_status = 'ok'
+                         GROUP BY body_id
+                  ) latest ON latest.id = f.id
             ), fit_err AS (
                 SELECT fit_id,
                        MAX(ABS(altitude_error_deg)) AS max_altitude_error_deg
@@ -1702,9 +2110,23 @@ def get_bodies(system_id: int, only_landable: bool = False) -> Dict[str, Any]:
                        SUM(CASE WHEN review_status IN ('new','needs_check') THEN 1 ELSE 0 END) AS unreviewed
                   FROM observations GROUP BY body_id
             ), active_approved AS (
-                SELECT * FROM fits WHERE is_active = 1 AND fit_mode = 'approved'
+                SELECT f.*
+                  FROM fits f
+                  JOIN (
+                        SELECT body_id, MAX(id) AS id
+                          FROM fits
+                         WHERE is_active = 1 AND fit_mode = 'approved' AND fit_status = 'ok'
+                         GROUP BY body_id
+                  ) latest ON latest.id = f.id
             ), active_provisional AS (
-                SELECT * FROM fits WHERE is_active = 1 AND fit_mode = 'provisional'
+                SELECT f.*
+                  FROM fits f
+                  JOIN (
+                        SELECT body_id, MAX(id) AS id
+                          FROM fits
+                         WHERE is_active = 1 AND fit_mode = 'provisional' AND fit_status = 'ok'
+                         GROUP BY body_id
+                  ) latest ON latest.id = f.id
             )
             SELECT b.*, s.name AS system_name, s.system_address,
                    COALESCE(obs.observations, 0) AS observations,
@@ -1856,12 +2278,103 @@ def get_fit(body_id: int, include_residuals: bool = True, model_mode: str = "app
     return data
 
 
+def build_prediction_response(
+    con: sqlite3.Connection,
+    body_id: int,
+    time: str,
+    prediction_hours: float,
+    model_mode: str,
+    fallback_transitions: int,
+    max_extended_hours: float,
+    lat: Optional[float] = None,
+    lon: Optional[float] = None,
+    poi_id: Optional[int] = None,
+) -> Dict[str, Any]:
+    get_body_row_or_404(con, body_id)
+    mode = (model_mode or "approved").strip().lower()
+    if mode not in {"approved", "provisional"}:
+        raise HTTPException(status_code=400, detail="model_mode must be approved or provisional")
+
+    poi_row: Optional[sqlite3.Row] = None
+    if poi_id is not None:
+        poi_row = get_poi_row_or_404(con, int(poi_id))
+        if int(poi_row["body_id"]) != int(body_id):
+            raise HTTPException(status_code=400, detail="poi_id does not belong to this body")
+        poi_lat = float(poi_row["lat"])
+        poi_lon = float(poi_row["lon"])
+        if lat is not None and abs(float(lat) - poi_lat) > 0.00001:
+            raise HTTPException(status_code=400, detail="lat does not match poi_id; omit lat/lon or use a manual prediction without poi_id")
+        if lon is not None and abs(float(lon) - poi_lon) > 0.00001:
+            raise HTTPException(status_code=400, detail="lon does not match poi_id; omit lat/lon or use a manual prediction without poi_id")
+        lat = poi_lat
+        lon = poi_lon
+
+    if lat is None or lon is None:
+        raise HTTPException(status_code=400, detail="lat and lon are required unless poi_id is provided")
+
+    system, fitted, fit_id = dbmod.model_from_active_fit(con, body_id, fit_mode=mode)
+    target_dt = model.parse_utc(time)
+    cached_crossings = None
+    cached_crossing_search_hours = None
+    cached_search_meta = None
+    cache_info: Dict[str, Any] = {"status": "not_applicable", "enabled": POI_TRANSITION_CACHE_ENABLED}
+    if poi_row is not None:
+        cached_crossings, cached_crossing_search_hours, cached_search_meta, cache_info = get_or_refresh_poi_transition_cache(
+            con,
+            poi_row,
+            fitted,
+            int(fit_id),
+            mode,
+            target_dt,
+            prediction_hours,
+            fallback_transitions,
+            max_extended_hours,
+        )
+
+    prediction = model.calculate_prediction(
+        fitted,
+        system,
+        target_dt,
+        float(lat),
+        float(lon),
+        prediction_hours=prediction_hours,
+        min_fallback_transitions=fallback_transitions,
+        max_extended_prediction_hours=max_extended_hours,
+        cached_crossings=cached_crossings,
+        cached_crossing_search_hours=cached_crossing_search_hours,
+        cached_search_meta=cached_search_meta,
+    )
+    prediction["model_mode"] = mode
+    review_meta = fit_review_metadata(con, int(fit_id))
+    prediction.update(review_meta)
+    prediction["model_confidence"] = model.model_confidence_dict(
+        fitted,
+        target_time=target_dt,
+        model_mode=mode,
+        includes_unreviewed=bool(review_meta.get("fit_uses_unverified_data")),
+    )
+    prediction["poi_transition_cache"] = cache_info
+    if poi_row is not None:
+        prediction["poi_id"] = int(poi_row["id"])
+        prediction["poi_name"] = str(poi_row["name"])
+    with WRITE_LOCK:
+        begin_write_transaction(con)
+        con.execute(
+            "INSERT INTO prediction_cache(body_id, fit_id, lat, lon, target_time_utc, prediction_json, created_at_utc) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (body_id, fit_id, float(lat), float(lon), prediction["target_time_utc"], dbmod.json_dumps(prediction), dbmod.utc_now()),
+        )
+        con.commit()
+    prediction["fit_id"] = fit_id
+    return prediction
+
+
 @app.get("/api/bodies/{body_id}/prediction")
 def predict(
     body_id: int,
-    lat: float,
-    lon: float,
-    time: str,
+    time: str = Query(...),
+    lat: Optional[float] = Query(None),
+    lon: Optional[float] = Query(None),
+    poi_id: Optional[int] = Query(None),
     prediction_hours: float = Query(72.0, ge=1.0, le=168.0),
     model_mode: str = "approved",
     fallback_transitions: int = Query(model.DEFAULT_MIN_FALLBACK_TRANSITIONS, ge=1, le=12),
@@ -1869,46 +2382,54 @@ def predict(
 ) -> Dict[str, Any]:
     con = connect()
     try:
-        get_body_row_or_404(con, body_id)
-        mode = (model_mode or "approved").strip().lower()
-        if mode not in {"approved", "provisional"}:
-            raise HTTPException(status_code=400, detail="model_mode must be approved or provisional")
-        system, fitted, fit_id = dbmod.model_from_active_fit(con, body_id, fit_mode=mode)
-        target_dt = model.parse_utc(time)
-        prediction = model.calculate_prediction(
-            fitted,
-            system,
-            target_dt,
-            lat,
-            lon,
-            prediction_hours=prediction_hours,
-            min_fallback_transitions=fallback_transitions,
-            max_extended_prediction_hours=max_extended_hours,
+        return build_prediction_response(
+            con,
+            body_id,
+            time,
+            prediction_hours,
+            model_mode,
+            fallback_transitions,
+            max_extended_hours,
+            lat=lat,
+            lon=lon,
+            poi_id=poi_id,
         )
-        prediction["model_mode"] = mode
-        review_meta = fit_review_metadata(con, int(fit_id))
-        prediction.update(review_meta)
-        prediction["model_confidence"] = model.model_confidence_dict(
-            fitted,
-            target_time=target_dt,
-            model_mode=mode,
-            includes_unreviewed=bool(review_meta.get("fit_uses_unverified_data")),
-        )
-        with WRITE_LOCK:
-            begin_write_transaction(con)
-            con.execute(
-                "INSERT INTO prediction_cache(body_id, fit_id, lat, lon, target_time_utc, prediction_json, created_at_utc) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (body_id, fit_id, lat, lon, prediction["target_time_utc"], dbmod.json_dumps(prediction), dbmod.utc_now()),
-            )
-            con.commit()
     except HTTPException:
         raise
     except Exception as exc:
         raise http_error_from_exception(exc)
     finally:
         con.close()
-    prediction["fit_id"] = fit_id
-    return prediction
+
+
+@app.get("/api/pois/{poi_id}/prediction")
+def predict_poi(
+    poi_id: int,
+    time: str = Query(...),
+    prediction_hours: float = Query(72.0, ge=1.0, le=168.0),
+    model_mode: str = "approved",
+    fallback_transitions: int = Query(model.DEFAULT_MIN_FALLBACK_TRANSITIONS, ge=1, le=12),
+    max_extended_hours: float = Query(model.DEFAULT_MAX_EXTENDED_PREDICTION_HOURS, ge=1.0, le=8760.0),
+) -> Dict[str, Any]:
+    con = connect()
+    try:
+        poi_row = get_poi_row_or_404(con, int(poi_id))
+        return build_prediction_response(
+            con,
+            int(poi_row["body_id"]),
+            time,
+            prediction_hours,
+            model_mode,
+            fallback_transitions,
+            max_extended_hours,
+            poi_id=int(poi_id),
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise http_error_from_exception(exc)
+    finally:
+        con.close()
 
 
 @app.post("/api/bodies/{body_id}/observations")

@@ -73,7 +73,7 @@ except Exception as exc:  # pragma: no cover
         f"Import error: {exc}"
     ) from exc
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 MODEL_VERSION = "v16"
 
 SPANSH_API_BASE = "https://www.spansh.co.uk/api"
@@ -841,6 +841,30 @@ def init_db(db_path: str) -> None:
             created_at_utc TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS poi_transition_cache (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            poi_id INTEGER NOT NULL,
+            body_id INTEGER NOT NULL REFERENCES bodies(id) ON DELETE CASCADE,
+            fit_id INTEGER NOT NULL REFERENCES fits(id) ON DELETE CASCADE,
+            model_mode TEXT NOT NULL DEFAULT 'approved',
+            lat REAL NOT NULL,
+            lon REAL NOT NULL,
+            threshold_deg REAL NOT NULL DEFAULT 0.0,
+            cache_version TEXT NOT NULL,
+            window_start_utc TEXT NOT NULL,
+            window_end_utc TEXT NOT NULL,
+            checked_until_utc TEXT NOT NULL,
+            requested_lookahead_hours REAL NOT NULL,
+            max_extended_hours REAL NOT NULL,
+            transitions_json TEXT NOT NULL,
+            search_meta_json TEXT,
+            created_at_utc TEXT NOT NULL,
+            refreshed_at_utc TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_poi_transition_cache_lookup ON poi_transition_cache(poi_id, fit_id, model_mode, cache_version);
+        CREATE INDEX IF NOT EXISTS idx_poi_transition_cache_body_fit ON poi_transition_cache(body_id, fit_id);
+        CREATE INDEX IF NOT EXISTS idx_poi_transition_cache_checked ON poi_transition_cache(checked_until_utc);
+
         CREATE TABLE IF NOT EXISTS audit_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             entity_type TEXT NOT NULL,
@@ -860,6 +884,9 @@ def init_db(db_path: str) -> None:
     ensure_illumination_columns(con)
     ensure_fit_mode_columns(con)
     ensure_automation_columns(con)
+    dedupe_duplicate_bodies(con)
+    dedupe_active_fits(con)
+    con.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_bodies_system_name_norm_unique ON bodies(system_id, lower(trim(name)))")
     con.execute("INSERT OR REPLACE INTO schema_meta(key, value) VALUES (?, ?)", ("schema_version", str(SCHEMA_VERSION)))
     con.execute("INSERT OR REPLACE INTO schema_meta(key, value) VALUES (?, ?)", ("model_version", MODEL_VERSION))
     con.commit()
@@ -882,20 +909,249 @@ def ensure_system(con: sqlite3.Connection, name: str, system_address: Optional[i
     return int(cur.lastrowid)
 
 
+def _table_exists(con: sqlite3.Connection, table_name: str) -> bool:
+    return con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table_name,),
+    ).fetchone() is not None
+
+
+def _table_columns(con: sqlite3.Connection, table_name: str) -> List[str]:
+    if not _table_exists(con, table_name):
+        return []
+    return [str(r[1]) for r in con.execute(f"PRAGMA table_info({table_name})").fetchall()]
+
+
+def _missing_body_value(value: Any) -> bool:
+    return value is None or (isinstance(value, str) and value.strip() == "")
+
+
+def _body_reference_targets(con: sqlite3.Connection) -> List[Tuple[str, str]]:
+    candidates = [
+        ("observations", "body_id"),
+        ("observations", "target_body_id"),
+        ("fits", "body_id"),
+        ("prediction_cache", "body_id"),
+        ("poi_transition_cache", "body_id"),
+        ("background_fit_jobs", "body_id"),
+        ("body_pois", "body_id"),
+    ]
+    out: List[Tuple[str, str]] = []
+    for table, column in candidates:
+        if column in _table_columns(con, table):
+            out.append((table, column))
+    return out
+
+
+def _body_link_count(con: sqlite3.Connection, body_pk: int) -> int:
+    total = 0
+    for table, column in _body_reference_targets(con):
+        row = con.execute(f"SELECT COUNT(*) FROM {table} WHERE {column} = ?", (body_pk,)).fetchone()
+        total += 0 if row is None else int(row[0])
+    return total
+
+
+def _body_merge_score(con: sqlite3.Connection, row: sqlite3.Row) -> Tuple[int, int, int, int, str, int]:
+    data = dict(row)
+    completeness = sum(0 if _missing_body_value(v) else 1 for v in data.values())
+    updated = str(data.get("updated_at_utc") or data.get("created_at_utc") or "")
+    return (
+        _body_link_count(con, int(data["id"])),
+        1 if not _missing_body_value(data.get("body_id")) else 0,
+        1 if not _missing_body_value(data.get("body_id64")) else 0,
+        completeness,
+        updated,
+        -int(data["id"]),
+    )
+
+
+def _deactivate_extra_active_fits_for_body(con: sqlite3.Connection, body_pk: int) -> None:
+    dedupe_active_fits(con, body_pk)
+
+
+def dedupe_active_fits(con: sqlite3.Connection, body_pk: Optional[int] = None) -> int:
+    """Keep only the newest active fit per body/mode.
+
+    Older versions and interrupted jobs can leave more than one active fit for
+    the same body/mode.  List pages join active fits, so duplicate active rows
+    can render a body more than once even when the body table is clean.
+    """
+    fit_cols = set(_table_columns(con, "fits"))
+    if not {"body_id", "fit_mode", "is_active", "id"}.issubset(fit_cols):
+        return 0
+    params: List[Any] = []
+    where = "WHERE is_active = 1"
+    if body_pk is not None:
+        where += " AND body_id = ?"
+        params.append(body_pk)
+    rows = con.execute(
+        f"""
+        SELECT body_id, fit_mode, MAX(id) AS keep_fit_id, COUNT(*) AS active_count
+          FROM fits
+          {where}
+         GROUP BY body_id, fit_mode
+        HAVING COUNT(*) > 1
+        """,
+        params,
+    ).fetchall()
+    deactivated = 0
+    for row in rows:
+        con.execute(
+            "UPDATE fits SET is_active = 0 WHERE body_id = ? AND fit_mode = ? AND is_active = 1 AND id <> ?",
+            (int(row[0]), row[1], int(row[2])),
+        )
+        deactivated += int(row[3]) - 1
+    return deactivated
+
+
+def _merge_body_rows(con: sqlite3.Connection, keep_body_pk: int, duplicate_body_pk: int, reason: str) -> None:
+    if keep_body_pk == duplicate_body_pk:
+        return
+    previous_factory = con.row_factory
+    con.row_factory = sqlite3.Row
+    try:
+        keep = con.execute("SELECT * FROM bodies WHERE id = ?", (keep_body_pk,)).fetchone()
+        duplicate = con.execute("SELECT * FROM bodies WHERE id = ?", (duplicate_body_pk,)).fetchone()
+        if keep is None or duplicate is None:
+            return
+        keep_data = dict(keep)
+        duplicate_data = dict(duplicate)
+        now = utc_now()
+
+        for table, column in _body_reference_targets(con):
+            con.execute(f"UPDATE {table} SET {column} = ? WHERE {column} = ?", (keep_body_pk, duplicate_body_pk))
+
+        con.execute("DELETE FROM bodies WHERE id = ?", (duplicate_body_pk,))
+
+        updates: Dict[str, Any] = {}
+        body_cols = _table_columns(con, "bodies")
+        skip = {"id", "system_id", "name", "created_at_utc"}
+        for col in body_cols:
+            if col in skip:
+                continue
+            if col == "updated_at_utc":
+                updates[col] = now
+                continue
+            if _missing_body_value(keep_data.get(col)) and not _missing_body_value(duplicate_data.get(col)):
+                updates[col] = duplicate_data.get(col)
+        if updates:
+            assignments = ", ".join(f"{col} = ?" for col in updates)
+            con.execute(
+                f"UPDATE bodies SET {assignments} WHERE id = ?",
+                [*updates.values(), keep_body_pk],
+            )
+        _deactivate_extra_active_fits_for_body(con, keep_body_pk)
+        if _table_exists(con, "audit_log"):
+            con.execute(
+                """
+                INSERT INTO audit_log(entity_type, entity_id, action, old_json, new_json, created_at_utc)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "body",
+                    keep_body_pk,
+                    reason,
+                    json_dumps({"removed_duplicate_body_id": duplicate_body_pk, "duplicate_name": duplicate_data.get("name")}),
+                    json_dumps({"kept_body_id": keep_body_pk, "kept_name": keep_data.get("name")}),
+                    now,
+                ),
+            )
+    finally:
+        con.row_factory = previous_factory
+
+
+def dedupe_duplicate_bodies(con: sqlite3.Connection, system_id: Optional[int] = None) -> int:
+    """Merge same-system body rows with the same normalized name.
+
+    Older imports or manual database work could leave case/spacing variants of
+    the same body.  Keep the row with the most linked data, repoint children,
+    and preserve missing body metadata from removed rows.
+    """
+    if not _table_exists(con, "bodies"):
+        return 0
+    previous_factory = con.row_factory
+    con.row_factory = sqlite3.Row
+    try:
+        params: List[Any] = []
+        where = "WHERE name IS NOT NULL AND trim(name) <> ''"
+        if system_id is not None:
+            where += " AND system_id = ?"
+            params.append(system_id)
+        groups = con.execute(
+            f"""
+            SELECT system_id, lower(trim(name)) AS norm_name, COUNT(*) AS c, group_concat(id) AS ids
+              FROM bodies
+              {where}
+             GROUP BY system_id, lower(trim(name))
+            HAVING COUNT(*) > 1
+            """,
+            params,
+        ).fetchall()
+        merged = 0
+        for group in groups:
+            ids = [int(x) for x in str(group["ids"]).split(",") if x]
+            if len(ids) < 2:
+                continue
+            placeholders = ",".join("?" for _ in ids)
+            rows = con.execute(f"SELECT * FROM bodies WHERE id IN ({placeholders})", ids).fetchall()
+            keep = max(rows, key=lambda r: _body_merge_score(con, r))
+            keep_id = int(keep["id"])
+            for row in rows:
+                duplicate_id = int(row["id"])
+                if duplicate_id == keep_id:
+                    continue
+                _merge_body_rows(con, keep_id, duplicate_id, "merge_duplicate_body_name")
+                merged += 1
+        return merged
+    finally:
+        con.row_factory = previous_factory
+
+
 def ensure_body(con: sqlite3.Connection, system_id: int, body_name: str, body_id_value: Optional[int] = None) -> int:
     now = utc_now()
-    row = None
-    if body_id_value is not None:
-        row = con.execute("SELECT id FROM bodies WHERE system_id = ? AND body_id = ?", (system_id, body_id_value)).fetchone()
-    if row is None:
-        row = con.execute("SELECT id FROM bodies WHERE system_id = ? AND lower(name) = lower(?)", (system_id, body_name)).fetchone()
-    if row:
-        return int(row[0])
-    cur = con.execute(
-        "INSERT INTO bodies(system_id, body_id, name, created_at_utc, updated_at_utc) VALUES (?, ?, ?, ?, ?)",
-        (system_id, body_id_value, body_name, now, now),
-    )
-    return int(cur.lastrowid)
+    clean_name = str(body_name or "").strip()
+    if not clean_name:
+        raise ValueError("Body JSON has no body name")
+    previous_factory = con.row_factory
+    con.row_factory = sqlite3.Row
+    try:
+        name_row = con.execute(
+            """
+            SELECT id, body_id FROM bodies
+             WHERE system_id = ? AND lower(trim(name)) = lower(trim(?))
+             ORDER BY CASE WHEN body_id IS NULL THEN 1 ELSE 0 END, id
+             LIMIT 1
+            """,
+            (system_id, clean_name),
+        ).fetchone()
+        id_row = None
+        if body_id_value is not None:
+            id_row = con.execute(
+                "SELECT id, body_id FROM bodies WHERE system_id = ? AND body_id = ?",
+                (system_id, body_id_value),
+            ).fetchone()
+        if name_row is not None and id_row is not None and int(name_row["id"]) != int(id_row["id"]):
+            _merge_body_rows(con, int(name_row["id"]), int(id_row["id"]), "merge_body_import_identity")
+            id_row = None
+        row = name_row if name_row is not None else id_row
+        if row:
+            body_pk = int(row["id"])
+            updates: Dict[str, Any] = {"updated_at_utc": now}
+            current_body_id = row["body_id"]
+            if body_id_value is not None and current_body_id is None:
+                updates["body_id"] = body_id_value
+            if name_row is None:
+                updates["name"] = clean_name
+            assignments = ", ".join(f"{col} = ?" for col in updates)
+            con.execute(f"UPDATE bodies SET {assignments} WHERE id = ?", [*updates.values(), body_pk])
+            return body_pk
+        cur = con.execute(
+            "INSERT INTO bodies(system_id, body_id, name, created_at_utc, updated_at_utc) VALUES (?, ?, ?, ?, ?)",
+            (system_id, body_id_value, clean_name, now, now),
+        )
+        return int(cur.lastrowid)
+    finally:
+        con.row_factory = previous_factory
 
 
 def import_system_json(db_path: str, json_path: str) -> int:
@@ -914,6 +1170,7 @@ def import_system_json(db_path: str, json_path: str) -> int:
     con.execute("PRAGMA foreign_keys = ON")
     begin_write_transaction(con)
     system_id = ensure_system(con, name, address)
+    dedupe_duplicate_bodies(con, system_id)
     con.execute(
         """
         UPDATE systems
@@ -1011,6 +1268,7 @@ def import_system_json(db_path: str, json_path: str) -> int:
         "INSERT INTO audit_log(entity_type, entity_id, action, new_json, created_at_utc) VALUES (?, ?, ?, ?, ?)",
         ("system", system_id, "import_compact_system_json", json_dumps({"file": os.path.basename(json_path), "stored_bodies": len(raw_bodies)}), now),
     )
+    dedupe_duplicate_bodies(con, system_id)
     con.commit()
     con.close()
     return system_id
