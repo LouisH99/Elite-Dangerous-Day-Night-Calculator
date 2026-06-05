@@ -1,12 +1,12 @@
 # Elite Dangerous Day/Night Calculator
 
-Current package version: **V0.212**.
+Current package version: **V0.213**.
 
 A community tool for predicting local daylight, sunrise, sunset, and sun elevation on planets and moons in **Elite Dangerous**.
 
 The project lets players add systems/bodies, submit sun observations, review submitted data, fit a prediction model, and use saved Points of Interest (POIs) to quickly check local light conditions.
 
-> **Project status:** early community tool, currently around `V0.212`.
+> **Project status:** early community tool, currently around `V0.213`.
 >
 > **Transparency note:** this is a **vibe-coded / AI-assisted project**. A large part of the design, code structure, debugging, and documentation was created with help from ChatGPT. The model, outputs, and implementation should be treated as experimental and should be validated with real observations.
 
@@ -50,6 +50,7 @@ Players can help by submitting surface observations. Reviewers can approve, reje
 - Beginner-friendly help text for new users
 - Public read-only prediction API at `/public/api/v1/prediction`
 - Prediction lookup by system/body/coordinates, public POI name, or Razz Racing race key
+- Cache-aware POI predictions reuse stored sunrise/sunset transition searches while recalculating current sun position live
 
 ### Public prediction API
 
@@ -159,9 +160,18 @@ ELITE_DAYNIGHT_PUBLIC_REFIT_COOLDOWN=60
 ELITE_DAYNIGHT_ADMIN_FIT_REFRESH_SECONDS=5
 ELITE_DAYNIGHT_AUTOMATION_MODE=shadow
 ELITE_DAYNIGHT_AUTOMATION_BATCH_LIMIT=200
+ELITE_DAYNIGHT_POI_TRANSITION_CACHE_ENABLED=1
+ELITE_DAYNIGHT_POI_CACHE_NORMAL_LOOKAHEAD_HOURS=72
+ELITE_DAYNIGHT_POI_CACHE_PREFETCH_HOURS=24
+ELITE_DAYNIGHT_POI_CACHE_PAST_MARGIN_HOURS=1
+ELITE_DAYNIGHT_POI_CACHE_REFRESH_MARGIN_HOURS=6
+ELITE_DAYNIGHT_POI_CACHE_EXTENDED_REFRESH_MARGIN_HOURS=336
+ELITE_DAYNIGHT_POI_CACHE_MAX_AGE_HOURS=24
+ELITE_DAYNIGHT_POI_CACHE_MAX_EXTENDED_HOURS=720
+ELITE_DAYNIGHT_POI_CACHE_MAX_CROSSINGS=512
 ```
 
-The private API run scripts set the automation defaults if the variables are not already defined.
+The private API run scripts set automation, performance, and POI cache defaults if the variables are not already defined.
 
 To disable public POI submissions:
 
