@@ -1,3 +1,9 @@
+## V0.211
+
+- Public prediction API responses now include the local `body_id` in the `target` object.
+- Public prediction API responses now include the local `poi_id` for POI/race-key predictions, or `null` for manual coordinate predictions.
+- Ambiguous public API POI/race/body lookup responses now include IDs where available to help callers disambiguate.
+
 ## V0.210
 
 - Fixed the systems overview health badges so they use the same current model-confidence and model-note logic as body predictions.

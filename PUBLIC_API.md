@@ -160,6 +160,8 @@ Example shape:
     "model_mode": "approved"
   },
   "target": {
+    "body_id": 123,
+    "poi_id": 55,
     "system_name": "Col 285 Sector XK-O d6-90",
     "body_name": "Col 285 Sector XK-O d6-90 2 a",
     "poi_name": "Race Start",
@@ -197,6 +199,9 @@ Example shape:
   "warnings": []
 }
 ```
+
+
+`target.body_id` and `target.poi_id` are local IDs from this Day/Night Calculator database. `poi_id` is `null` for manual system/body/coordinate predictions and set for POI or race-key predictions.
 
 `model_confidence.note` is intentionally a single short note. It is empty when the model is healthy. When the model needs attention, it gives one short reason such as:
 
@@ -257,7 +262,7 @@ model_unavailable
 prediction_failed
 ```
 
-Ambiguous lookup errors can include a `matches` list to help the caller disambiguate.
+Ambiguous lookup errors can include a `matches` list to help the caller disambiguate. Match objects include `body_id` and/or `poi_id` when available.
 
 ---
 

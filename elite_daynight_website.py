@@ -61,7 +61,7 @@ PUBLIC_POI_SUBMISSIONS_ENABLED = env_bool("ELITE_DAYNIGHT_PUBLIC_POI_SUBMISSIONS
 
 app = FastAPI(
     title="Elite Dangerous Day/Night Calculator Website",
-    version="0.210",
+    version="0.211",
     docs_url=None,
     redoc_url=None,
     openapi_url=None,
@@ -277,7 +277,11 @@ def public_body_matches(row: sqlite3.Row, requested: str) -> bool:
 
 def public_match_summary(row: sqlite3.Row) -> Dict[str, Any]:
     d = public_row_dict(row)
+    body_id_value = d.get("body_pk") or d.get("body_id")
+    poi_id_value = d.get("id") if d.get("poi_name") is not None else d.get("poi_id")
     return {
+        "body_id": None if body_id_value in (None, "") else int(body_id_value),
+        "poi_id": None if poi_id_value in (None, "") else int(poi_id_value),
         "system_name": d.get("system_name"),
         "body_name": d.get("body_name") or d.get("name"),
         "poi_name": d.get("poi_name"),
@@ -314,11 +318,12 @@ def public_resolve_body(system_name: str, body_name_value: str) -> tuple[Optiona
                 "ambiguous_body",
                 "Multiple bodies matched that name. Use the full body name.",
                 400,
-                matches=[{"system_name": m["system_name"], "body_name": m["name"]} for m in matches[:10]],
+                matches=[{"body_id": int(m["id"]), "system_name": m["system_name"], "body_name": m["name"]} for m in matches[:10]],
             )
         b = public_row_dict(matches[0])
         return {
             "body_id": int(b["id"]),
+            "poi_id": None,
             "system_name": b.get("system_name"),
             "body_name": b.get("name"),
         }, None
@@ -359,6 +364,7 @@ def public_resolve_poi(poi_name: str, system_name: str = "", body_name_value: st
         r = public_row_dict(rows[0])
         return {
             "body_id": int(r["body_id"]),
+            "poi_id": int(r["id"]),
             "system_name": r.get("system_name"),
             "body_name": r.get("body_name"),
             "poi_name": r.get("poi_name"),
@@ -404,6 +410,7 @@ def public_resolve_race_key(race_key: str) -> tuple[Optional[Dict[str, Any]], Op
         r = public_row_dict(rows[0])
         return {
             "body_id": int(r["body_id"]),
+            "poi_id": int(r["id"]),
             "system_name": r.get("system_name"),
             "body_name": r.get("body_name"),
             "poi_name": r.get("poi_name"),
@@ -569,6 +576,8 @@ async def public_api_prediction(
             "model_mode": mode,
         },
         "target": {
+            "body_id": None if target.get("body_id") in (None, "") else int(target["body_id"]),
+            "poi_id": None if target.get("poi_id") in (None, "") else int(target["poi_id"]),
             "system_name": target.get("system_name"),
             "body_name": target.get("body_name"),
             "poi_name": target.get("poi_name"),
