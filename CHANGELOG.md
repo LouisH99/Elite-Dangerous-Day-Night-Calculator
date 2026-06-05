@@ -1,3 +1,7 @@
+## V0.214
+
+- Added an About page section for suggestions, bug reports, and feedback with a GitHub Issues link.
+
 ## V0.213
 
 - Fixed system/body list queries so extra active fit rows cannot make one imported target body appear twice.
