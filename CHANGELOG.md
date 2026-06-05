@@ -1,3 +1,14 @@
+## V0.212
+
+- Ported the v0.213 calculation performance work onto the V0.211 UI baseline.
+- Added adaptive coarse/fine scanning for the normal prediction window.
+- Added optional multiprocessing for long extended fallback searches.
+- Added optional multiprocessing for model fitting orientation branches.
+- The background fit queue remains single-job-at-a-time; only the CPU-heavy branch search inside one fit job is parallelized.
+- Fit metadata/report now records parallel fitting status, worker count, evaluated branch count, and elapsed fit seconds.
+- Added private API run-script defaults for prediction search and model-fit performance settings.
+- Kept the V0.211 templates and static website styling unchanged.
+
 ## V0.211
 
 - Public prediction API responses now include the local `body_id` in the `target` object.

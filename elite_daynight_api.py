@@ -71,7 +71,7 @@ ALLOWED_QUALITY = {"high", "medium", "low"}
 
 app = FastAPI(
     title="Elite Dangerous Day/Night Calculator API",
-    version="0.211",
+    version="0.212",
     description="Local-first API for systems, bodies, observations, fitting and prediction.",
 )
 
@@ -1223,7 +1223,7 @@ def start_provisional_fit_worker() -> None:
 def root() -> Dict[str, Any]:
     return {
         "name": "Elite Dangerous Day/Night Calculator API",
-        "version": "0.211",
+        "version": "0.212",
         "db_path": DB_PATH,
         "docs": "/docs",
     }

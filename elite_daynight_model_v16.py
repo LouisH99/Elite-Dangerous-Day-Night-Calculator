@@ -14,11 +14,13 @@ and compact sunrise/sunset/day-period prediction helpers.
 
 from __future__ import annotations
 
+import concurrent.futures
 import csv
 import json
 import math
 import os
 import random
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -124,6 +126,64 @@ VISUAL_DISC_MIN_RADIUS_DEG = 1.0
 # not contain a complete cycle.
 DEFAULT_MIN_FALLBACK_TRANSITIONS = 2
 DEFAULT_MAX_EXTENDED_PREDICTION_HOURS = 30.0 * 24.0
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off", "disabled", ""}
+
+
+def _env_float(name: str, default: float, low: Optional[float] = None, high: Optional[float] = None) -> float:
+    try:
+        value = float(os.environ.get(name, str(default)))
+    except Exception:
+        value = float(default)
+    if low is not None:
+        value = max(float(low), value)
+    if high is not None:
+        value = min(float(high), value)
+    return float(value)
+
+
+def _env_int(name: str, default: int, low: Optional[int] = None, high: Optional[int] = None) -> int:
+    try:
+        value = int(float(os.environ.get(name, str(default))))
+    except Exception:
+        value = int(default)
+    if low is not None:
+        value = max(int(low), value)
+    if high is not None:
+        value = min(int(high), value)
+    return int(value)
+
+
+# Extended fallback search optimisation.  Long no-transition searches can be
+# expensive on Raspberry Pi systems with seasonal 400-700 h day/night cycles.
+# The selected display window remains accurate; the coarse search is refined by
+# bisection whenever a transition is detected.
+PARALLEL_EXTENDED_SEARCH = _env_bool("ELITE_DAYNIGHT_PARALLEL_EXTENDED_SEARCH", True)
+PREDICTION_WORKERS = _env_int("ELITE_DAYNIGHT_PREDICTION_WORKERS", 3, 1, 8)
+PARALLEL_EXTENDED_MIN_HOURS = _env_float("ELITE_DAYNIGHT_PARALLEL_EXTENDED_MIN_HOURS", 168.0, 1.0, 8760.0)
+PARALLEL_CHUNK_OVERLAP_HOURS = _env_float("ELITE_DAYNIGHT_PARALLEL_CHUNK_OVERLAP_HOURS", 2.0, 0.0, 24.0)
+LONG_SEARCH_STEP_SECONDS = _env_float("ELITE_DAYNIGHT_LONG_SEARCH_STEP_SECONDS", 300.0, 30.0, 3600.0)
+
+# Normal prediction window optimisation.  The default 30 s scanner is preserved
+# for very short cycles; slower cycles use a larger coarse step and binary
+# refinement around detected crossings.
+ADAPTIVE_NORMAL_SEARCH = _env_bool("ELITE_DAYNIGHT_ADAPTIVE_NORMAL_SEARCH", True)
+NORMAL_SEARCH_MIN_STEP_SECONDS = _env_float("ELITE_DAYNIGHT_NORMAL_SEARCH_MIN_STEP_SECONDS", 30.0, 1.0, 3600.0)
+NORMAL_SEARCH_MAX_STEP_SECONDS = _env_float("ELITE_DAYNIGHT_NORMAL_SEARCH_MAX_STEP_SECONDS", 300.0, 1.0, 3600.0)
+NORMAL_SEARCH_EARLY_STOP = _env_bool("ELITE_DAYNIGHT_NORMAL_SEARCH_EARLY_STOP", False)
+NORMAL_SEARCH_EARLY_STOP_CROSSINGS = _env_int("ELITE_DAYNIGHT_NORMAL_SEARCH_EARLY_STOP_CROSSINGS", 8, 2, 48)
+
+# Model fitting optimisation.  The 8 spin/lon/orbit-flip orientation branches
+# are independent, so a single background fit job can evaluate them across a few
+# CPU processes while the main process keeps all SQLite writes serialized.
+PARALLEL_FIT = _env_bool("ELITE_DAYNIGHT_PARALLEL_FIT", True)
+FIT_WORKERS = _env_int("ELITE_DAYNIGHT_FIT_WORKERS", 3, 1, 8)
+FIT_PARALLEL_MIN_COMBOS = _env_int("ELITE_DAYNIGHT_FIT_PARALLEL_MIN_COMBOS", 4, 1, 8)
 
 # Fitting evaluates the same observation timestamps thousands of times. Cache the
 # recursive inertial sun vectors by system/body/time/orbit convention so the
@@ -923,6 +983,10 @@ class FittedModel:
     time_weighting_mode: str = "recent_boost"
     recent_boost_max: float = 2.0
     recent_boost_scale_hours: Optional[float] = None
+    fit_parallel_enabled: bool = False
+    fit_workers: int = 1
+    fit_evaluated_combos: int = 0
+    fit_elapsed_seconds: Optional[float] = None
     # "recursive_source" uses the V0.199+ physical/recursive star-vector path.
     # "legacy_distant" keeps the pre-V0.199 empirical fitted distant-star vector.
     sun_geometry_mode: str = "recursive_source"
@@ -1077,6 +1141,162 @@ def model_loss(model: FittedModel, use_heading: bool = True, horizon_for_night_d
 
 
 
+def _split_fit_candidate(x: Iterable[float]) -> Tuple[float, float, float, float]:
+    vals = [float(v) for v in x]
+    return tuple(vals[:4])  # type: ignore[return-value]
+
+
+def _fit_combo_worker(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Fit one independent spin/lon/orbit orientation branch.
+
+    This worker is intentionally pure model code: it receives body/system and
+    observations as serialisable objects and returns the best candidate for this
+    branch.  It never opens or writes SQLite, which keeps background refits safe
+    when ProcessPoolExecutor is used on a Raspberry Pi.
+    """
+    body: Dict[str, Any] = payload["body"]
+    observations: List[Observation] = payload["observations"]
+    system: Optional[Dict[str, Any]] = payload.get("system")
+    use_heading = bool(payload.get("use_heading", True))
+    seed = int(payload.get("seed", 42))
+    combo_index = int(payload.get("combo_index", 0))
+    spin_sign, lon_sign, orbit_flip = tuple(payload["combo"])
+    time_weighting = bool(payload.get("time_weighting", False))
+    time_half_life_hours = float(payload.get("time_half_life_hours", 24.0))
+    time_ref: Optional[datetime] = payload.get("time_ref")
+    time_min_weight = float(payload.get("time_min_weight", 0.05))
+    time_weighting_mode = str(payload.get("time_weighting_mode") or "recent_boost")
+    recent_boost_max = float(payload.get("recent_boost_max", 2.0))
+    recent_boost_scale_hours: Optional[float] = payload.get("recent_boost_scale_hours")
+    sun_geometry_mode = str(payload.get("sun_geometry_mode") or "recursive_source")
+    bounds = [(-math.pi, math.pi), (-math.pi, math.pi), (-math.pi, math.pi), (-math.pi, math.pi)]
+
+    def evaluate_tuple(x: Iterable[float]) -> float:
+        params = _split_fit_candidate(x)
+        m = make_model(
+            body, params, int(spin_sign), int(lon_sign), int(orbit_flip), observations,
+            time_weighting=time_weighting,
+            time_ref=time_ref,
+            time_half_life_hours=time_half_life_hours,
+            time_min_weight=time_min_weight,
+            system=system,
+            time_weighting_mode=time_weighting_mode,
+            recent_boost_max=recent_boost_max,
+            recent_boost_scale_hours=recent_boost_scale_hours,
+            sun_geometry_mode=sun_geometry_mode,
+        )
+        return model_loss(m, use_heading=use_heading)[0]
+
+    if differential_evolution is not None:
+        result = differential_evolution(
+            lambda x: evaluate_tuple(x),
+            bounds,
+            seed=seed,
+            tol=1e-7,
+            popsize=8,
+            maxiter=220,
+            polish=True,
+            workers=1,
+        )
+        params = _split_fit_candidate(result.x)
+    else:
+        # Pure-Python fallback: random global search + simple coordinate pattern search.
+        rng = random.Random(seed + combo_index * 1009)
+        candidates: List[Tuple[float, Tuple[float, float, float, float]]] = []
+        ndim = len(bounds)
+        for _ in range(2500):
+            x = tuple(rng.uniform(bounds[i][0], bounds[i][1]) for i in range(ndim))
+            candidates.append((evaluate_tuple(x), x))
+        candidates.sort(key=lambda p: p[0])
+        best_params = candidates[0][1]
+        best_score = candidates[0][0]
+        for _, start in candidates[:20]:
+            x = list(start)
+            step = math.pi / 3.0
+            best = evaluate_tuple(x)
+            while step > 1e-5:
+                improved = False
+                for j in range(len(bounds)):
+                    for direction in (-1.0, 1.0):
+                        y = x[:]
+                        y[j] += direction * step
+                        if j < 4:
+                            y[j] = (y[j] + math.pi) % (2.0 * math.pi) - math.pi
+                        else:
+                            y[j] = max(bounds[j][0], min(bounds[j][1], y[j]))
+                        val = evaluate_tuple(y)
+                        if val < best:
+                            x, best, improved = y, val, True
+                if not improved:
+                    step *= 0.55
+            if best < best_score:
+                best_score = best
+                best_params = tuple(float(v) for v in x)  # type: ignore[assignment]
+        params = _split_fit_candidate(best_params)
+
+    m = make_model(
+        body, params, int(spin_sign), int(lon_sign), int(orbit_flip), observations,
+        time_weighting=time_weighting,
+        time_ref=time_ref,
+        time_half_life_hours=time_half_life_hours,
+        time_min_weight=time_min_weight,
+        system=system,
+        time_weighting_mode=time_weighting_mode,
+        recent_boost_max=recent_boost_max,
+        recent_boost_scale_hours=recent_boost_scale_hours,
+        sun_geometry_mode=sun_geometry_mode,
+    )
+    score, rms_alt, rms_head = model_loss(m, use_heading=use_heading)
+    return {
+        "score": float(score),
+        "rms_altitude": float(rms_alt),
+        "rms_heading": None if rms_head is None else float(rms_head),
+        "params": tuple(float(v) for v in params),
+        "spin_sign": int(spin_sign),
+        "lon_sign": int(lon_sign),
+        "orbit_flip": int(orbit_flip),
+        "combo_index": int(combo_index),
+    }
+
+
+def _model_from_fit_combo_result(
+    result: Dict[str, Any],
+    *,
+    body: Dict[str, Any],
+    observations: List[Observation],
+    time_weighting: bool,
+    time_ref: Optional[datetime],
+    time_half_life_hours: float,
+    time_min_weight: float,
+    system: Optional[Dict[str, Any]],
+    time_weighting_mode: str,
+    recent_boost_max: float,
+    recent_boost_scale_hours: Optional[float],
+    sun_geometry_mode: str,
+) -> FittedModel:
+    m = make_model(
+        body,
+        tuple(float(v) for v in result["params"]),  # type: ignore[arg-type]
+        int(result["spin_sign"]),
+        int(result["lon_sign"]),
+        int(result["orbit_flip"]),
+        observations,
+        time_weighting=time_weighting,
+        time_ref=time_ref,
+        time_half_life_hours=time_half_life_hours,
+        time_min_weight=time_min_weight,
+        system=system,
+        time_weighting_mode=time_weighting_mode,
+        recent_boost_max=recent_boost_max,
+        recent_boost_scale_hours=recent_boost_scale_hours,
+        sun_geometry_mode=sun_geometry_mode,
+    )
+    m.score = float(result["score"])
+    m.rms_altitude = float(result["rms_altitude"])
+    m.rms_heading = None if result.get("rms_heading") is None else float(result["rms_heading"])
+    return m
+
+
 def fit_model(
     body: Dict[str, Any],
     observations: List[Observation],
@@ -1123,25 +1343,64 @@ def fit_model(
     if sun_geometry_mode not in {"recursive_source", "legacy_distant"}:
         sun_geometry_mode, _geometry_reason = recommended_sun_geometry_mode(system, body)
 
+    fit_start_monotonic = time.perf_counter()
+
     # Validate required fields early.
     for key in ("timestamp", "RotationPeriod", "OrbitalPeriod", "SemiMajorAxis"):
         get_required_float(body, key) if key != "timestamp" else scan_epoch(body)
 
     best_model: Optional[FittedModel] = None
-    rng = random.Random(seed)
     effective_time_ref = observation_time_reference(observations, time_ref) if time_weighting else None
     recent_boost_scale_hours: Optional[float] = None
     if time_weighting and (time_weighting_mode or "recent_boost").strip().lower() not in {"decay", "legacy_decay", "half_life"}:
         recent_boost_scale_hours = float(fit_recent_boost_scale_details(body)["boost_scale_hours"])
 
-    def split_candidate(x: Iterable[float]) -> Tuple[float, float, float, float]:
-        vals = [float(v) for v in x]
-        return tuple(vals[:4])  # type: ignore[return-value]
+    combos = [(sp, lo, of) for sp in (1, -1) for lo in (1, -1) for of in (1, -1)]
+    payloads: List[Dict[str, Any]] = []
+    for i, combo in enumerate(combos):
+        payloads.append({
+            "body": body,
+            "observations": observations,
+            "use_heading": bool(use_heading),
+            "seed": int(seed),
+            "combo_index": int(i),
+            "combo": combo,
+            "time_weighting": bool(time_weighting),
+            "time_half_life_hours": float(time_half_life_hours),
+            "time_ref": effective_time_ref,
+            "time_min_weight": float(time_min_weight),
+            "system": system,
+            "time_weighting_mode": time_weighting_mode,
+            "recent_boost_max": float(recent_boost_max),
+            "recent_boost_scale_hours": recent_boost_scale_hours,
+            "sun_geometry_mode": sun_geometry_mode,
+        })
 
-    def evaluate_tuple(x: Iterable[float], spin_sign: int, lon_sign: int, orbit_flip: int) -> float:
-        params = split_candidate(x)
-        m = make_model(
-            body, params, spin_sign, lon_sign, orbit_flip, observations,
+    fit_workers = min(int(FIT_WORKERS), len(payloads))
+    parallel_requested = bool(PARALLEL_FIT and fit_workers > 1 and len(payloads) >= int(FIT_PARALLEL_MIN_COMBOS))
+    used_parallel = False
+    results: List[Dict[str, Any]] = []
+
+    if parallel_requested:
+        try:
+            with concurrent.futures.ProcessPoolExecutor(max_workers=fit_workers) as executor:
+                results = list(executor.map(_fit_combo_worker, payloads))
+            used_parallel = True
+        except Exception as exc:
+            print(f"Warning: parallel fit failed; falling back to single-process fit: {exc}")
+            results = []
+            used_parallel = False
+
+    if not results:
+        # Sequential fallback.  This is also used when parallel fitting is
+        # disabled, SciPy is missing, or process creation is unavailable.
+        results = [_fit_combo_worker(payload) for payload in payloads]
+
+    for result in sorted(results, key=lambda r: float(r.get("score", 1e99))):
+        candidate_model = _model_from_fit_combo_result(
+            result,
+            body=body,
+            observations=observations,
             time_weighting=time_weighting,
             time_ref=effective_time_ref,
             time_half_life_hours=time_half_life_hours,
@@ -1152,89 +1411,15 @@ def fit_model(
             recent_boost_scale_hours=recent_boost_scale_hours,
             sun_geometry_mode=sun_geometry_mode,
         )
-        return model_loss(m, use_heading=use_heading)[0]
+        if best_model is None or candidate_model.score < best_model.score:
+            best_model = candidate_model
 
-    combos = [(sp, lo, of) for sp in (1, -1) for lo in (1, -1) for of in (1, -1)]
-    bounds = [(-math.pi, math.pi), (-math.pi, math.pi), (-math.pi, math.pi), (-math.pi, math.pi)]
-
-    if differential_evolution is not None:
-        for spin_sign, lon_sign, orbit_flip in combos:
-            result = differential_evolution(
-                lambda x, sp=spin_sign, lo=lon_sign, of=orbit_flip: evaluate_tuple(x, sp, lo, of),
-                bounds,
-                seed=seed,
-                tol=1e-7,
-                popsize=8,
-                maxiter=220,
-                polish=True,
-                workers=1,
-            )
-            params = split_candidate(result.x)
-            model = make_model(
-                body, params, spin_sign, lon_sign, orbit_flip, observations,
-                time_weighting=time_weighting,
-                time_ref=effective_time_ref,
-                time_half_life_hours=time_half_life_hours,
-                time_min_weight=time_min_weight,
-                system=system,
-                time_weighting_mode=time_weighting_mode,
-                recent_boost_max=recent_boost_max,
-                recent_boost_scale_hours=recent_boost_scale_hours,
-                sun_geometry_mode=sun_geometry_mode,
-            )
-            score, rms_alt, rms_head = model_loss(model, use_heading=use_heading)
-            model.score = score
-            model.rms_altitude = rms_alt
-            model.rms_heading = rms_head
-            if best_model is None or model.score < best_model.score:
-                best_model = model
-    else:
-        # Pure-Python fallback: random global search + simple coordinate pattern search.
-        for spin_sign, lon_sign, orbit_flip in combos:
-            candidates: List[Tuple[float, Tuple[float, float, float, float]]] = []
-            ndim = len(bounds)
-            for _ in range(2500):
-                x = tuple(rng.uniform(bounds[i][0], bounds[i][1]) for i in range(ndim))
-                candidates.append((evaluate_tuple(x, spin_sign, lon_sign, orbit_flip), x))
-            candidates.sort(key=lambda p: p[0])
-            for _, start in candidates[:20]:
-                x = list(start)
-                step = math.pi / 3.0
-                best = evaluate_tuple(x, spin_sign, lon_sign, orbit_flip)
-                while step > 1e-5:
-                    improved = False
-                    for j in range(len(bounds)):
-                        for direction in (-1.0, 1.0):
-                            y = x[:]
-                            y[j] += direction * step
-                            if j < 4:
-                                y[j] = (y[j] + math.pi) % (2.0 * math.pi) - math.pi
-                            else:
-                                y[j] = max(bounds[j][0], min(bounds[j][1], y[j]))
-                            val = evaluate_tuple(y, spin_sign, lon_sign, orbit_flip)
-                            if val < best:
-                                x, best, improved = y, val, True
-                    if not improved:
-                        step *= 0.55
-                params = split_candidate(x)
-                model = make_model(
-                    body, params, spin_sign, lon_sign, orbit_flip, observations,
-                    time_weighting=time_weighting,
-                    time_ref=effective_time_ref,
-                    time_half_life_hours=time_half_life_hours,
-                    time_min_weight=time_min_weight,
-                    system=system,
-                    time_weighting_mode=time_weighting_mode,
-                    recent_boost_max=recent_boost_max,
-                    recent_boost_scale_hours=recent_boost_scale_hours,
-                    sun_geometry_mode=sun_geometry_mode,
-                )
-                score, rms_alt, rms_head = model_loss(model, use_heading=use_heading)
-                model.score = score
-                model.rms_altitude = rms_alt
-                model.rms_heading = rms_head
-                if best_model is None or model.score < best_model.score:
-                    best_model = model
+    elapsed = time.perf_counter() - fit_start_monotonic
+    if best_model is not None:
+        best_model.fit_parallel_enabled = bool(used_parallel)
+        best_model.fit_workers = int(fit_workers if used_parallel else 1)
+        best_model.fit_evaluated_combos = int(len(payloads))
+        best_model.fit_elapsed_seconds = float(elapsed)
 
     if best_model is None:
         raise RuntimeError("Fit failed")
@@ -1284,7 +1469,44 @@ def crossing_type(model: FittedModel, t: datetime, lat: float, lon: float, thres
     return "set"
 
 
-def find_crossings(
+def _clamp_float(value: float, low: float, high: float) -> float:
+    return max(float(low), min(float(high), float(value)))
+
+
+def _search_period_seconds(body: Dict[str, Any]) -> Optional[float]:
+    """Best-effort local day/cycle period estimate used only for scan steps."""
+    try:
+        diff_p, sum_p = apparent_mean_periods(body)
+        candidates = [float(v) for v in (diff_p, sum_p) if math.isfinite(float(v)) and float(v) > 0.0]
+        if candidates:
+            return min(candidates)
+    except Exception:
+        pass
+    for key in ("RotationPeriod", "rotation_period_s", "OrbitalPeriod", "orbital_period_s"):
+        try:
+            value = abs(float(body.get(key) or 0.0))
+            if math.isfinite(value) and value > 0.0:
+                return value
+        except Exception:
+            continue
+    return None
+
+
+def normal_search_step_seconds(model: FittedModel, hours: float) -> float:
+    if not ADAPTIVE_NORMAL_SEARCH:
+        return 30.0
+    period_s = _search_period_seconds(model.body)
+    if period_s is not None:
+        # ~120 samples per estimated cycle keeps short cycles safe while allowing
+        # slow-season bodies to use the configured max step.
+        step = period_s / 120.0
+    else:
+        # Fall back to roughly 1000 samples over the requested window.
+        step = max(30.0, float(hours) * 3600.0 / 1000.0)
+    return _clamp_float(step, NORMAL_SEARCH_MIN_STEP_SECONDS, NORMAL_SEARCH_MAX_STEP_SECONDS)
+
+
+def _scan_crossings_with_step(
     model: FittedModel,
     start: datetime,
     lat: float,
@@ -1292,22 +1514,27 @@ def find_crossings(
     threshold: float = 0.0,
     hours: float = 16.0,
     max_crossings: int = 8,
-) -> List[Tuple[datetime, str]]:
+    step_seconds: float = 30.0,
+) -> Tuple[List[Tuple[datetime, str]], Dict[str, Any]]:
     out: List[Tuple[datetime, str]] = []
-    step = 30.0
-    end = start + timedelta(hours=hours)
+    step = max(1.0, float(step_seconds))
+    end = start + timedelta(hours=float(hours))
     t0 = start
     f0 = model.predict(t0, lat, lon)[0] - threshold
     t = start + timedelta(seconds=step)
+    samples = 1
+    refinements = 0
     while t <= end and len(out) < max_crossings:
         f1 = model.predict(t, lat, lon)[0] - threshold
+        samples += 1
         if f0 == 0.0 or f0 * f1 < 0.0:
             lo = t - timedelta(seconds=step)
             hi = t
             flo = f0
-            for _ in range(32):
+            for _ in range(40):
                 mid = lo + (hi - lo) / 2
                 fm = model.predict(mid, lat, lon)[0] - threshold
+                refinements += 1
                 if flo == 0.0 or flo * fm <= 0.0:
                     hi = mid
                     f1 = fm
@@ -1318,7 +1545,47 @@ def find_crossings(
             out.append((hi, ct))
         t0, f0 = t, f1
         t = t + timedelta(seconds=step)
-    return out
+    meta = {
+        "step_seconds": float(step),
+        "samples": int(samples),
+        "refinements": int(refinements),
+    }
+    return out, meta
+
+
+def find_crossings(
+    model: FittedModel,
+    start: datetime,
+    lat: float,
+    lon: float,
+    threshold: float = 0.0,
+    hours: float = 16.0,
+    max_crossings: int = 8,
+    step_seconds: Optional[float] = None,
+) -> List[Tuple[datetime, str]]:
+    step = 30.0 if step_seconds is None else float(step_seconds)
+    crossings, _meta = _scan_crossings_with_step(
+        model, start, lat, lon, threshold=threshold,
+        hours=hours, max_crossings=max_crossings, step_seconds=step,
+    )
+    return crossings
+
+
+def find_crossings_with_metadata(
+    model: FittedModel,
+    start: datetime,
+    lat: float,
+    lon: float,
+    threshold: float = 0.0,
+    hours: float = 16.0,
+    max_crossings: int = 8,
+    step_seconds: Optional[float] = None,
+) -> Tuple[List[Tuple[datetime, str]], Dict[str, Any]]:
+    step = 30.0 if step_seconds is None else float(step_seconds)
+    return _scan_crossings_with_step(
+        model, start, lat, lon, threshold=threshold,
+        hours=hours, max_crossings=max_crossings, step_seconds=step,
+    )
 
 
 def find_crossings_adaptive(
@@ -1330,42 +1597,116 @@ def find_crossings_adaptive(
     hours: float = 16.0,
     max_crossings: int = 8,
     max_steps: int = 30000,
+    step_seconds: Optional[float] = None,
 ) -> List[Tuple[datetime, str]]:
-    """Find crossings over long windows without doing millions of 30 s samples.
+    crossings, _meta = find_crossings_adaptive_with_metadata(
+        model, start, lat, lon, threshold=threshold, hours=hours,
+        max_crossings=max_crossings, max_steps=max_steps, step_seconds=step_seconds,
+    )
+    return crossings
 
-    The normal 30 s scanner is still used for the visible prediction window.
-    This adaptive scanner is used only when we need to look farther ahead to
-    find the next sun passes or a complete daylight/day-period summary.
-    """
-    out: List[Tuple[datetime, str]] = []
+
+def find_crossings_adaptive_with_metadata(
+    model: FittedModel,
+    start: datetime,
+    lat: float,
+    lon: float,
+    threshold: float = 0.0,
+    hours: float = 16.0,
+    max_crossings: int = 8,
+    max_steps: int = 30000,
+    step_seconds: Optional[float] = None,
+) -> Tuple[List[Tuple[datetime, str]], Dict[str, Any]]:
+    """Find crossings over long windows without doing millions of 30 s samples."""
     total_seconds = max(1.0, float(hours) * 3600.0)
-    step = max(30.0, total_seconds / max(1000, int(max_steps)))
-    end = start + timedelta(seconds=total_seconds)
-    t0 = start
-    f0 = model.predict(t0, lat, lon)[0] - threshold
-    t = start + timedelta(seconds=step)
-    while t <= end and len(out) < max_crossings:
-        f1 = model.predict(t, lat, lon)[0] - threshold
-        if f0 == 0.0 or f0 * f1 < 0.0:
-            lo = t - timedelta(seconds=step)
-            hi = t
-            flo = f0
-            for _ in range(40):
-                mid = lo + (hi - lo) / 2
-                fm = model.predict(mid, lat, lon)[0] - threshold
-                if flo == 0.0 or flo * fm <= 0.0:
-                    hi = mid
-                    f1 = fm
-                else:
-                    lo = mid
-                    flo = fm
-            ct = crossing_type(model, hi, lat, lon, threshold)
-            # Avoid duplicates where the extended scan overlaps the normal scan.
-            if not out or abs((hi - out[-1][0]).total_seconds()) > 2.0:
-                out.append((hi, ct))
-        t0, f0 = t, f1
-        t = t + timedelta(seconds=step)
-    return out
+    if step_seconds is None:
+        step = max(30.0, total_seconds / max(1000, int(max_steps)))
+    else:
+        step = max(1.0, float(step_seconds))
+    return _scan_crossings_with_step(
+        model, start, lat, lon, threshold=threshold,
+        hours=hours, max_crossings=max_crossings, step_seconds=step,
+    )
+
+
+def _extended_chunk_worker(args: Tuple[FittedModel, datetime, float, float, float, float, int, float]) -> Tuple[List[Tuple[datetime, str]], Dict[str, Any]]:
+    model_obj, chunk_start, lat, lon, threshold, hours, max_crossings, step_seconds = args
+    return find_crossings_adaptive_with_metadata(
+        model_obj, chunk_start, lat, lon, threshold=threshold,
+        hours=hours, max_crossings=max_crossings, step_seconds=step_seconds,
+    )
+
+
+def find_crossings_extended_with_metadata(
+    model: FittedModel,
+    start: datetime,
+    lat: float,
+    lon: float,
+    threshold: float = 0.0,
+    hours: float = 16.0,
+    max_crossings: int = 8,
+) -> Tuple[List[Tuple[datetime, str]], Dict[str, Any]]:
+    """Long fallback crossing search, optionally split across processes."""
+    hours = max(0.1, float(hours))
+    step = float(LONG_SEARCH_STEP_SECONDS)
+    base_meta = {
+        "step_seconds": step,
+        "parallel_enabled": False,
+        "workers": 1,
+        "samples": 0,
+        "refinements": 0,
+        "chunks": 1,
+        "parallel_error": None,
+    }
+    use_parallel = bool(PARALLEL_EXTENDED_SEARCH and PREDICTION_WORKERS > 1 and hours >= PARALLEL_EXTENDED_MIN_HOURS)
+    if not use_parallel:
+        crossings, meta = find_crossings_adaptive_with_metadata(
+            model, start, lat, lon, threshold=threshold,
+            hours=hours, max_crossings=max_crossings, step_seconds=step,
+        )
+        base_meta.update(meta)
+        return crossings, base_meta
+
+    workers = min(max(1, int(PREDICTION_WORKERS)), max(1, int(math.ceil(hours))))
+    chunk_hours = hours / workers
+    overlap = min(float(PARALLEL_CHUNK_OVERLAP_HOURS), max(0.0, chunk_hours / 2.0))
+    tasks = []
+    for i in range(workers):
+        nominal_start_h = i * chunk_hours
+        nominal_end_h = hours if i == workers - 1 else (i + 1) * chunk_hours
+        chunk_start_h = max(0.0, nominal_start_h - (overlap if i > 0 else 0.0))
+        chunk_end_h = min(hours, nominal_end_h + (overlap if i < workers - 1 else 0.0))
+        chunk_start = start + timedelta(hours=chunk_start_h)
+        chunk_span_h = max(0.1, chunk_end_h - chunk_start_h)
+        tasks.append((model, chunk_start, lat, lon, threshold, chunk_span_h, max_crossings, step))
+
+    all_crossings: List[Tuple[datetime, str]] = []
+    total_samples = 0
+    total_refinements = 0
+    try:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as executor:
+            for crossings, meta in executor.map(_extended_chunk_worker, tasks):
+                all_crossings.extend(crossings)
+                total_samples += int(meta.get("samples") or 0)
+                total_refinements += int(meta.get("refinements") or 0)
+        merged = unique_crossings(all_crossings)[:max_crossings]
+        base_meta.update({
+            "parallel_enabled": True,
+            "workers": int(workers),
+            "samples": int(total_samples),
+            "refinements": int(total_refinements),
+            "chunks": int(workers),
+        })
+        return merged, base_meta
+    except Exception as exc:
+        # Keep prediction reliable if multiprocessing is unavailable on a host.
+        crossings, meta = find_crossings_adaptive_with_metadata(
+            model, start, lat, lon, threshold=threshold,
+            hours=hours, max_crossings=max_crossings, step_seconds=step,
+        )
+        base_meta.update(meta)
+        base_meta["parallel_error"] = str(exc)[:500]
+        return crossings, base_meta
 
 
 def unique_crossings(crossings: List[Tuple[datetime, str]]) -> List[Tuple[datetime, str]]:
@@ -1395,37 +1736,54 @@ def find_crossings_for_prediction(
     bool,
     bool,
     str,
+    Dict[str, Any],
 ]:
     """Return crossings for display plus enough data for cycle summaries.
 
-    V0.200 behaviour:
-      * The selected prediction window remains the primary result.
-      * If at least one day/night transition exists inside that window, only
-        window transitions are listed.
-      * If no transition exists in the selected window, search forward up to
-        ``max_extended_hours`` and list the next ``min_fallback_transitions``.
-      * If the selected window does not contain a complete day/night cycle,
-        the extended search is still used silently to calculate sunlight
-        duration and the day period when possible.
-
-    Return value:
-      display_crossings, window_crossings, cycle_crossings, search_hours,
-      listed_crossings_extended, cycle_search_extended, daylight_source
+    V0.212 keeps the V0.200 behaviour but optimises the scanners:
+      * The selected prediction window uses an adaptive coarse-to-fine step.
+      * Long extended fallback searches use a coarse scan and can be split
+        across multiple processes.
+      * Every detected crossing is refined by bisection.
     """
     prediction_hours = max(0.1, float(prediction_hours))
     min_fallback_transitions = max(1, int(min_fallback_transitions))
     max_extended_hours = max(prediction_hours, float(max_extended_hours))
 
-    window_crossings = find_crossings(
+    normal_step = normal_search_step_seconds(model, prediction_hours)
+    effective_max_crossings = max_crossings
+    early_stop_used = False
+    if NORMAL_SEARCH_EARLY_STOP and max_crossings > NORMAL_SEARCH_EARLY_STOP_CROSSINGS:
+        # Keep enough transitions for next rise/set plus a complete cycle while
+        # avoiding very long normal-window scans on slow seasonal bodies.
+        effective_max_crossings = int(NORMAL_SEARCH_EARLY_STOP_CROSSINGS)
+        early_stop_used = True
+
+    window_crossings, normal_meta = find_crossings_with_metadata(
         model, start, lat, lon, threshold=threshold,
-        hours=prediction_hours, max_crossings=max_crossings,
+        hours=prediction_hours, max_crossings=effective_max_crossings,
+        step_seconds=normal_step,
     )
+    normal_meta["early_stop"] = bool(early_stop_used)
+    normal_meta["adaptive_enabled"] = bool(ADAPTIVE_NORMAL_SEARCH)
 
     window_summary = daylight_cycle_summary(window_crossings)
     need_display_fallback = len(window_crossings) == 0
     need_cycle_fallback = window_summary is None
 
     if not need_display_fallback and not need_cycle_fallback:
+        search_meta = {
+            "normal": normal_meta,
+            "extended": {
+                "step_seconds": None,
+                "parallel_enabled": False,
+                "workers": 0,
+                "samples": 0,
+                "refinements": 0,
+                "chunks": 0,
+                "parallel_error": None,
+            },
+        }
         return (
             window_crossings,
             window_crossings,
@@ -1434,9 +1792,10 @@ def find_crossings_for_prediction(
             False,
             False,
             "window",
+            search_meta,
         )
 
-    extended = find_crossings_adaptive(
+    extended, extended_meta = find_crossings_extended_with_metadata(
         model, start, lat, lon, threshold=threshold,
         hours=max_extended_hours,
         max_crossings=max(max_crossings, min_fallback_transitions, 8),
@@ -1457,6 +1816,10 @@ def find_crossings_for_prediction(
         for ct, _kind in display_crossings
     )
 
+    search_meta = {
+        "normal": normal_meta,
+        "extended": extended_meta,
+    }
     return (
         display_crossings,
         window_crossings,
@@ -1465,6 +1828,7 @@ def find_crossings_for_prediction(
         bool(listed_extended),
         bool(cycle_search_extended),
         daylight_source,
+        search_meta,
     )
 
 
@@ -1612,6 +1976,10 @@ def make_report(
         lines.append("Recent-observation boost: OFF; all observation ages use only quality weights.")
     if model.rms_heading is not None:
         lines.append(f"RMS heading residual:  {model.rms_heading:.3f}°")
+    if getattr(model, "fit_parallel_enabled", False):
+        lines.append(f"Fit parallelization: ON, {getattr(model, 'fit_workers', 1)} workers, {getattr(model, 'fit_evaluated_combos', 0)} orientation branches, {getattr(model, 'fit_elapsed_seconds', 0.0):.2f} s")
+    else:
+        lines.append(f"Fit parallelization: OFF, {getattr(model, 'fit_evaluated_combos', 0) or 8} orientation branches, {getattr(model, 'fit_elapsed_seconds', 0.0):.2f} s")
     lines.append(f"Fit score: {model.score:.3f}")
     lines.append("")
     lines.append("Observation residuals")
@@ -1725,6 +2093,10 @@ def model_summary_dict(model: FittedModel) -> Dict[str, Any]:
         "sun_source_mode": model_sun_source_mode_label(model),
         "orbit_context": model_orbit_context_label(model),
         "sun_vector_source": model_sun_vector_source_label(model),
+        "fit_parallel_enabled": bool(getattr(model, "fit_parallel_enabled", False)),
+        "fit_workers": int(getattr(model, "fit_workers", 1) or 1),
+        "fit_evaluated_combos": int(getattr(model, "fit_evaluated_combos", 0) or 0),
+        "fit_elapsed_seconds": None if getattr(model, "fit_elapsed_seconds", None) is None else float(getattr(model, "fit_elapsed_seconds")),
     }
 
 
@@ -1898,6 +2270,7 @@ def calculate_prediction(
         crossings_extended,
         cycle_search_extended,
         daylight_summary_source,
+        search_meta,
     ) = find_crossings_for_prediction(
         model,
         target_time,
@@ -1926,6 +2299,7 @@ def calculate_prediction(
             threshold=-radius,
             hours=prediction_hours,
             max_crossings=24,
+            step_seconds=normal_search_step_seconds(model, prediction_hours),
         ):
             visual_disc_crossings.append({
                 "time_utc": format_utc(ct),
@@ -1968,6 +2342,18 @@ def calculate_prediction(
         "daylight_summary_source": daylight_summary_source,
         "min_fallback_transitions": int(min_fallback_transitions),
         "max_extended_prediction_hours": float(max_extended_prediction_hours),
+        "normal_search_step_seconds": None if search_meta.get("normal", {}).get("step_seconds") is None else float(search_meta.get("normal", {}).get("step_seconds")),
+        "normal_search_adaptive_enabled": bool(search_meta.get("normal", {}).get("adaptive_enabled", False)),
+        "normal_search_early_stop": bool(search_meta.get("normal", {}).get("early_stop", False)),
+        "normal_search_samples": int(search_meta.get("normal", {}).get("samples") or 0),
+        "normal_search_refinements": int(search_meta.get("normal", {}).get("refinements") or 0),
+        "extended_search_step_seconds": None if search_meta.get("extended", {}).get("step_seconds") is None else float(search_meta.get("extended", {}).get("step_seconds")),
+        "extended_search_parallel_enabled": bool(search_meta.get("extended", {}).get("parallel_enabled", False)),
+        "extended_search_workers": int(search_meta.get("extended", {}).get("workers") or 0),
+        "extended_search_chunks": int(search_meta.get("extended", {}).get("chunks") or 0),
+        "extended_search_samples": int(search_meta.get("extended", {}).get("samples") or 0),
+        "extended_search_refinements": int(search_meta.get("extended", {}).get("refinements") or 0),
+        "extended_search_parallel_error": search_meta.get("extended", {}).get("parallel_error"),
         "window_horizon_crossing_count": int(len(window_crossings)),
         "cycle_horizon_crossing_count": int(len(cycle_crossings)),
         "centre_horizon_crossings": [
