@@ -212,6 +212,29 @@ input[readonly] { opacity: 0.82; }
   padding: 0.85rem 1rem;
   margin: 0.75rem 0 1rem;
 }
+.guide-figure {
+  margin: 1rem 0 0;
+}
+.guide-image {
+  display: block;
+  width: 100%;
+  height: auto;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: #05070d;
+}
+.guide-figure figcaption {
+  margin-top: 0.5rem;
+  font-size: 0.92rem;
+}
+.guide-list {
+  margin: 0.6rem 0 0;
+  padding-left: 1.25rem;
+  color: var(--muted);
+}
+.guide-list li + li {
+  margin-top: 0.45rem;
+}
 .inline-mini { display: inline-flex; margin: 0; }
 
 /* Review table improvements */

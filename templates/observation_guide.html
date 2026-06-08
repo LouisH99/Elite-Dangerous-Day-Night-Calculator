@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+{% block title %}Observation Guide - Elite Day/Night{% endblock %}
+{% block content %}
+<section class="card">
+  <h1>Observation guide</h1>
+  <p class="muted">Use this guide when submitting a sun observation from a planet or moon surface. The marked HUD values are the ones the calculator needs.</p>
+  <figure class="guide-figure">
+    <img class="guide-image" src="/static/observation_explanation.png" alt="Elite Dangerous cockpit HUD with heading, elevation, latitude, and longitude marked for observation submission">
+    <figcaption class="muted">Example cockpit HUD with heading, sun elevation, latitude, and longitude marked.</figcaption>
+  </figure>
+</section>
+
+<section class="grid two">
+  <div class="card">
+    <h2>Before you submit</h2>
+    <ol>
+      <li>Land on the body you want to observe.</li>
+      <li>Target the local sun in-game.</li>
+      <li>Aim as close as possible at the centre of the targeted sun marker.</li>
+      <li>Use the live UTC time on the form, or enter the UTC time shown in-game.</li>
+      <li>Copy latitude, longitude, and sun elevation from the HUD.</li>
+    </ol>
+  </div>
+
+  <div class="card">
+    <h2>Reading the HUD</h2>
+    <ul class="guide-list">
+      <li><b>Latitude and longitude:</b> bottom-right surface coordinates. Keep the minus signs when shown.</li>
+      <li><b>Elevation:</b> the vertical angle to the targeted sun. Copy the signed number from the HUD as accurately as you can.</li>
+      <li><b>Heading:</b> the top compass value. Only submit it when you are pointed directly at the sun marker.</li>
+    </ul>
+  </div>
+</section>
+
+<section class="card">
+  <h2>Form fields</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Field</th><th>What to enter</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td>Observer name</td><td>Your commander or reviewer-recognizable name.</td><td>Use the same name for future submissions.</td></tr>
+        <tr><td>UTC observation time</td><td>The time of the observation.</td><td>The form can keep this live. You can also enter the UTC time shown in-game.</td></tr>
+        <tr><td>Latitude</td><td>The first surface coordinate.</td><td>Enter the HUD value as shown. Example: -22.24716.</td></tr>
+        <tr><td>Longitude</td><td>The second surface coordinate.</td><td>Enter the HUD value as shown. Example: -23.72146.</td></tr>
+        <tr><td>Sun altitude / elevation</td><td>The sun elevation angle in degrees.</td><td>Example: -10. Decimals such as -10.5 are okay if you are confident.</td></tr>
+        <tr><td>Sun heading</td><td>The compass heading in degrees.</td><td>Optional. Leave empty unless aimed at the sun marker.</td></tr>
+        <tr><td>Quality</td><td>How accurate the reading is.</td><td>Use low for rough screenshots or uncertain aiming.</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section class="card narrow">
+  <h2>Good observation habits</h2>
+  <ul class="guide-list">
+    <li>Submit more than one observation only if the time or sun position has meaningfully changed.</li>
+    <li>Avoid entering heading if you are not lined up with the sun marker; altitude alone is usually more reliable.</li>
+    <li>Add a note when visibility is poor, the sun marker is hard to read, or the value came from a screenshot.</li>
+  </ul>
+</section>
+{% endblock %}

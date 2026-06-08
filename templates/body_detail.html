@@ -83,10 +83,10 @@
         {% endif %}
         <form class="stack-form" method="get" action="/bodies/{{ body.id }}">
           <label>Latitude
-            <input required name="lat" type="number" step="0.000001" min="-90" max="90" value="{{ lat }}">
+            <input required name="lat" inputmode="decimal" value="{{ lat }}" placeholder="+12.345678 or -12.345678">
           </label>
           <label>Longitude
-            <input required name="lon" type="number" step="0.000001" min="-180" max="180" value="{{ lon }}">
+            <input required name="lon" inputmode="decimal" value="{{ lon }}" placeholder="+12.345678 or -12.345678">
           </label>
           <label>UTC time
             <input required name="time" value="{{ target_time }}" placeholder="2026-06-02 18 or 2026-06-02 18:00">
@@ -180,6 +180,7 @@
   <p class="muted">Submissions are saved as <b>new</b>. Please use the same observer name for future observations so reviewers can contact you if something looks wrong.</p>
   <div class="help-box">
     <b>Observation tips</b>
+    <p><a href="/observations/guide">Open the detailed observation guide</a></p>
     <ul>
       <li>Use latitude and longitude from the in-game surface HUD.</li>
       <li>Target the sun, aim at the centre of the targeted sun marker, and read the elevation value.</li>
@@ -199,16 +200,16 @@
     </label>
     <small class="field-help">When enabled, the observation time updates every second. Disable it to enter an older/manual time.</small>
     <label>Latitude
-      <input required name="lat" type="number" step="0.000001" min="-90" max="90" value="{{ lat }}">
+      <input required name="lat" inputmode="decimal" value="{{ lat }}" placeholder="+12.345678 or -12.345678">
     </label>
     <label>Longitude
-      <input required name="lon" type="number" step="0.000001" min="-180" max="180" value="{{ lon }}">
+      <input required name="lon" inputmode="decimal" value="{{ lon }}" placeholder="+12.345678 or -12.345678">
     </label>
     <label>Sun altitude / elevation °
-      <input required name="elevation" type="number" step="0.01" min="-90" max="90" placeholder="34.0">
+      <input required name="elevation" inputmode="decimal" placeholder="+34.0 or -10.5">
     </label>
     <label>Sun heading optional
-      <input name="heading" type="number" step="0.01" min="0" max="359.99" placeholder="leave empty if unsure">
+      <input name="heading" inputmode="decimal" placeholder="+336 or leave empty if unsure">
     </label>
     <label>Quality
       <select name="quality">

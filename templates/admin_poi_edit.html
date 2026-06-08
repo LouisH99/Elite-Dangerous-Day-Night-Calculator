@@ -13,10 +13,10 @@
     </label>
     <div class="grid two compact-form-grid">
       <label>Latitude
-        <input name="lat" required type="number" step="0.000001" min="-90" max="90" value="{{ poi.lat }}">
+        <input name="lat" required inputmode="decimal" value="{{ poi.lat }}">
       </label>
       <label>Longitude
-        <input name="lon" required type="number" step="0.000001" min="-180" max="180" value="{{ poi.lon }}">
+        <input name="lon" required inputmode="decimal" value="{{ poi.lon }}">
       </label>
     </div>
     <label>Description

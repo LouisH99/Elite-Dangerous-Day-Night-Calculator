@@ -1,6 +1,12 @@
+## V0.215
+
+- Coordinate, elevation, and heading inputs now accept explicit leading plus signs.
+- Added `/race/{race_key}` links that redirect directly to the matching racing POI/body page.
+
 ## V0.214
 
 - Added an About page section for suggestions, bug reports, and feedback with a GitHub Issues link.
+- Added a detailed observation guide page with a cockpit HUD reference image and links from navigation, About, and the observation form.
 
 ## V0.213
 

@@ -61,7 +61,7 @@ PUBLIC_POI_SUBMISSIONS_ENABLED = env_bool("ELITE_DAYNIGHT_PUBLIC_POI_SUBMISSIONS
 
 app = FastAPI(
     title="Elite Dangerous Day/Night Calculator Website",
-    version="0.214",
+    version="0.215",
     docs_url=None,
     redoc_url=None,
     openapi_url=None,
@@ -462,6 +462,21 @@ def public_observation_need(conf: Dict[str, Any]) -> Dict[str, Any]:
     return {"needs_observations": bool(needs), "level": level}
 
 
+def parse_signed_float(value: Any, field_name: str, min_value: Optional[float] = None, max_value: Optional[float] = None) -> float:
+    text = str(value if value is not None else "").strip().replace(",", ".")
+    if not text:
+        raise ValueError(f"{field_name} is required")
+    try:
+        parsed = float(text)
+    except Exception as exc:
+        raise ValueError(f"{field_name} must be a number") from exc
+    if min_value is not None and parsed < min_value:
+        raise ValueError(f"{field_name} must be >= {min_value:g}")
+    if max_value is not None and parsed > max_value:
+        raise ValueError(f"{field_name} must be <= {max_value:g}")
+    return parsed
+
+
 @app.get("/public/api/v1/health")
 async def public_api_health() -> Dict[str, Any]:
     return {"api_version": PUBLIC_API_VERSION, "ok": True, "service": "Elite Dangerous Day/Night Calculator public prediction API"}
@@ -516,14 +531,10 @@ async def public_api_prediction(
         if lat in (None, "") or lon in (None, ""):
             return public_api_error("missing_coordinates", "lat and lon are required for manual coordinate predictions.")
         try:
-            lat_value = float(str(lat).strip())
-            lon_value = float(str(lon).strip())
-        except Exception:
-            return public_api_error("invalid_coordinates", "lat and lon must be numbers.")
-        if lat_value < -90 or lat_value > 90:
-            return public_api_error("invalid_coordinates", "lat must be between -90 and 90.")
-        if lon_value < -180 or lon_value > 180:
-            return public_api_error("invalid_coordinates", "lon must be between -180 and 180.")
+            lat_value = parse_signed_float(lat, "lat", -90.0, 90.0)
+            lon_value = parse_signed_float(lon, "lon", -180.0, 180.0)
+        except ValueError as exc:
+            return public_api_error("invalid_coordinates", str(exc))
         target, error = public_resolve_body(system, body)
         if target is not None:
             target["lat"] = lat_value
@@ -774,8 +785,8 @@ async def submit_poi_post(
     body_id: int = Form(...),
     submitter_name: str = Form(...),
     name: str = Form(...),
-    lat: float = Form(...),
-    lon: float = Form(...),
+    lat: str = Form(...),
+    lon: str = Form(...),
     description: str = Form(""),
 ) -> RedirectResponse:
     if not PUBLIC_POI_SUBMISSIONS_ENABLED:
@@ -783,10 +794,15 @@ async def submit_poi_post(
     submitter = submitter_name.strip()
     if len(submitter) < 2:
         return RedirectResponse("/pois/submit?message=Submitter%20name%20is%20required", status_code=303)
+    try:
+        lat_value = parse_signed_float(lat, "Latitude", -90.0, 90.0)
+        lon_value = parse_signed_float(lon, "Longitude", -180.0, 180.0)
+    except ValueError as exc:
+        return RedirectResponse(f"/pois/submit?body_id={body_id}&message={quote(str(exc))}", status_code=303)
     payload = {
         "name": name.strip(),
-        "lat": lat,
-        "lon": lon,
+        "lat": lat_value,
+        "lon": lon_value,
         "description": description.strip(),
         "submitter_name": submitter,
         "actor": submitter,
@@ -794,7 +810,38 @@ async def submit_poi_post(
         "review_status": "new",
     }
     await api_request("POST", f"/api/bodies/{body_id}/pois/submit", json_body=payload)
-    return RedirectResponse(f"/bodies/{body_id}?lat={lat}&lon={lon}&message=POI%20submitted%20for%20review", status_code=303)
+    return RedirectResponse(f"/bodies/{body_id}?lat={lat_value}&lon={lon_value}&message=POI%20submitted%20for%20review", status_code=303)
+
+
+@app.get("/race/{race_key}")
+async def race_key_open(
+    request: Request,
+    race_key: str,
+    time: str = Query(""),
+    prediction_hours: str = Query("72"),
+    model_mode: str = Query("approved"),
+):
+    target, error = public_resolve_race_key(race_key)
+    if target is None or error is not None:
+        return render(
+            request,
+            "error.html",
+            {
+                "title": "Race key not found",
+                "status_code": 404,
+                "detail": f"No approved racing POI was found for race key: {race_key}",
+            },
+            status_code=404,
+        )
+    query: Dict[str, Any] = {
+        "poi": int(target["poi_id"]),
+        "prediction_hours": parse_prediction_hours(prediction_hours),
+    }
+    if time.strip():
+        query["time"] = time.strip()
+    if (model_mode or "").strip().lower() == "provisional":
+        query["model_mode"] = "provisional"
+    return RedirectResponse(f"/bodies/{int(target['body_id'])}?{urlencode(query)}", status_code=303)
 
 
 @app.get("/systems/{system_id}/open")
@@ -843,7 +890,7 @@ def parse_optional_query_float(value: Optional[str]) -> Optional[float]:
     text = str(value).strip()
     if not text:
         return None
-    return float(text)
+    return parse_signed_float(text, "coordinate")
 
 
 def parse_prediction_hours(value: str) -> float:
@@ -950,9 +997,9 @@ async def submit_observation(
     body_id: int,
     observer_name: str = Form(...),
     timestamp_utc: str = Form(...),
-    lat: float = Form(...),
-    lon: float = Form(...),
-    elevation: float = Form(...),
+    lat: str = Form(...),
+    lon: str = Form(...),
+    elevation: str = Form(...),
     heading: str = Form(""),
     quality: str = Form("medium"),
     note: str = Form(""),
@@ -960,26 +1007,33 @@ async def submit_observation(
     observer_name_clean = observer_name.strip()
     if len(observer_name_clean) < 2:
         return RedirectResponse(f"/bodies/{body_id}?lat={lat}&lon={lon}&time={timestamp_utc}&message=Observer%20name%20is%20required", status_code=303)
+    try:
+        lat_value = parse_signed_float(lat, "Latitude", -90.0, 90.0)
+        lon_value = parse_signed_float(lon, "Longitude", -180.0, 180.0)
+        elevation_value = parse_signed_float(elevation, "Sun altitude / elevation", -90.0, 90.0)
+        heading_value = None
+        if str(heading).strip():
+            heading_value = parse_signed_float(heading, "Sun heading", 0.0, 359.99)
+    except ValueError as exc:
+        return RedirectResponse(f"/bodies/{body_id}?lat={quote(str(lat))}&lon={quote(str(lon))}&time={quote(timestamp_utc)}&message={quote(str(exc))}", status_code=303)
 
     payload: Dict[str, Any] = {
         "observer_name": observer_name_clean,
         "timestamp_utc": timestamp_utc.strip(),
-        "lat": lat,
-        "lon": lon,
+        "lat": lat_value,
+        "lon": lon_value,
         "observation": "elevation",
-        "elevation": elevation,
-        "heading": None,
+        "elevation": elevation_value,
+        "heading": heading_value,
         "quality": quality.strip().lower(),
         "note": note.strip(),
         "review_status": "new",
         "source": "website",
     }
-    if heading.strip():
-        payload["heading"] = float(heading.strip())
     await api_request("POST", f"/api/bodies/{body_id}/observations", json_body=payload)
     # Keep the submitted coordinate as prediction coordinate after redirect.
     return RedirectResponse(
-        f"/bodies/{body_id}?lat={lat}&lon={lon}&time={timestamp_utc}&message=Observation%20submitted%20for%20review.%20Provisional%20model%20will%20be%20prepared%20in%20the%20background",
+        f"/bodies/{body_id}?lat={lat_value}&lon={lon_value}&time={quote(timestamp_utc)}&message=Observation%20submitted%20for%20review.%20Provisional%20model%20will%20be%20prepared%20in%20the%20background",
         status_code=303,
     )
 
@@ -1698,8 +1752,8 @@ async def admin_edit_observation_submit(
     observation_id: int,
     observer_name: str = Form(""),
     timestamp_utc: str = Form(...),
-    lat: float = Form(...),
-    lon: float = Form(...),
+    lat: str = Form(...),
+    lon: str = Form(...),
     observation: str = Form("elevation"),
     elevation: str = Form(""),
     heading: str = Form(""),
@@ -1709,14 +1763,25 @@ async def admin_edit_observation_submit(
 ):
     if not admin_logged_in(request):
         return admin_redirect(request)
+    try:
+        lat_value = parse_signed_float(lat, "Latitude", -90.0, 90.0)
+        lon_value = parse_signed_float(lon, "Longitude", -180.0, 180.0)
+        elevation_value = None
+        if elevation.strip():
+            elevation_value = parse_signed_float(elevation, "Sun altitude / elevation", -90.0, 90.0)
+        heading_value = None
+        if heading.strip():
+            heading_value = parse_signed_float(heading, "Sun heading", 0.0, 359.999)
+    except ValueError as exc:
+        return RedirectResponse(f"/control/observations/{observation_id}/edit?message={quote(str(exc))}", status_code=303)
     payload: Dict[str, Any] = {
         "observer_name": observer_name.strip(),
         "timestamp_utc": timestamp_utc.strip(),
-        "lat": lat,
-        "lon": lon,
+        "lat": lat_value,
+        "lon": lon_value,
         "observation": observation.strip().lower(),
-        "elevation": None if not elevation.strip() else float(elevation.strip()),
-        "heading": None if not heading.strip() else float(heading.strip()),
+        "elevation": elevation_value,
+        "heading": heading_value,
         "quality": quality.strip().lower(),
         "review_status": review_status.strip().lower(),
         "note": note.strip(),
@@ -1787,17 +1852,22 @@ async def admin_create_poi(
     request: Request,
     body_id: int = Form(...),
     name: str = Form(...),
-    lat: float = Form(...),
-    lon: float = Form(...),
+    lat: str = Form(...),
+    lon: str = Form(...),
     description: str = Form(""),
     is_public: str = Form(""),
 ):
     if not admin_logged_in(request):
         return admin_redirect(request)
+    try:
+        lat_value = parse_signed_float(lat, "Latitude", -90.0, 90.0)
+        lon_value = parse_signed_float(lon, "Longitude", -180.0, 180.0)
+    except ValueError as exc:
+        return RedirectResponse(f"/control/pois?message={quote(str(exc))}", status_code=303)
     payload = {
         "name": name.strip(),
-        "lat": lat,
-        "lon": lon,
+        "lat": lat_value,
+        "lon": lon_value,
         "description": description.strip(),
         "is_public": bool(is_public),
         "review_status": "approved",
@@ -1821,8 +1891,8 @@ async def admin_edit_poi_submit(
     request: Request,
     poi_id: int,
     name: str = Form(...),
-    lat: float = Form(...),
-    lon: float = Form(...),
+    lat: str = Form(...),
+    lon: str = Form(...),
     description: str = Form(""),
     is_public: str = Form(""),
     review_status: str = Form("new"),
@@ -1830,10 +1900,15 @@ async def admin_edit_poi_submit(
 ):
     if not admin_logged_in(request):
         return admin_redirect(request)
+    try:
+        lat_value = parse_signed_float(lat, "Latitude", -90.0, 90.0)
+        lon_value = parse_signed_float(lon, "Longitude", -180.0, 180.0)
+    except ValueError as exc:
+        return RedirectResponse(f"/control/pois/{poi_id}/edit?message={quote(str(exc))}", status_code=303)
     payload = {
         "name": name.strip(),
-        "lat": lat,
-        "lon": lon,
+        "lat": lat_value,
+        "lon": lon_value,
         "description": description.strip(),
         "is_public": bool(is_public),
         "review_status": review_status.strip().lower(),
@@ -1943,3 +2018,8 @@ async def admin_refit_body(
 @app.get("/about", response_class=HTMLResponse)
 async def about(request: Request) -> HTMLResponse:
     return render(request, "about.html", {})
+
+
+@app.get("/observations/guide", response_class=HTMLResponse)
+async def observation_guide(request: Request) -> HTMLResponse:
+    return render(request, "observation_guide.html", {})
