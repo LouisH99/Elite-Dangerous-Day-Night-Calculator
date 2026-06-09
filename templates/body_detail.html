@@ -103,12 +103,12 @@
       <div class="card visual-card">
         <h2>Local sun elevation</h2>
         {% if prediction %}
-          <canvas id="sunCanvas" width="420" height="280" data-prediction='{{ prediction_json|safe }}'></canvas>
+          <canvas id="sunCanvas" width="420" height="280" data-prediction='{{ prediction_json }}'></canvas>
           <div class="state-pill {{ prediction.centre_state|lower }}">{{ prediction.centre_state }}</div>
           <div class="sun-trend trend-{{ prediction.sun_altitude_trend|replace(' ', '-') }}">
             Sun is {{ prediction.sun_altitude_trend }}{% if prediction.sun_altitude_rate_deg_per_min is not none %} · {{ prediction.sun_altitude_rate_deg_per_min|num(4) }}°/min{% endif %}
           </div>
-          <div id="countdown" class="countdown" data-prediction='{{ prediction_json|safe }}'>Loading timer…</div>
+          <div id="countdown" class="countdown" data-prediction='{{ prediction_json }}'>Loading timer…</div>
         {% else %}
           <div class="empty-visual">Enter latitude/longitude/time or select a POI to calculate.</div>
         {% endif %}

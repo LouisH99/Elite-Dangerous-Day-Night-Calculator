@@ -2,6 +2,8 @@
 
 - Coordinate, elevation, and heading inputs now accept explicit leading plus signs.
 - Added `/race/{race_key}` links that redirect directly to the matching racing POI/body page.
+- Fixed POI prediction display data for race names containing apostrophes, so the 2D view countdown keeps showing the next sunrise/sunset.
+- Updated the observation guide wording for body selection before taking readings.
 
 ## V0.214
 
