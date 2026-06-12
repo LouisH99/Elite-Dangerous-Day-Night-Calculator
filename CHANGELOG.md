@@ -1,3 +1,9 @@
+## V0.218
+
+- Added a public feedback form for bug reports and feature ideas.
+- Added a reviewer/admin feedback inbox with type/status filters, status updates, and internal notes.
+- Added feedback links to public navigation, About, the admin navigation, and the admin dashboard.
+
 ## V0.217
 
 - Approved observations now queue a background approved-model refit automatically when enough approved sun observations exist.

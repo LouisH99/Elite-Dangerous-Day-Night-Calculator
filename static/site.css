@@ -52,6 +52,7 @@ nav { display: flex; gap: 0.8rem; }
 h1, h2, h3 { margin: 0 0 0.6rem; line-height: 1.15; }
 p { line-height: 1.55; }
 .muted { color: var(--muted); }
+.small-text { font-size: 0.9rem; }
 .warn { color: var(--warn); }
 .notice { background: rgba(124,199,255,0.12); border: 1px solid rgba(124,199,255,0.35); padding: 0.75rem 1rem; border-radius: 14px; margin-bottom: 1rem; }
 .grid.two { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
@@ -236,6 +237,22 @@ input[readonly] { opacity: 0.82; }
   margin-top: 0.45rem;
 }
 .inline-mini { display: inline-flex; margin: 0; }
+
+/* Feedback inbox */
+.feedback-message {
+  max-width: 340px;
+  white-space: pre-wrap;
+}
+.feedback-note-cell {
+  min-width: 250px;
+}
+.feedback-review-form {
+  display: grid;
+  gap: 0.4rem;
+}
+.feedback-review-form textarea {
+  min-width: 240px;
+}
 
 /* Review table improvements */
 .residual-cell { min-width: 12rem; font-size: 0.88rem; line-height: 1.35; }

@@ -61,7 +61,7 @@ PUBLIC_POI_SUBMISSIONS_ENABLED = env_bool("ELITE_DAYNIGHT_PUBLIC_POI_SUBMISSIONS
 
 app = FastAPI(
     title="Elite Dangerous Day/Night Calculator Website",
-    version="0.217",
+    version="0.218",
     docs_url=None,
     redoc_url=None,
     openapi_url=None,
@@ -829,6 +829,38 @@ async def submit_poi_post(
     return RedirectResponse(f"/bodies/{body_id}?lat={lat_value}&lon={lon_value}&message=POI%20submitted%20for%20review", status_code=303)
 
 
+@app.get("/feedback", response_class=HTMLResponse)
+async def feedback_form(request: Request) -> HTMLResponse:
+    return render(
+        request,
+        "submit_feedback.html",
+        {"form": {"submitter_name": "", "feedback_type": "bug", "title": "", "message": "", "context": ""}},
+    )
+
+
+@app.post("/feedback", response_class=HTMLResponse)
+async def feedback_submit(
+    request: Request,
+    submitter_name: str = Form(...),
+    feedback_type: str = Form("bug"),
+    title: str = Form(...),
+    message: str = Form(...),
+    context: str = Form(""),
+) -> RedirectResponse:
+    payload = {
+        "submitter_name": submitter_name.strip(),
+        "feedback_type": feedback_type.strip().lower(),
+        "title": title.strip(),
+        "message": message.strip(),
+        "context": context.strip(),
+    }
+    try:
+        await api_request("POST", "/api/feedback", json_body=payload)
+    except ApiError as exc:
+        return RedirectResponse(f"/feedback?message={quote(exc.detail)}", status_code=303)
+    return RedirectResponse("/feedback?message=Feedback%20sent.%20Thank%20you!", status_code=303)
+
+
 @app.get("/race/{race_key}")
 async def race_key_open(
     request: Request,
@@ -1207,6 +1239,36 @@ def ensure_admin_user_table() -> None:
             )
             con.execute("CREATE INDEX IF NOT EXISTS idx_admin_users_username ON admin_users(username)")
             con.execute("CREATE INDEX IF NOT EXISTS idx_admin_users_active ON admin_users(is_active)")
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS feedback_entries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    submitter_name TEXT NOT NULL,
+                    feedback_type TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    message TEXT NOT NULL,
+                    context TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'new',
+                    internal_note TEXT NOT NULL DEFAULT '',
+                    created_at_utc TEXT NOT NULL,
+                    updated_at_utc TEXT NOT NULL,
+                    reviewed_at_utc TEXT,
+                    reviewed_by TEXT
+                )
+                """
+            )
+            feedback_cols = {r[1] for r in con.execute("PRAGMA table_info(feedback_entries)").fetchall()}
+            if "context" not in feedback_cols:
+                con.execute("ALTER TABLE feedback_entries ADD COLUMN context TEXT NOT NULL DEFAULT ''")
+            if "internal_note" not in feedback_cols:
+                con.execute("ALTER TABLE feedback_entries ADD COLUMN internal_note TEXT NOT NULL DEFAULT ''")
+            if "reviewed_at_utc" not in feedback_cols:
+                con.execute("ALTER TABLE feedback_entries ADD COLUMN reviewed_at_utc TEXT")
+            if "reviewed_by" not in feedback_cols:
+                con.execute("ALTER TABLE feedback_entries ADD COLUMN reviewed_by TEXT")
+            con.execute("CREATE INDEX IF NOT EXISTS idx_feedback_entries_status_created ON feedback_entries(status, created_at_utc DESC)")
+            con.execute("CREATE INDEX IF NOT EXISTS idx_feedback_entries_type_created ON feedback_entries(feedback_type, created_at_utc DESC)")
+            con.execute("CREATE INDEX IF NOT EXISTS idx_feedback_entries_created ON feedback_entries(created_at_utc DESC)")
             now = utc_now()
             row = con.execute("SELECT id FROM admin_users WHERE username = ? COLLATE NOCASE", (SUPERUSER_NAME,)).fetchone()
             if row is None:
@@ -1650,7 +1712,58 @@ async def admin_home(request: Request):
         return admin_redirect(request)
     summary = await api_request("GET", "/api/summary")
     observations = await api_request("GET", "/api/admin/observations", params={"status": "new", "limit": 10})
-    return render(request, "admin_dashboard.html", {"summary": summary, "new_observations": observations.get("results", [])})
+    feedback = await api_request("GET", "/api/admin/feedback", params={"status": "new", "limit": 5})
+    return render(request, "admin_dashboard.html", {"summary": summary, "new_observations": observations.get("results", []), "new_feedback": feedback.get("results", [])})
+
+
+@app.get("/control/feedback", response_class=HTMLResponse)
+async def admin_feedback(
+    request: Request,
+    feedback_type: str = Query("all"),
+    status: str = Query("new"),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+):
+    if not admin_logged_in(request):
+        return admin_redirect(request)
+    params: Dict[str, Any] = {"limit": limit, "offset": offset}
+    if feedback_type and feedback_type != "all":
+        params["feedback_type"] = feedback_type.strip().lower()
+    if status and status != "all":
+        params["status"] = status.strip().lower()
+    result = await api_request("GET", "/api/admin/feedback", params=params)
+    return render(
+        request,
+        "admin_feedback.html",
+        {
+            "feedback": result.get("results", []),
+            "feedback_type": feedback_type,
+            "status": status,
+            "limit": limit,
+            "offset": offset,
+            "prev_offset": max(offset - limit, 0),
+        },
+    )
+
+
+@app.post("/control/feedback/{feedback_id}")
+async def admin_update_feedback(
+    request: Request,
+    feedback_id: int,
+    status: str = Form(...),
+    internal_note: str = Form(""),
+    next_url: str = Form("/control/feedback"),
+):
+    if not admin_logged_in(request):
+        return admin_redirect(request)
+    payload = {
+        "status": status.strip().lower(),
+        "internal_note": internal_note.strip(),
+        "actor": request.session.get("admin_user", "control-admin"),
+    }
+    await api_request("PATCH", f"/api/admin/feedback/{feedback_id}", json_body=payload)
+    sep = "&" if "?" in next_url else "?"
+    return RedirectResponse(f"{next_url}{sep}message=Feedback%20updated", status_code=303)
 
 
 @app.get("/control/observations", response_class=HTMLResponse)

@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block title %}Feedback - Elite Day/Night{% endblock %}
+{% block content %}
+<section class="card narrow">
+  <h1>Feedback</h1>
+  <p class="muted">Send a bug report or feature idea for the day/night calculator.</p>
+  <form method="post" action="/feedback" class="stack-form">
+    <label>Name
+      <input name="submitter_name" required maxlength="80" placeholder="CMDR or contact name">
+    </label>
+    <label>Type
+      <select name="feedback_type">
+        <option value="bug">bug report</option>
+        <option value="idea">idea / feature request</option>
+      </select>
+    </label>
+    <label>Title
+      <input name="title" required minlength="3" maxlength="160" placeholder="Short summary">
+    </label>
+    <label>Page, system, body, or race key optional
+      <input name="context" maxlength="240" placeholder="/bodies/123, Muang 5 a, RAZZAFRAG03">
+    </label>
+    <label>Message
+      <textarea name="message" rows="7" required minlength="5" maxlength="4000" placeholder="What happened, or what should be improved?"></textarea>
+    </label>
+    <button type="submit" class="primary">Send feedback</button>
+  </form>
+  <p class="muted small-text">You can also use <a href="https://github.com/LouisH99/Elite-Dangerous-Day-Night-Calculator/issues" rel="noopener noreferrer">GitHub Issues</a> for public tracking.</p>
+</section>
+{% endblock %}

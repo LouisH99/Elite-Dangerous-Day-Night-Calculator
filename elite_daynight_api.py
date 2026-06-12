@@ -107,10 +107,12 @@ PROVISIONAL_WORKER_STARTED = False
 ALLOWED_REVIEW = {"new", "approved", "rejected", "needs_check", "corrected"}
 ALLOWED_OBSERVATIONS = {"sunrise", "sunset", "horizon", "rise", "set", "elevation", "altitude", "sun_altitude", "alt", "day", "night"}
 ALLOWED_QUALITY = {"high", "medium", "low"}
+ALLOWED_FEEDBACK_TYPES = {"bug", "idea"}
+ALLOWED_FEEDBACK_STATUS = {"new", "seen", "planned", "done", "closed"}
 
 app = FastAPI(
     title="Elite Dangerous Day/Night Calculator API",
-    version="0.217",
+    version="0.218",
     description="Local-first API for systems, bodies, observations, fitting and prediction.",
 )
 
@@ -301,6 +303,65 @@ class PoiPatch(BaseModel):
     actor: str = "website-admin"
 
 
+class FeedbackCreate(BaseModel):
+    submitter_name: str = Field(..., min_length=1, max_length=80)
+    feedback_type: str = "bug"
+    title: str = Field(..., min_length=3, max_length=160)
+    message: str = Field(..., min_length=5, max_length=4000)
+    context: str = Field("", max_length=240)
+
+    @validator("feedback_type")
+    def check_feedback_type(cls, value: str) -> str:
+        v = value.strip().lower()
+        if v not in ALLOWED_FEEDBACK_TYPES:
+            raise ValueError("feedback_type must be bug or idea")
+        return v
+
+    @validator("submitter_name")
+    def strip_submitter_name(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("submitter_name is required")
+        return stripped
+
+    @validator("title")
+    def strip_feedback_title(cls, value: str) -> str:
+        stripped = value.strip()
+        if len(stripped) < 3:
+            raise ValueError("title is too short")
+        return stripped
+
+    @validator("message")
+    def strip_feedback_message(cls, value: str) -> str:
+        stripped = value.strip()
+        if len(stripped) < 5:
+            raise ValueError("message is too short")
+        return stripped
+
+    @validator("context")
+    def strip_feedback_context(cls, value: str) -> str:
+        return value.strip()
+
+
+class FeedbackPatch(BaseModel):
+    status: Optional[str] = None
+    internal_note: Optional[str] = Field(None, max_length=4000)
+    actor: str = "website-admin"
+
+    @validator("status")
+    def check_feedback_status(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        v = value.strip().lower()
+        if v not in ALLOWED_FEEDBACK_STATUS:
+            raise ValueError("invalid feedback status")
+        return v
+
+    @validator("internal_note")
+    def strip_feedback_note(cls, value: Optional[str]) -> Optional[str]:
+        return None if value is None else value.strip()
+
+
 # ------------------------------ DB helpers ------------------------------
 
 def harden_connection(con: sqlite3.Connection) -> None:
@@ -467,6 +528,36 @@ def ensure_runtime_migrations(con: sqlite3.Connection) -> None:
     con.execute("CREATE INDEX IF NOT EXISTS idx_poi_transition_cache_lookup ON poi_transition_cache(poi_id, fit_id, model_mode, cache_version)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_poi_transition_cache_body_fit ON poi_transition_cache(body_id, fit_id)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_poi_transition_cache_checked ON poi_transition_cache(checked_until_utc)")
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS feedback_entries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            submitter_name TEXT NOT NULL,
+            feedback_type TEXT NOT NULL,
+            title TEXT NOT NULL,
+            message TEXT NOT NULL,
+            context TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'new',
+            internal_note TEXT NOT NULL DEFAULT '',
+            created_at_utc TEXT NOT NULL,
+            updated_at_utc TEXT NOT NULL,
+            reviewed_at_utc TEXT,
+            reviewed_by TEXT
+        )
+        """
+    )
+    feedback_cols = {r[1] for r in con.execute("PRAGMA table_info(feedback_entries)").fetchall()}
+    if "context" not in feedback_cols:
+        con.execute("ALTER TABLE feedback_entries ADD COLUMN context TEXT NOT NULL DEFAULT ''")
+    if "internal_note" not in feedback_cols:
+        con.execute("ALTER TABLE feedback_entries ADD COLUMN internal_note TEXT NOT NULL DEFAULT ''")
+    if "reviewed_at_utc" not in feedback_cols:
+        con.execute("ALTER TABLE feedback_entries ADD COLUMN reviewed_at_utc TEXT")
+    if "reviewed_by" not in feedback_cols:
+        con.execute("ALTER TABLE feedback_entries ADD COLUMN reviewed_by TEXT")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_feedback_entries_status_created ON feedback_entries(status, created_at_utc DESC)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_feedback_entries_type_created ON feedback_entries(feedback_type, created_at_utc DESC)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_feedback_entries_created ON feedback_entries(created_at_utc DESC)")
     if hasattr(dbmod, "dedupe_duplicate_bodies"):
         dbmod.dedupe_duplicate_bodies(con)
     if hasattr(dbmod, "dedupe_active_fits"):
@@ -685,6 +776,33 @@ def poi_public_dict(row: sqlite3.Row) -> Dict[str, Any]:
         "created_by": d.get("created_by"),
         "updated_by": d.get("updated_by"),
     }
+
+
+def feedback_public_dict(row: sqlite3.Row, include_internal: bool = True) -> Dict[str, Any]:
+    d = row_to_dict(row)
+    out = {
+        "id": d["id"],
+        "submitter_name": d.get("submitter_name", ""),
+        "feedback_type": d.get("feedback_type", "bug"),
+        "title": d.get("title", ""),
+        "message": d.get("message", ""),
+        "context": d.get("context", ""),
+        "status": d.get("status", "new"),
+        "created_at_utc": d.get("created_at_utc"),
+        "updated_at_utc": d.get("updated_at_utc"),
+    }
+    if include_internal:
+        out["internal_note"] = d.get("internal_note", "")
+        out["reviewed_at_utc"] = d.get("reviewed_at_utc")
+        out["reviewed_by"] = d.get("reviewed_by")
+    return out
+
+
+def get_feedback_row_or_404(con: sqlite3.Connection, feedback_id: int) -> sqlite3.Row:
+    row = con.execute("SELECT * FROM feedback_entries WHERE id = ?", (feedback_id,)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail=f"Feedback id not found: {feedback_id}")
+    return row
 
 
 def get_poi_row_or_404(con: sqlite3.Connection, poi_id: int) -> sqlite3.Row:
@@ -1656,7 +1774,7 @@ def start_provisional_fit_worker() -> None:
 def root() -> Dict[str, Any]:
     return {
         "name": "Elite Dangerous Day/Night Calculator API",
-        "version": "0.217",
+        "version": "0.218",
         "db_path": DB_PATH,
         "docs": "/docs",
     }
@@ -1687,7 +1805,7 @@ def health() -> Dict[str, Any]:
 def summary() -> Dict[str, Any]:
     con = connect()
     try:
-        counts = {table: con.execute(f"SELECT COUNT(*) AS c FROM {table}").fetchone()["c"] for table in ("systems", "bodies", "observations", "fits", "fit_observations")}
+        counts = {table: con.execute(f"SELECT COUNT(*) AS c FROM {table}").fetchone()["c"] for table in ("systems", "bodies", "observations", "fits", "fit_observations", "feedback_entries")}
         observed_count = con.execute("SELECT COUNT(DISTINCT body_id) AS c FROM observations WHERE review_status <> 'rejected'").fetchone()["c"]
         tracked_count = con.execute("SELECT COUNT(*) AS c FROM bodies WHERE tracked_for_prediction = 1").fetchone()["c"]
         rows = con.execute(
@@ -2788,6 +2906,120 @@ def admin_racing_import(req: RacingImportRequest) -> Dict[str, Any]:
                 con.close()
         imported.append({"key": race.get("key"), "name": race.get("name"), "system_name": system_name, "body_name": body_name, "poi_id": poi_id})
     return {"imported_count": len(imported), "skipped_count": len(skipped), "imported": imported, "skipped": skipped}
+
+
+@app.post("/api/feedback")
+def submit_feedback(req: FeedbackCreate) -> Dict[str, Any]:
+    with WRITE_LOCK:
+        con = connect_write()
+        try:
+            now = dbmod.utc_now()
+            cur = con.execute(
+                """
+                INSERT INTO feedback_entries(submitter_name, feedback_type, title, message, context, status, internal_note, created_at_utc, updated_at_utc)
+                VALUES (?, ?, ?, ?, ?, 'new', '', ?, ?)
+                """,
+                (req.submitter_name, req.feedback_type, req.title, req.message, req.context, now, now),
+            )
+            feedback_id = int(cur.lastrowid)
+            row = get_feedback_row_or_404(con, feedback_id)
+            public = feedback_public_dict(row, include_internal=False)
+            insert_audit(con, "feedback", feedback_id, "api_submit_feedback", None, public, req.submitter_name)
+            con.commit()
+            return public
+        except sqlite3.OperationalError as exc:
+            raise http_error_from_exception(exc)
+        finally:
+            con.close()
+
+
+@app.get("/api/admin/feedback")
+def list_admin_feedback(
+    feedback_type: Optional[str] = None,
+    status: Optional[str] = None,
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+) -> Dict[str, Any]:
+    con = connect()
+    try:
+        clauses: List[str] = []
+        params: List[Any] = []
+        if feedback_type and feedback_type != "all":
+            ft = feedback_type.strip().lower()
+            if ft not in ALLOWED_FEEDBACK_TYPES:
+                raise HTTPException(status_code=400, detail="feedback_type must be bug or idea")
+            clauses.append("feedback_type = ?")
+            params.append(ft)
+        if status and status != "all":
+            st = status.strip().lower()
+            if st not in ALLOWED_FEEDBACK_STATUS:
+                raise HTTPException(status_code=400, detail="invalid feedback status")
+            clauses.append("status = ?")
+            params.append(st)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        rows = con.execute(
+            f"""
+            SELECT *
+              FROM feedback_entries
+              {where}
+             ORDER BY created_at_utc DESC, id DESC
+             LIMIT ? OFFSET ?
+            """,
+            params + [limit, offset],
+        ).fetchall()
+    finally:
+        con.close()
+    return {"results": [feedback_public_dict(r, include_internal=True) for r in rows], "limit": limit, "offset": offset}
+
+
+@app.get("/api/admin/feedback/{feedback_id}")
+def get_admin_feedback(feedback_id: int) -> Dict[str, Any]:
+    con = connect()
+    try:
+        row = get_feedback_row_or_404(con, feedback_id)
+        return feedback_public_dict(row, include_internal=True)
+    finally:
+        con.close()
+
+
+@app.patch("/api/admin/feedback/{feedback_id}")
+def patch_feedback(feedback_id: int, req: FeedbackPatch) -> Dict[str, Any]:
+    with WRITE_LOCK:
+        con = connect_write()
+        try:
+            old = get_feedback_row_or_404(con, feedback_id)
+            old_public = feedback_public_dict(old, include_internal=True)
+            patch = req.dict(exclude_unset=True)
+            actor = str(patch.pop("actor", "website-admin") or "website-admin")
+            status = patch.get("status")
+            if status is None:
+                status = old["status"]
+            internal_note = patch.get("internal_note")
+            if internal_note is None:
+                internal_note = old["internal_note"] or ""
+            reviewed_at = old["reviewed_at_utc"]
+            reviewed_by = old["reviewed_by"]
+            if status != old["status"] or "internal_note" in patch:
+                reviewed_at = dbmod.utc_now()
+                reviewed_by = actor
+            now = dbmod.utc_now()
+            con.execute(
+                """
+                UPDATE feedback_entries
+                   SET status = ?, internal_note = ?, reviewed_at_utc = ?, reviewed_by = ?, updated_at_utc = ?
+                 WHERE id = ?
+                """,
+                (status, internal_note, reviewed_at, reviewed_by, now, feedback_id),
+            )
+            row = get_feedback_row_or_404(con, feedback_id)
+            new_public = feedback_public_dict(row, include_internal=True)
+            insert_audit(con, "feedback", feedback_id, "api_patch_feedback", old_public, new_public, actor)
+            con.commit()
+            return new_public
+        except sqlite3.OperationalError as exc:
+            raise http_error_from_exception(exc)
+        finally:
+            con.close()
 
 
 @app.get("/api/admin/pois")

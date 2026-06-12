@@ -1,0 +1,88 @@
+{% extends "admin_base.html" %}
+{% block title %}Feedback - Elite Day/Night Control{% endblock %}
+{% block content %}
+<section class="card">
+  <h1>Feedback</h1>
+  <p class="muted">Review public bug reports and feature ideas.</p>
+  <form method="get" action="/control/feedback" class="inline-form wrap">
+    <label>Type
+      <select name="feedback_type">
+        <option value="all" {% if feedback_type == "all" %}selected{% endif %}>all</option>
+        <option value="bug" {% if feedback_type == "bug" %}selected{% endif %}>bug</option>
+        <option value="idea" {% if feedback_type == "idea" %}selected{% endif %}>idea</option>
+      </select>
+    </label>
+    <label>Status
+      <select name="status">
+        <option value="all" {% if status == "all" %}selected{% endif %}>all</option>
+        {% for st in ["new", "seen", "planned", "done", "closed"] %}
+          <option value="{{ st }}" {% if status == st %}selected{% endif %}>{{ st }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>Limit
+      <input name="limit" type="number" min="1" max="500" value="{{ limit }}">
+    </label>
+    <button type="submit">Filter</button>
+  </form>
+</section>
+
+<section class="card">
+  <h2>Entries</h2>
+  <div class="table-wrap">
+    <table class="dense">
+      <thead>
+        <tr>
+          <th>Title</th>
+          <th>From</th>
+          <th>Context</th>
+          <th>Status</th>
+          <th>Message</th>
+          <th>Reviewer note</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for item in feedback %}
+        <tr>
+          <td>
+            <strong>{{ item.title }}</strong><br>
+            <span class="badge {% if item.feedback_type == 'bug' %}badge-danger{% else %}badge-warn{% endif %}">{{ item.feedback_type }}</span>
+          </td>
+          <td>{{ item.submitter_name }}<br><span class="muted">{{ item.created_at_utc|utc }}</span></td>
+          <td class="note-cell">{{ item.context|dash }}</td>
+          <td>
+            <span class="badge {% if item.status in ['done','closed'] %}badge-ok{% elif item.status in ['planned','seen'] %}badge-warn{% else %}badge-new{% endif %}">{{ item.status }}</span>
+            {% if item.reviewed_by %}<br><span class="muted">{{ item.reviewed_by }}</span>{% endif %}
+          </td>
+          <td class="note-cell feedback-message">{{ item.message }}</td>
+          <td class="feedback-note-cell">
+            <form method="post" action="/control/feedback/{{ item.id }}" class="feedback-review-form">
+              <input type="hidden" name="next_url" value="/control/feedback?feedback_type={{ feedback_type }}&status={{ status }}&limit={{ limit }}&offset={{ offset }}">
+              <select name="status">
+                {% for st in ["new", "seen", "planned", "done", "closed"] %}
+                  <option value="{{ st }}" {% if item.status == st %}selected{% endif %}>{{ st }}</option>
+                {% endfor %}
+              </select>
+              <textarea name="internal_note" rows="3" maxlength="4000" placeholder="Internal note">{{ item.internal_note }}</textarea>
+              <button type="submit" class="small">Save</button>
+            </form>
+          </td>
+          <td>#{{ item.id }}</td>
+        </tr>
+      {% else %}
+        <tr><td colspan="7" class="muted">No feedback found.</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <div class="pager">
+    {% if offset > 0 %}
+      <a class="button small" href="/control/feedback?feedback_type={{ feedback_type }}&status={{ status }}&limit={{ limit }}&offset={{ prev_offset }}">Previous</a>
+    {% endif %}
+    {% if feedback|length == limit %}
+      <a class="button small" href="/control/feedback?feedback_type={{ feedback_type }}&status={{ status }}&limit={{ limit }}&offset={{ offset + limit }}">Next</a>
+    {% endif %}
+  </div>
+</section>
+{% endblock %}

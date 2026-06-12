@@ -5,7 +5,7 @@
   <div class="split">
     <div>
       <h1>Admin dashboard</h1>
-      <p class="muted">Review observations first. Approved observations are used only after a manual refit.</p>
+      <p class="muted">Review observations and feedback. Approved observations can queue an approved-model refit automatically.</p>
     </div>
     <form method="post" action="/control/logout">
       <button type="submit">Log out</button>
@@ -16,14 +16,41 @@
     <div><strong>{{ summary.bodies_with_observations|length }}</strong><span>bodies with observations</span></div>
     <div><strong>{{ summary.counts.observations }}</strong><span>observations</span></div>
     <div><strong>{{ summary.counts.fits }}</strong><span>fits</span></div>
+    <div><strong>{{ summary.counts.feedback_entries }}</strong><span>feedback</span></div>
   </div>
   <p class="actions-row">
     <a class="button primary" href="/control/observations?status=new">Review new observations</a>
+    <a class="button" href="/control/feedback?status=new">Review feedback{% if new_feedback %} ({{ new_feedback|length }} new){% endif %}</a>
     <a class="button" href="/control/observations?status=approved">Approved observations</a>
     <a class="button" href="/control/bodies">Models / refit</a>
     <a class="button" href="/control/account/password">Change password</a>
     {% if is_super_admin %}<a class="button" href="/control/users">Manage users</a>{% endif %}
   </p>
+</section>
+
+<section class="card">
+  <h2>Newest feedback</h2>
+  {% if new_feedback %}
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>ID</th><th>Type</th><th>Title</th><th>From</th><th>Context</th><th>Actions</th></tr></thead>
+      <tbody>
+      {% for item in new_feedback %}
+        <tr>
+          <td>#{{ item.id }}</td>
+          <td><span class="badge {% if item.feedback_type == 'bug' %}badge-danger{% else %}badge-warn{% endif %}">{{ item.feedback_type }}</span></td>
+          <td>{{ item.title }}</td>
+          <td>{{ item.submitter_name }}</td>
+          <td>{{ item.context|dash }}</td>
+          <td><a class="button small" href="/control/feedback?status=new">Open</a></td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="muted">No new feedback waiting for review.</p>
+  {% endif %}
 </section>
 
 <section class="card">
