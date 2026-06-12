@@ -1,12 +1,12 @@
 # Elite Dangerous Day/Night Calculator
 
-Current package version: **V0.217**.
+Current package version: **V0.218**.
 
 A community tool for predicting local daylight, sunrise, sunset, and sun elevation on planets and moons in **Elite Dangerous**.
 
 The project lets players add systems/bodies, submit sun observations, review submitted data, fit a prediction model, and use saved Points of Interest (POIs) to quickly check local light conditions.
 
-> **Project status:** early community tool, currently around `V0.217`.
+> **Project status:** early community tool, currently around `V0.218`.
 >
 > **Transparency note:** this is a **vibe-coded / AI-assisted project**. A large part of the design, code structure, debugging, and documentation was created with help from ChatGPT. The model, outputs, and implementation should be treated as experimental and should be validated with real observations.
 
@@ -27,7 +27,7 @@ For a selected planet or moon, the website can show:
 - model confidence level and score
 - system-overview health badges for model and observation triage
 
-Players can help by submitting surface observations. Reviewers can approve, reject, edit, or inspect observations before they are used in the reviewed model.
+Players can help by submitting surface observations and feedback. Reviewers can approve, reject, edit, or inspect observations before they are used in the reviewed model.
 
 ---
 
@@ -46,6 +46,7 @@ Players can help by submitting surface observations. Reviewers can approve, reje
 - Select POIs on a body page
 - Submit observations for review
 - Submit POIs for review, if public POI submissions are enabled
+- Submit bug reports and feature ideas through the feedback form
 - Try a provisional model when unreviewed observations exist
 - Beginner-friendly help text for new users
 - Public read-only prediction API at `/public/api/v1/prediction`
@@ -85,6 +86,7 @@ PUBLIC_API.md
 - View automation shadow-review recommendations for submitted observations
 - Batch-analyse observations for would-approve / candidate / needs-check recommendations
 - Manage POIs
+- Review public feedback with type/status filters and internal notes
 - Import Razz Racing race starts as POIs from the hidden control area
 - Refit reviewed and provisional models separately
 - Reviewer accounts can queue reviewed/provisional refits without super-admin account-management permissions
