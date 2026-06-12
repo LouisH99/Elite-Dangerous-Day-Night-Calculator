@@ -1,3 +1,9 @@
+## V0.217
+
+- Approved observations now queue a background approved-model refit automatically when enough approved sun observations exist.
+- Auto-approved refits use heading constraints and recent-observation boost by default.
+- Reviewer/admin saves now report whether the approved refit was queued, already queued, or skipped.
+
 ## V0.216
 
 - Rejected observations are no longer counted as usable observations on model/body overview surfaces.

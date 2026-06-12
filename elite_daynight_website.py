@@ -61,7 +61,7 @@ PUBLIC_POI_SUBMISSIONS_ENABLED = env_bool("ELITE_DAYNIGHT_PUBLIC_POI_SUBMISSIONS
 
 app = FastAPI(
     title="Elite Dangerous Day/Night Calculator Website",
-    version="0.216",
+    version="0.217",
     docs_url=None,
     redoc_url=None,
     openapi_url=None,
@@ -475,6 +475,22 @@ def parse_signed_float(value: Any, field_name: str, min_value: Optional[float] =
     if max_value is not None and parsed > max_value:
         raise ValueError(f"{field_name} must be <= {max_value:g}")
     return parsed
+
+
+def approved_refit_message(result: Dict[str, Any], default: str) -> str:
+    refit = result.get("approved_refit_job")
+    if not isinstance(refit, dict):
+        return default
+    reason = str(refit.get("reason") or "unknown")
+    if refit.get("queued"):
+        return "Observation approved; approved model refit queued"
+    if reason == "already_queued":
+        return "Observation approved; approved model refit already queued"
+    if reason == "not_enough_approved_observations":
+        return "Observation approved; not enough approved observations to refit yet"
+    if reason == "disabled":
+        return "Observation approved; approved model auto-refit is disabled"
+    return f"Observation approved; refit not queued ({reason})"
 
 
 @app.get("/public/api/v1/health")
@@ -1740,9 +1756,14 @@ async def admin_review_observation(
 ):
     if not admin_logged_in(request):
         return admin_redirect(request)
-    await api_request("POST", f"/api/admin/observations/{observation_id}/review", json_body={"review_status": review_status, "actor": request.session.get("admin_user", "control-admin")})
+    result = await api_request(
+        "POST",
+        f"/api/admin/observations/{observation_id}/review",
+        json_body={"review_status": review_status, "actor": request.session.get("admin_user", "control-admin")},
+    )
+    message = approved_refit_message(result, "Observation updated")
     sep = "&" if "?" in next_url else "?"
-    return RedirectResponse(f"{next_url}{sep}message=Observation%20updated", status_code=303)
+    return RedirectResponse(f"{next_url}{sep}message={quote(message)}", status_code=303)
 
 
 @app.get("/control/observations/{observation_id}/edit", response_class=HTMLResponse)
@@ -1793,8 +1814,9 @@ async def admin_edit_observation_submit(
         "review_status": review_status.strip().lower(),
         "note": note.strip(),
     }
-    await api_request("PATCH", f"/api/admin/observations/{observation_id}", json_body=payload)
-    return RedirectResponse(f"/control/observations/{observation_id}/edit?message=Saved", status_code=303)
+    result = await api_request("PATCH", f"/api/admin/observations/{observation_id}", json_body=payload)
+    message = approved_refit_message(result, "Saved")
+    return RedirectResponse(f"/control/observations/{observation_id}/edit?message={quote(message)}", status_code=303)
 
 
 @app.post("/control/observations/{observation_id}/delete")

@@ -89,6 +89,10 @@ POI_CACHE_MAX_CROSSINGS = env_int("ELITE_DAYNIGHT_POI_CACHE_MAX_CROSSINGS", 512,
 # calculates and stores recommendations; it never changes review_status.
 AUTOMATION_MODE = os.environ.get("ELITE_DAYNIGHT_AUTOMATION_MODE", "shadow").strip().lower()
 AUTOMATION_BATCH_LIMIT = int(os.environ.get("ELITE_DAYNIGHT_AUTOMATION_BATCH_LIMIT", "200"))
+AUTO_REFIT_APPROVED_ON_APPROVAL = env_bool("ELITE_DAYNIGHT_AUTO_REFIT_APPROVED_ON_APPROVAL", True)
+AUTO_REFIT_APPROVED_MIN_OBSERVATIONS = env_int("ELITE_DAYNIGHT_AUTO_REFIT_APPROVED_MIN_OBSERVATIONS", 3, 1, 100)
+AUTO_REFIT_APPROVED_USE_HEADING = env_bool("ELITE_DAYNIGHT_AUTO_REFIT_APPROVED_USE_HEADING", True)
+AUTO_REFIT_APPROVED_TIME_WEIGHTING = env_bool("ELITE_DAYNIGHT_AUTO_REFIT_APPROVED_TIME_WEIGHTING", True)
 
 WRITE_LOCK = threading.RLock()
 
@@ -106,7 +110,7 @@ ALLOWED_QUALITY = {"high", "medium", "low"}
 
 app = FastAPI(
     title="Elite Dangerous Day/Night Calculator API",
-    version="0.216",
+    version="0.217",
     description="Local-first API for systems, bodies, observations, fitting and prediction.",
 )
 
@@ -1332,6 +1336,18 @@ def pending_unreviewed_count(con: sqlite3.Connection, body_id: int) -> int:
     return int(row["c"] if row else 0)
 
 
+def approved_sun_observation_count(con: sqlite3.Connection, body_id: int) -> int:
+    row = con.execute(
+        """
+        SELECT COUNT(*) AS c
+          FROM observations
+         WHERE body_id = ? AND review_status = 'approved' AND target_type = 'sun'
+        """,
+        (body_id,),
+    ).fetchone()
+    return int(row["c"] if row else 0)
+
+
 def create_background_job_row(
     body_id: int,
     reason: str,
@@ -1501,6 +1517,42 @@ def enqueue_provisional_fit(body_id: int, reason: str = "observation_submitted")
     )
 
 
+def enqueue_approved_refit_after_approval(body_id: int, actor: str = "api-admin") -> Dict[str, Any]:
+    if not AUTO_REFIT_APPROVED_ON_APPROVAL:
+        return {"queued": False, "reason": "disabled", "body_id": body_id, "fit_mode": "approved"}
+    con = connect()
+    try:
+        get_body_row_or_404(con, body_id)
+        approved_count = approved_sun_observation_count(con, body_id)
+    finally:
+        con.close()
+
+    if approved_count < AUTO_REFIT_APPROVED_MIN_OBSERVATIONS:
+        return {
+            "queued": False,
+            "reason": "not_enough_approved_observations",
+            "body_id": body_id,
+            "fit_mode": "approved",
+            "approved_observations": approved_count,
+            "minimum_observations": AUTO_REFIT_APPROVED_MIN_OBSERVATIONS,
+        }
+
+    result = enqueue_fit_job(
+        body_id,
+        include_unreviewed=False,
+        use_heading=AUTO_REFIT_APPROVED_USE_HEADING,
+        time_weighting=AUTO_REFIT_APPROVED_TIME_WEIGHTING,
+        time_half_life_hours=24.0,
+        force_refit=True,
+        reason="observation_approved",
+        actor=actor or "api-admin",
+    )
+    result["approved_observations"] = approved_count
+    result["use_heading"] = AUTO_REFIT_APPROVED_USE_HEADING
+    result["time_weighting"] = AUTO_REFIT_APPROVED_TIME_WEIGHTING
+    return result
+
+
 def load_background_job(job_id: int) -> Dict[str, Any]:
     con = connect()
     try:
@@ -1604,7 +1656,7 @@ def start_provisional_fit_worker() -> None:
 def root() -> Dict[str, Any]:
     return {
         "name": "Elite Dangerous Day/Night Calculator API",
-        "version": "0.216",
+        "version": "0.217",
         "db_path": DB_PATH,
         "docs": "/docs",
     }
@@ -3089,6 +3141,8 @@ def get_admin_observation(observation_id: int) -> Dict[str, Any]:
 
 @app.patch("/api/admin/observations/{observation_id}")
 def patch_observation(observation_id: int, req: ObservationPatch) -> Dict[str, Any]:
+    queue_approved_refit_body_id: Optional[int] = None
+    response: Dict[str, Any]
     with WRITE_LOCK:
         con = connect_write()
         try:
@@ -3151,6 +3205,8 @@ def patch_observation(observation_id: int, req: ObservationPatch) -> Dict[str, A
                 evaluate_observation_automation(con, int(observation_id), persist=True, actor="automation")
             except Exception:
                 pass
+            if str(old["review_status"]) != "approved" and str(row["review_status"]) == "approved":
+                queue_approved_refit_body_id = int(row["body_id"])
             con.commit()
             refreshed = con.execute(
                 """
@@ -3160,15 +3216,23 @@ def patch_observation(observation_id: int, req: ObservationPatch) -> Dict[str, A
                 """,
                 (observation_id,),
             ).fetchone()
-            return observation_public_dict(refreshed)
+            response = observation_public_dict(refreshed)
         except sqlite3.IntegrityError as exc:
             raise HTTPException(status_code=409, detail=f"Patch conflicts with an existing observation: {exc}")
         finally:
             con.close()
+    if queue_approved_refit_body_id is not None:
+        try:
+            response["approved_refit_job"] = enqueue_approved_refit_after_approval(queue_approved_refit_body_id, "api-admin")
+        except Exception as exc:
+            response["approved_refit_job"] = {"queued": False, "reason": "queue_failed", "error": str(exc)}
+    return response
 
 
 @app.post("/api/admin/observations/{observation_id}/review")
 def set_observation_review(observation_id: int, req: ReviewStatusUpdate) -> Dict[str, Any]:
+    queue_approved_refit_body_id: Optional[int] = None
+    response: Dict[str, Any]
     with WRITE_LOCK:
         con = connect_write()
         try:
@@ -3185,10 +3249,18 @@ def set_observation_review(observation_id: int, req: ReviewStatusUpdate) -> Dict
                 (observation_id,),
             ).fetchone()
             insert_audit(con, "observation", observation_id, f"set_review_{req.review_status}", row_to_dict(old), observation_public_dict(row), req.actor)
+            if str(old["review_status"]) != "approved" and str(row["review_status"]) == "approved":
+                queue_approved_refit_body_id = int(row["body_id"])
             con.commit()
-            return observation_public_dict(row)
+            response = observation_public_dict(row)
         finally:
             con.close()
+    if queue_approved_refit_body_id is not None:
+        try:
+            response["approved_refit_job"] = enqueue_approved_refit_after_approval(queue_approved_refit_body_id, req.actor)
+        except Exception as exc:
+            response["approved_refit_job"] = {"queued": False, "reason": "queue_failed", "error": str(exc)}
+    return response
 
 
 @app.post("/api/admin/bodies/{body_id}/refit")
