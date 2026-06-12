@@ -1,3 +1,9 @@
+## V0.216
+
+- Rejected observations are no longer counted as usable observations on model/body overview surfaces.
+- Observation review rows now show each body's non-rejected observation count.
+- Added an observation review filter to hide bodies with fewer than 3 non-rejected observations.
+
 ## V0.215
 
 - Coordinate, elevation, and heading inputs now accept explicit leading plus signs.

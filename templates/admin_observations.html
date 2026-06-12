@@ -33,6 +33,12 @@
         {% endfor %}
       </select>
     </label>
+    <label>Hide &lt;3
+      <select name="hide_under_three_observations">
+        <option value="" {% if not hide_under_three_observations %}selected{% endif %}>No</option>
+        <option value="1" {% if hide_under_three_observations %}selected{% endif %}>Yes</option>
+      </select>
+    </label>
     <label>Limit
       <input name="limit" type="number" min="1" max="500" value="{{ limit }}">
     </label>
@@ -43,6 +49,7 @@
     <input type="hidden" name="system_name" value="{{ system_name }}">
     <input type="hidden" name="body_name" value="{{ body_name }}">
     <input type="hidden" name="observer_name" value="{{ observer_name }}">
+    <input type="hidden" name="hide_under_three_observations" value="{{ '1' if hide_under_three_observations else '' }}">
     <input type="hidden" name="limit" value="{{ limit }}">
     <input type="hidden" name="next_url" value="/control/observations?{{ filter_qs }}">
     <button class="small" type="submit">Analyse automation recommendations</button>
@@ -59,10 +66,11 @@
           <th>ID</th>
           <th>Status</th>
           <th>System / body</th>
+          <th>Body obs</th>
           <th>Submitter</th>
           <th>Time</th>
           <th>Lat/Lon</th>
-          <th>Obs</th>
+          <th>Type</th>
           <th>Alt/Head</th>
           <th>Quality</th>
           <th>Actions</th>
@@ -77,6 +85,7 @@
           {% if o.auto_review_status %}<br><span class="badge {{ o.auto_review_status|auto_review_badge }}">{{ o.auto_review_status }}</span>{% endif %}
         </td>
         <td>{{ o.system_name }}<br><b>{{ o.body_name }}</b></td>
+        <td><b>{{ o.body_non_rejected_observation_count or 0 }}</b><br><span class="muted">non-rejected</span></td>
         <td>{{ o.observer_name|dash }}</td>
         <td>{{ o.timestamp_utc|utc }}<br><span class="muted">submitted {{ o.created_at_utc|utc }}</span></td>
         <td>{{ o.lat|num(5) }}<br>{{ o.lon|num(5) }}</td>
@@ -103,7 +112,7 @@
         </td>
       </tr>
       <tr class="review-detail-row {% if o.approved_altitude_error_deg is not none and (o.approved_altitude_error_deg|abs) > 5 %}bad-row{% endif %}">
-        <td colspan="10">
+        <td colspan="11">
           <div class="review-detail-grid">
             <div class="residual-detail">
               <b>Fit residuals</b>

@@ -106,7 +106,7 @@ ALLOWED_QUALITY = {"high", "medium", "low"}
 
 app = FastAPI(
     title="Elite Dangerous Day/Night Calculator API",
-    version="0.215",
+    version="0.216",
     description="Local-first API for systems, bodies, observations, fitting and prediction.",
 )
 
@@ -648,6 +648,7 @@ def observation_public_dict(row: sqlite3.Row) -> Dict[str, Any]:
         "auto_review_threshold_deg",
         "auto_review_confidence_score",
         "auto_reviewed_at_utc",
+        "body_non_rejected_observation_count",
     ):
         if key in d:
             out[key] = d.get(key)
@@ -1603,7 +1604,7 @@ def start_provisional_fit_worker() -> None:
 def root() -> Dict[str, Any]:
     return {
         "name": "Elite Dangerous Day/Night Calculator API",
-        "version": "0.215",
+        "version": "0.216",
         "db_path": DB_PATH,
         "docs": "/docs",
     }
@@ -1635,7 +1636,7 @@ def summary() -> Dict[str, Any]:
     con = connect()
     try:
         counts = {table: con.execute(f"SELECT COUNT(*) AS c FROM {table}").fetchone()["c"] for table in ("systems", "bodies", "observations", "fits", "fit_observations")}
-        observed_count = con.execute("SELECT COUNT(DISTINCT body_id) AS c FROM observations").fetchone()["c"]
+        observed_count = con.execute("SELECT COUNT(DISTINCT body_id) AS c FROM observations WHERE review_status <> 'rejected'").fetchone()["c"]
         tracked_count = con.execute("SELECT COUNT(*) AS c FROM bodies WHERE tracked_for_prediction = 1").fetchone()["c"]
         rows = con.execute(
             """
@@ -1643,7 +1644,9 @@ def summary() -> Dict[str, Any]:
                 SELECT body_id, COUNT(*) AS observations,
                        SUM(CASE WHEN review_status = 'approved' THEN 1 ELSE 0 END) AS approved,
                        SUM(CASE WHEN review_status IN ('new','needs_check') THEN 1 ELSE 0 END) AS unreviewed
-                  FROM observations GROUP BY body_id
+                  FROM observations
+                 WHERE review_status <> 'rejected'
+                 GROUP BY body_id
             ), active_approved AS (
                 SELECT f.*
                   FROM fits f
@@ -1705,6 +1708,7 @@ def enrich_system_search_model_health(con: sqlite3.Connection, system_rows: List
             SELECT body_id, COUNT(*) AS observations
               FROM observations
              WHERE target_type = 'sun'
+               AND review_status <> 'rejected'
              GROUP BY body_id
         ), active_approved AS (
             SELECT body_id, MAX(id) AS approved_fit_id
@@ -1838,6 +1842,7 @@ def search_systems(
                        SUM(CASE WHEN review_status IN ('new','needs_check') THEN 1 ELSE 0 END) AS unreviewed_observations
                   FROM observations
                  WHERE target_type = 'sun'
+                   AND review_status <> 'rejected'
                  GROUP BY body_id
             ), active_approved AS (
                 SELECT f.*
@@ -2108,7 +2113,9 @@ def get_bodies(system_id: int, only_landable: bool = False) -> Dict[str, Any]:
                 SELECT body_id, COUNT(*) AS observations,
                        SUM(CASE WHEN review_status = 'approved' THEN 1 ELSE 0 END) AS approved,
                        SUM(CASE WHEN review_status IN ('new','needs_check') THEN 1 ELSE 0 END) AS unreviewed
-                  FROM observations GROUP BY body_id
+                  FROM observations
+                 WHERE review_status <> 'rejected'
+                 GROUP BY body_id
             ), active_approved AS (
                 SELECT f.*
                   FROM fits f
@@ -2898,6 +2905,7 @@ def list_observations(
     system_name: Optional[str] = None,
     observer_name: Optional[str] = None,
     automation: Optional[str] = Query(None, description="auto review filter"),
+    min_body_non_rejected_observations: int = Query(0, ge=0, le=1000),
     limit: int = Query(100, ge=1, le=1000),
     offset: int = Query(0, ge=0),
 ) -> Dict[str, Any]:
@@ -2932,10 +2940,14 @@ def list_observations(
             else:
                 clauses.append("o.auto_review_status = ?")
                 params.append(automation_filter)
+        if min_body_non_rejected_observations > 0:
+            clauses.append("COALESCE(body_obs.non_rejected_observations, 0) >= ?")
+            params.append(int(min_body_non_rejected_observations))
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
         rows = con.execute(
             f"""
             SELECT o.*, s.name AS system_name, b.name AS body_name,
+                   COALESCE(body_obs.non_rejected_observations, 0) AS body_non_rejected_observation_count,
                    af.id AS approved_fit_id,
                    afo.altitude_error_deg AS approved_altitude_error_deg,
                    afo.heading_error_deg AS approved_heading_error_deg,
@@ -2947,6 +2959,12 @@ def list_observations(
               FROM observations o
               JOIN systems s ON s.id = o.system_id
               JOIN bodies b ON b.id = o.body_id
+              LEFT JOIN (
+                    SELECT body_id, COUNT(*) AS non_rejected_observations
+                      FROM observations
+                     WHERE review_status <> 'rejected'
+                     GROUP BY body_id
+              ) body_obs ON body_obs.body_id = o.body_id
               LEFT JOIN fits af ON af.id = (
                     SELECT id FROM fits
                      WHERE body_id = o.body_id

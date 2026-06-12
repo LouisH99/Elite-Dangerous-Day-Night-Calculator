@@ -61,7 +61,7 @@ PUBLIC_POI_SUBMISSIONS_ENABLED = env_bool("ELITE_DAYNIGHT_PUBLIC_POI_SUBMISSIONS
 
 app = FastAPI(
     title="Elite Dangerous Day/Night Calculator Website",
-    version="0.215",
+    version="0.216",
     docs_url=None,
     redoc_url=None,
     openapi_url=None,
@@ -1645,6 +1645,7 @@ async def admin_observations(
     body_name: str = Query(""),
     observer_name: str = Query(""),
     automation: str = Query("all"),
+    hide_under_three_observations: str = Query(""),
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
 ):
@@ -1661,6 +1662,9 @@ async def admin_observations(
         params["observer_name"] = observer_name.strip()
     if automation and automation != "all":
         params["automation"] = automation.strip().lower()
+    hide_under_three = query_flag(hide_under_three_observations)
+    if hide_under_three:
+        params["min_body_non_rejected_observations"] = 3
     data = await api_request("GET", "/api/admin/observations", params=params)
     summary = await api_request("GET", "/api/summary")
     filter_qs = urlencode({
@@ -1669,6 +1673,7 @@ async def admin_observations(
         "body_name": body_name,
         "observer_name": observer_name,
         "automation": automation,
+        "hide_under_three_observations": "1" if hide_under_three else "",
         "limit": limit,
         "offset": offset,
     })
@@ -1678,6 +1683,7 @@ async def admin_observations(
         "body_name": body_name,
         "observer_name": observer_name,
         "automation": automation,
+        "hide_under_three_observations": "1" if hide_under_three else "",
         "limit": limit,
     })
     return render(
@@ -1690,6 +1696,7 @@ async def admin_observations(
             "body_name": body_name,
             "observer_name": observer_name,
             "automation": automation,
+            "hide_under_three_observations": hide_under_three,
             "limit": limit,
             "offset": offset,
             "summary": summary,

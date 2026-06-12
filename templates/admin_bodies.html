@@ -5,14 +5,14 @@
   <div class="split">
     <div>
       <h1>Models / refit</h1>
-      <p class="muted">Only bodies with observations are listed here.</p>
+      <p class="muted">Only bodies with non-rejected observations are listed here.</p>
     </div>
     <a class="button" href="/control">Admin home</a>
   </div>
   {% if bodies %}
   <div class="table-wrap">
     <table>
-      <thead><tr><th>System</th><th>Body</th><th>Observations</th><th>Approved</th><th>Active fit</th><th>Actions</th></tr></thead>
+      <thead><tr><th>System</th><th>Body</th><th>Non-rejected obs</th><th>Approved</th><th>Active fit</th><th>Actions</th></tr></thead>
       <tbody>
       {% for b in bodies %}
         <tr>
@@ -28,7 +28,7 @@
     </table>
   </div>
   {% else %}
-    <p class="muted">No bodies have observations yet.</p>
+    <p class="muted">No bodies have non-rejected observations yet.</p>
   {% endif %}
 </section>
 {% endblock %}
