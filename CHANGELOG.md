@@ -1,3 +1,11 @@
+## V0.219
+
+- Added advisory observation-spacing recommendations using a configurable default target of 5% of the relevant day/rotation/orbit period.
+- New and edited observations now store spacing status, nearest/reference observation, elapsed percent/degrees, recommended spacing time, and reviewer-facing reason text.
+- Body pages now show a next-useful-observation advisory box; early submissions are still accepted.
+- Reviewer/admin observation pages now show spacing warnings alongside automation recommendations.
+- Added observation-spacing environment defaults to private API run scripts.
+
 ## V0.218
 
 - Added a public feedback form for bug reports and feature ideas.

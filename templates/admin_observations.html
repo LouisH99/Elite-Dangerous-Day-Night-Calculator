@@ -83,6 +83,7 @@
         <td>
           <span class="badge {{ o.review_status|review_badge }}">{{ o.review_status }}</span>
           {% if o.auto_review_status %}<br><span class="badge {{ o.auto_review_status|auto_review_badge }}">{{ o.auto_review_status }}</span>{% endif %}
+          {% if o.spacing_status %}<br><span class="badge {{ o.spacing_status|spacing_badge }}">{{ o.spacing_status }}</span>{% endif %}
         </td>
         <td>{{ o.system_name }}<br><b>{{ o.body_name }}</b></td>
         <td><b>{{ o.body_non_rejected_observation_count or 0 }}</b><br><span class="muted">non-rejected</span></td>
@@ -144,6 +145,21 @@
                 <p class="muted">{{ o.auto_review_reason|dash }}</p>
               {% else %}
                 <p class="muted">Not analysed yet.</p>
+              {% endif %}
+            </div>
+            <div class="spacing-detail">
+              <b>Observation spacing</b>
+              {% if o.spacing_status %}
+                <p><span class="badge {{ o.spacing_status|spacing_badge }}">{{ o.spacing_status }}</span>
+                {% if o.spacing_reference_observation_id %}<span class="muted">near #{{ o.spacing_reference_observation_id }}</span>{% endif %}</p>
+                <p>
+                  {% if o.spacing_elapsed_degrees is not none %}spacing {{ o.spacing_elapsed_percent|num(2) }}% / {{ o.spacing_elapsed_degrees|num(1) }} deg{% endif %}
+                  {% if o.spacing_target_degrees is not none %} / target {{ o.spacing_target_percent|num(1) }}% / {{ o.spacing_target_degrees|num(1) }} deg{% endif %}
+                </p>
+                {% if o.spacing_next_recommended_utc %}<p class="muted">recommended after {{ o.spacing_next_recommended_utc|utc }}</p>{% endif %}
+                <p class="muted">{{ o.spacing_reason|dash }}</p>
+              {% else %}
+                <p class="muted">No spacing recommendation stored yet.</p>
               {% endif %}
             </div>
             <div class="note-detail">

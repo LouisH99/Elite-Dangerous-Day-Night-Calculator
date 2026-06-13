@@ -213,6 +213,20 @@ input[readonly] { opacity: 0.82; }
   padding: 0.85rem 1rem;
   margin: 0.75rem 0 1rem;
 }
+.observation-spacing-box {
+  border: 1px solid rgba(255,211,124,0.4);
+  background: rgba(255,211,124,0.10);
+  border-radius: 14px;
+  padding: 0.85rem 1rem;
+  margin: 0.75rem 0 1rem;
+}
+.observation-spacing-box p {
+  margin: 0.35rem 0 0;
+}
+.observation-spacing-box.spacing-ok {
+  border-color: rgba(146,240,177,0.32);
+  background: rgba(146,240,177,0.07);
+}
 .guide-figure {
   margin: 1rem 0 0;
 }

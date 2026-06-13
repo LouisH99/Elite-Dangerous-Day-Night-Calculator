@@ -93,6 +93,10 @@ AUTO_REFIT_APPROVED_ON_APPROVAL = env_bool("ELITE_DAYNIGHT_AUTO_REFIT_APPROVED_O
 AUTO_REFIT_APPROVED_MIN_OBSERVATIONS = env_int("ELITE_DAYNIGHT_AUTO_REFIT_APPROVED_MIN_OBSERVATIONS", 3, 1, 100)
 AUTO_REFIT_APPROVED_USE_HEADING = env_bool("ELITE_DAYNIGHT_AUTO_REFIT_APPROVED_USE_HEADING", True)
 AUTO_REFIT_APPROVED_TIME_WEIGHTING = env_bool("ELITE_DAYNIGHT_AUTO_REFIT_APPROVED_TIME_WEIGHTING", True)
+OBSERVATION_SPACING_TARGET_FRACTION = env_float("ELITE_DAYNIGHT_OBSERVATION_SPACING_TARGET_FRACTION", 0.05, 0.001, 0.5)
+OBSERVATION_SPACING_MIN_WAIT_HOURS = env_float("ELITE_DAYNIGHT_OBSERVATION_SPACING_MIN_WAIT_HOURS", 6.0, 0.0, 24.0 * 30.0)
+OBSERVATION_SPACING_MAX_WAIT_HOURS = env_float("ELITE_DAYNIGHT_OBSERVATION_SPACING_MAX_WAIT_HOURS", 168.0, 1.0, 24.0 * 365.0)
+OBSERVATION_SPACING_TARGET_DEGREES = OBSERVATION_SPACING_TARGET_FRACTION * 360.0
 
 WRITE_LOCK = threading.RLock()
 
@@ -112,7 +116,7 @@ ALLOWED_FEEDBACK_STATUS = {"new", "seen", "planned", "done", "closed"}
 
 app = FastAPI(
     title="Elite Dangerous Day/Night Calculator API",
-    version="0.218",
+    version="0.219",
     description="Local-first API for systems, bodies, observations, fitting and prediction.",
 )
 
@@ -455,6 +459,38 @@ def ensure_runtime_migrations(con: sqlite3.Connection) -> None:
     if "auto_reviewed_at_utc" not in obs_cols:
         con.execute("ALTER TABLE observations ADD COLUMN auto_reviewed_at_utc TEXT")
     con.execute("CREATE INDEX IF NOT EXISTS idx_observations_auto_review ON observations(auto_review_status)")
+    if "spacing_status" not in obs_cols:
+        con.execute("ALTER TABLE observations ADD COLUMN spacing_status TEXT")
+    if "spacing_reason" not in obs_cols:
+        con.execute("ALTER TABLE observations ADD COLUMN spacing_reason TEXT")
+    if "spacing_reference_observation_id" not in obs_cols:
+        con.execute("ALTER TABLE observations ADD COLUMN spacing_reference_observation_id INTEGER REFERENCES observations(id) ON DELETE SET NULL")
+    if "spacing_reference_timestamp_utc" not in obs_cols:
+        con.execute("ALTER TABLE observations ADD COLUMN spacing_reference_timestamp_utc TEXT")
+    if "spacing_period_source" not in obs_cols:
+        con.execute("ALTER TABLE observations ADD COLUMN spacing_period_source TEXT")
+    if "spacing_period_seconds" not in obs_cols:
+        con.execute("ALTER TABLE observations ADD COLUMN spacing_period_seconds REAL")
+    if "spacing_elapsed_seconds" not in obs_cols:
+        con.execute("ALTER TABLE observations ADD COLUMN spacing_elapsed_seconds REAL")
+    if "spacing_elapsed_fraction" not in obs_cols:
+        con.execute("ALTER TABLE observations ADD COLUMN spacing_elapsed_fraction REAL")
+    if "spacing_elapsed_degrees" not in obs_cols:
+        con.execute("ALTER TABLE observations ADD COLUMN spacing_elapsed_degrees REAL")
+    if "spacing_target_fraction" not in obs_cols:
+        con.execute("ALTER TABLE observations ADD COLUMN spacing_target_fraction REAL")
+    if "spacing_target_degrees" not in obs_cols:
+        con.execute("ALTER TABLE observations ADD COLUMN spacing_target_degrees REAL")
+    if "spacing_recommended_wait_seconds" not in obs_cols:
+        con.execute("ALTER TABLE observations ADD COLUMN spacing_recommended_wait_seconds REAL")
+    if "spacing_ideal_wait_seconds" not in obs_cols:
+        con.execute("ALTER TABLE observations ADD COLUMN spacing_ideal_wait_seconds REAL")
+    if "spacing_next_recommended_utc" not in obs_cols:
+        con.execute("ALTER TABLE observations ADD COLUMN spacing_next_recommended_utc TEXT")
+    if "spacing_checked_at_utc" not in obs_cols:
+        con.execute("ALTER TABLE observations ADD COLUMN spacing_checked_at_utc TEXT")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_observations_spacing_status ON observations(spacing_status)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_observations_body_spacing_time ON observations(body_id, target_type, review_status, timestamp_utc)")
     fit_cols = {r[1] for r in con.execute("PRAGMA table_info(fits)").fetchall()}
     if "fit_origin" not in fit_cols:
         con.execute("ALTER TABLE fits ADD COLUMN fit_origin TEXT NOT NULL DEFAULT 'manual'")
@@ -743,10 +779,29 @@ def observation_public_dict(row: sqlite3.Row) -> Dict[str, Any]:
         "auto_review_threshold_deg",
         "auto_review_confidence_score",
         "auto_reviewed_at_utc",
+        "spacing_status",
+        "spacing_reason",
+        "spacing_reference_observation_id",
+        "spacing_reference_timestamp_utc",
+        "spacing_period_source",
+        "spacing_period_seconds",
+        "spacing_elapsed_seconds",
+        "spacing_elapsed_fraction",
+        "spacing_elapsed_degrees",
+        "spacing_target_fraction",
+        "spacing_target_degrees",
+        "spacing_recommended_wait_seconds",
+        "spacing_ideal_wait_seconds",
+        "spacing_next_recommended_utc",
+        "spacing_checked_at_utc",
         "body_non_rejected_observation_count",
     ):
         if key in d:
             out[key] = d.get(key)
+    if "spacing_elapsed_fraction" in d and d.get("spacing_elapsed_fraction") is not None:
+        out["spacing_elapsed_percent"] = float(d["spacing_elapsed_fraction"]) * 100.0
+    if "spacing_target_fraction" in d and d.get("spacing_target_fraction") is not None:
+        out["spacing_target_percent"] = float(d["spacing_target_fraction"]) * 100.0
     return out
 
 
@@ -1203,6 +1258,274 @@ def _duplicate_or_near_duplicate(con: sqlite3.Connection, obs_row: sqlite3.Row) 
             continue
         return int(other["id"])
     return None
+
+
+def _positive_seconds(value: Any) -> Optional[float]:
+    try:
+        seconds = abs(float(value or 0.0))
+    except Exception:
+        return None
+    if not (seconds > 0.0):
+        return None
+    return seconds
+
+
+def _duration_text(seconds: Optional[float]) -> str:
+    if seconds is None:
+        return "unknown"
+    seconds = max(0.0, float(seconds))
+    hours = seconds / 3600.0
+    if hours < 48.0:
+        return f"{hours:.1f} h"
+    return f"{hours / 24.0:.1f} d"
+
+
+def observation_spacing_period_info(con: sqlite3.Connection, body_id: int) -> Dict[str, Any]:
+    body = get_body_row_or_404(con, body_id)
+
+    for mode in ("approved", "provisional"):
+        try:
+            _system, fitted, fit_id = dbmod.model_from_active_fit(con, body_id, fit_mode=mode)
+            period_seconds = _positive_seconds(model.estimated_model_day_period_seconds(fitted))
+        except Exception:
+            period_seconds = None
+            fit_id = None
+        if period_seconds is not None:
+            return {
+                "period_source": f"{mode}_fit_day_period",
+                "period_source_label": f"{mode} model day period",
+                "period_seconds": period_seconds,
+                "fit_id": fit_id,
+            }
+
+    rotation_seconds = _positive_seconds(body["rotation_period_s"])
+    if rotation_seconds is not None:
+        return {
+            "period_source": "rotation_period",
+            "period_source_label": "body rotation period",
+            "period_seconds": rotation_seconds,
+            "fit_id": None,
+        }
+
+    orbital_seconds = _positive_seconds(body["orbital_period_s"])
+    if orbital_seconds is not None:
+        return {
+            "period_source": "orbital_period",
+            "period_source_label": "orbital period",
+            "period_seconds": orbital_seconds,
+            "fit_id": None,
+        }
+
+    return {
+        "period_source": "unknown",
+        "period_source_label": "unknown",
+        "period_seconds": None,
+        "fit_id": None,
+    }
+
+
+def observation_spacing_recommendation(
+    con: sqlite3.Connection,
+    body_id: int,
+    *,
+    target_time_utc: Optional[str] = None,
+    exclude_observation_id: Optional[int] = None,
+) -> Dict[str, Any]:
+    checked_at = dbmod.utc_now()
+    try:
+        target_dt = model.parse_utc(str(target_time_utc or checked_at))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Bad observation time for spacing recommendation: {exc}")
+
+    period = observation_spacing_period_info(con, body_id)
+    rows = con.execute(
+        """
+        SELECT id, timestamp_utc
+          FROM observations
+         WHERE body_id = ?
+           AND target_type = 'sun'
+           AND review_status <> 'rejected'
+           AND (? IS NULL OR id <> ?)
+         ORDER BY timestamp_utc DESC, id DESC
+         LIMIT 1000
+        """,
+        (body_id, exclude_observation_id, exclude_observation_id),
+    ).fetchall()
+
+    parsed: List[Dict[str, Any]] = []
+    for row in rows:
+        try:
+            parsed.append({"id": int(row["id"]), "timestamp_utc": str(row["timestamp_utc"]), "dt": model.parse_utc(str(row["timestamp_utc"]))})
+        except Exception:
+            continue
+
+    base: Dict[str, Any] = {
+        "body_id": int(body_id),
+        "target_time_utc": model.format_utc(target_dt),
+        "status": "unknown",
+        "reason": "",
+        "target_fraction": float(OBSERVATION_SPACING_TARGET_FRACTION),
+        "target_percent": float(OBSERVATION_SPACING_TARGET_FRACTION * 100.0),
+        "target_degrees": float(OBSERVATION_SPACING_TARGET_DEGREES),
+        "minimum_wait_seconds": float(OBSERVATION_SPACING_MIN_WAIT_HOURS * 3600.0),
+        "maximum_wait_seconds": float(OBSERVATION_SPACING_MAX_WAIT_HOURS * 3600.0),
+        "period_source": period.get("period_source"),
+        "period_source_label": period.get("period_source_label"),
+        "period_seconds": period.get("period_seconds"),
+        "period_fit_id": period.get("fit_id"),
+        "reference_observation_id": None,
+        "reference_timestamp_utc": None,
+        "reference_direction": None,
+        "elapsed_seconds": None,
+        "elapsed_fraction": None,
+        "elapsed_percent": None,
+        "elapsed_degrees": None,
+        "ideal_wait_seconds": None,
+        "recommended_wait_seconds": None,
+        "next_recommended_utc": None,
+        "recommendation_clamped": None,
+        "checked_at_utc": checked_at,
+    }
+
+    if not parsed:
+        base["status"] = "first_observation"
+        base["reason"] = "No previous non-rejected sun observation exists for this body; any well-measured observation is useful."
+        return base
+
+    previous = [item for item in parsed if item["dt"] <= target_dt]
+    if previous:
+        reference = max(previous, key=lambda item: (item["dt"], item["id"]))
+        direction = "previous"
+    else:
+        reference = min(parsed, key=lambda item: (item["dt"], item["id"]))
+        direction = "future"
+
+    elapsed_seconds = abs((target_dt - reference["dt"]).total_seconds())
+    base["reference_observation_id"] = int(reference["id"])
+    base["reference_timestamp_utc"] = str(reference["timestamp_utc"])
+    base["reference_direction"] = direction
+    base["elapsed_seconds"] = float(elapsed_seconds)
+
+    period_seconds = _positive_seconds(period.get("period_seconds"))
+    if period_seconds is None:
+        base["status"] = "unknown"
+        base["reason"] = (
+            f"Spacing could not be estimated because no day, rotation, or orbital period is available. "
+            f"Nearest existing observation is #{reference['id']}."
+        )
+        return base
+
+    ideal_wait_seconds = period_seconds * float(OBSERVATION_SPACING_TARGET_FRACTION)
+    min_wait_seconds = float(OBSERVATION_SPACING_MIN_WAIT_HOURS * 3600.0)
+    max_wait_seconds = max(min_wait_seconds, float(OBSERVATION_SPACING_MAX_WAIT_HOURS * 3600.0))
+    recommended_wait_seconds = max(min_wait_seconds, ideal_wait_seconds)
+    clamp: Optional[str] = None
+    if recommended_wait_seconds > max_wait_seconds:
+        recommended_wait_seconds = max_wait_seconds
+        clamp = "maximum"
+    elif recommended_wait_seconds > ideal_wait_seconds:
+        clamp = "minimum"
+
+    elapsed_fraction = elapsed_seconds / period_seconds
+    elapsed_degrees = elapsed_fraction * 360.0
+    next_dt = reference["dt"] + timedelta(seconds=recommended_wait_seconds)
+
+    base.update({
+        "elapsed_fraction": float(elapsed_fraction),
+        "elapsed_percent": float(elapsed_fraction * 100.0),
+        "elapsed_degrees": float(elapsed_degrees),
+        "ideal_wait_seconds": float(ideal_wait_seconds),
+        "recommended_wait_seconds": float(recommended_wait_seconds),
+        "next_recommended_utc": model.format_utc(next_dt),
+        "recommendation_clamped": clamp,
+    })
+
+    spacing_bits = (
+        f"{elapsed_fraction * 100.0:.2f}% / {elapsed_degrees:.1f} deg of the {period['period_source_label']} "
+        f"has passed; target is {OBSERVATION_SPACING_TARGET_FRACTION * 100.0:.1f}% / {OBSERVATION_SPACING_TARGET_DEGREES:.1f} deg."
+    )
+    if clamp == "maximum":
+        clamp_note = (
+            f" Ideal {OBSERVATION_SPACING_TARGET_FRACTION * 100.0:.1f}% spacing would be {_duration_text(ideal_wait_seconds)}, "
+            f"but the recommendation is capped at {_duration_text(recommended_wait_seconds)} for practicality."
+        )
+    elif clamp == "minimum":
+        clamp_note = f" Minimum practical spacing raises the wait to {_duration_text(recommended_wait_seconds)}."
+    else:
+        clamp_note = ""
+
+    if elapsed_seconds + 1.0 >= recommended_wait_seconds:
+        base["status"] = "ok"
+        base["reason"] = f"Spacing looks useful. {spacing_bits}{clamp_note}"
+    else:
+        base["status"] = "too_early"
+        if direction == "previous":
+            base["reason"] = (
+                f"Observation is close to previous observation #{reference['id']}. {spacing_bits} "
+                f"Recommended after {model.format_utc(next_dt)}.{clamp_note}"
+            )
+        else:
+            base["reason"] = (
+                f"Observation timestamp is close to existing later observation #{reference['id']}. {spacing_bits}"
+                f"{clamp_note}"
+            )
+    return base
+
+
+def store_observation_spacing_decision(con: sqlite3.Connection, observation_id: int, decision: Dict[str, Any]) -> None:
+    con.execute(
+        """
+        UPDATE observations
+           SET spacing_status = ?,
+               spacing_reason = ?,
+               spacing_reference_observation_id = ?,
+               spacing_reference_timestamp_utc = ?,
+               spacing_period_source = ?,
+               spacing_period_seconds = ?,
+               spacing_elapsed_seconds = ?,
+               spacing_elapsed_fraction = ?,
+               spacing_elapsed_degrees = ?,
+               spacing_target_fraction = ?,
+               spacing_target_degrees = ?,
+               spacing_recommended_wait_seconds = ?,
+               spacing_ideal_wait_seconds = ?,
+               spacing_next_recommended_utc = ?,
+               spacing_checked_at_utc = ?
+         WHERE id = ?
+        """,
+        (
+            decision.get("status"),
+            decision.get("reason"),
+            decision.get("reference_observation_id"),
+            decision.get("reference_timestamp_utc"),
+            decision.get("period_source"),
+            decision.get("period_seconds"),
+            decision.get("elapsed_seconds"),
+            decision.get("elapsed_fraction"),
+            decision.get("elapsed_degrees"),
+            decision.get("target_fraction"),
+            decision.get("target_degrees"),
+            decision.get("recommended_wait_seconds"),
+            decision.get("ideal_wait_seconds"),
+            decision.get("next_recommended_utc"),
+            decision.get("checked_at_utc") or dbmod.utc_now(),
+            int(observation_id),
+        ),
+    )
+
+
+def calculate_and_store_observation_spacing(con: sqlite3.Connection, observation_id: int) -> Dict[str, Any]:
+    row = con.execute("SELECT body_id, timestamp_utc FROM observations WHERE id = ?", (observation_id,)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Observation not found")
+    decision = observation_spacing_recommendation(
+        con,
+        int(row["body_id"]),
+        target_time_utc=str(row["timestamp_utc"]),
+        exclude_observation_id=int(observation_id),
+    )
+    store_observation_spacing_decision(con, observation_id, decision)
+    return decision
 
 
 def evaluate_observation_automation(
@@ -1774,7 +2097,7 @@ def start_provisional_fit_worker() -> None:
 def root() -> Dict[str, Any]:
     return {
         "name": "Elite Dangerous Day/Night Calculator API",
-        "version": "0.218",
+        "version": "0.219",
         "db_path": DB_PATH,
         "docs": "/docs",
     }
@@ -2349,6 +2672,16 @@ def get_body(body_id: int) -> Dict[str, Any]:
     return body
 
 
+@app.get("/api/bodies/{body_id}/observation-spacing")
+def get_observation_spacing(body_id: int, time: Optional[str] = None) -> Dict[str, Any]:
+    con = connect()
+    try:
+        get_body_row_or_404(con, body_id)
+        return observation_spacing_recommendation(con, body_id, target_time_utc=time)
+    finally:
+        con.close()
+
+
 @app.get("/api/bodies/{body_id}/provisional/status")
 def get_provisional_status(body_id: int, auto_enqueue: bool = False) -> Dict[str, Any]:
     con = connect()
@@ -2652,7 +2985,17 @@ def add_observation(body_id: int, req: ObservationCreate) -> Dict[str, Any]:
                 """,
                 (ohash,),
             ).fetchone()
+            spacing_decision = calculate_and_store_observation_spacing(con, int(row["id"]))
+            row = con.execute(
+                """
+                SELECT o.*, s.name AS system_name, b.name AS body_name
+                  FROM observations o JOIN systems s ON s.id = o.system_id JOIN bodies b ON b.id = o.body_id
+                 WHERE o.id = ?
+                """,
+                (int(row["id"]),),
+            ).fetchone()
             public_row = observation_public_dict(row)
+            public_row["observation_spacing"] = spacing_decision
             insert_audit(con, "observation", int(row["id"]), "api_upsert_observation", None, public_row, req.observer_name or "api")
             try:
                 decision = evaluate_observation_automation(con, int(row["id"]), persist=True, actor="automation")
@@ -3334,6 +3677,7 @@ def analyze_observation_automation_batch(
             counts: Dict[str, int] = {}
             for r in rows:
                 try:
+                    calculate_and_store_observation_spacing(con, int(r["id"]))
                     decision = evaluate_observation_automation(con, int(r["id"]), persist=True, actor=actor or "automation")
                 except Exception as exc:
                     decision = {"observation_id": int(r["id"]), "auto_review_status": "blocked", "auto_review_reason": str(exc)}
@@ -3424,6 +3768,15 @@ def patch_observation(observation_id: int, req: ObservationPatch) -> Dict[str, A
                  values.get("elevation"), values.get("heading"), values.get("quality"), values.get("note"), values.get("review_status"),
                  dbmod.utc_now(), observation_id),
             )
+            row = con.execute(
+                """
+                SELECT o.*, s.name AS system_name, b.name AS body_name
+                  FROM observations o JOIN systems s ON s.id = o.system_id JOIN bodies b ON b.id = o.body_id
+                 WHERE o.id = ?
+                """,
+                (observation_id,),
+            ).fetchone()
+            calculate_and_store_observation_spacing(con, int(observation_id))
             row = con.execute(
                 """
                 SELECT o.*, s.name AS system_name, b.name AS body_name

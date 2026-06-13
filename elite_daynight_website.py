@@ -61,7 +61,7 @@ PUBLIC_POI_SUBMISSIONS_ENABLED = env_bool("ELITE_DAYNIGHT_PUBLIC_POI_SUBMISSIONS
 
 app = FastAPI(
     title="Elite Dangerous Day/Night Calculator Website",
-    version="0.218",
+    version="0.219",
     docs_url=None,
     redoc_url=None,
     openapi_url=None,
@@ -1009,6 +1009,15 @@ async def body_detail(
     except ApiError as exc:
         fit_error = exc.detail
     target_time = time.strip() or now_utc_iso()
+    observation_spacing = None
+    try:
+        observation_spacing = await api_request(
+            "GET",
+            f"/api/bodies/{body_id}/observation-spacing",
+            params={"time": target_time},
+        )
+    except ApiError:
+        observation_spacing = None
     if lat_value is not None and lon_value is not None and fit is not None:
         prediction_params = {"lat": lat_value, "lon": lon_value, "time": target_time, "prediction_hours": prediction_hours_value, "model_mode": model_mode}
         if selected_poi is not None and selected_poi.get("id") not in (None, ""):
@@ -1036,6 +1045,7 @@ async def body_detail(
             "selected_poi": selected_poi,
             "model_mode": model_mode,
             "provisional_status": provisional_status,
+            "observation_spacing": observation_spacing,
         },
     )
 
@@ -1239,6 +1249,41 @@ def ensure_admin_user_table() -> None:
             )
             con.execute("CREATE INDEX IF NOT EXISTS idx_admin_users_username ON admin_users(username)")
             con.execute("CREATE INDEX IF NOT EXISTS idx_admin_users_active ON admin_users(is_active)")
+            observations_table = con.execute("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'observations'").fetchone()
+            if observations_table is not None:
+                obs_cols = {r[1] for r in con.execute("PRAGMA table_info(observations)").fetchall()}
+                if "spacing_status" not in obs_cols:
+                    con.execute("ALTER TABLE observations ADD COLUMN spacing_status TEXT")
+                if "spacing_reason" not in obs_cols:
+                    con.execute("ALTER TABLE observations ADD COLUMN spacing_reason TEXT")
+                if "spacing_reference_observation_id" not in obs_cols:
+                    con.execute("ALTER TABLE observations ADD COLUMN spacing_reference_observation_id INTEGER REFERENCES observations(id) ON DELETE SET NULL")
+                if "spacing_reference_timestamp_utc" not in obs_cols:
+                    con.execute("ALTER TABLE observations ADD COLUMN spacing_reference_timestamp_utc TEXT")
+                if "spacing_period_source" not in obs_cols:
+                    con.execute("ALTER TABLE observations ADD COLUMN spacing_period_source TEXT")
+                if "spacing_period_seconds" not in obs_cols:
+                    con.execute("ALTER TABLE observations ADD COLUMN spacing_period_seconds REAL")
+                if "spacing_elapsed_seconds" not in obs_cols:
+                    con.execute("ALTER TABLE observations ADD COLUMN spacing_elapsed_seconds REAL")
+                if "spacing_elapsed_fraction" not in obs_cols:
+                    con.execute("ALTER TABLE observations ADD COLUMN spacing_elapsed_fraction REAL")
+                if "spacing_elapsed_degrees" not in obs_cols:
+                    con.execute("ALTER TABLE observations ADD COLUMN spacing_elapsed_degrees REAL")
+                if "spacing_target_fraction" not in obs_cols:
+                    con.execute("ALTER TABLE observations ADD COLUMN spacing_target_fraction REAL")
+                if "spacing_target_degrees" not in obs_cols:
+                    con.execute("ALTER TABLE observations ADD COLUMN spacing_target_degrees REAL")
+                if "spacing_recommended_wait_seconds" not in obs_cols:
+                    con.execute("ALTER TABLE observations ADD COLUMN spacing_recommended_wait_seconds REAL")
+                if "spacing_ideal_wait_seconds" not in obs_cols:
+                    con.execute("ALTER TABLE observations ADD COLUMN spacing_ideal_wait_seconds REAL")
+                if "spacing_next_recommended_utc" not in obs_cols:
+                    con.execute("ALTER TABLE observations ADD COLUMN spacing_next_recommended_utc TEXT")
+                if "spacing_checked_at_utc" not in obs_cols:
+                    con.execute("ALTER TABLE observations ADD COLUMN spacing_checked_at_utc TEXT")
+                con.execute("CREATE INDEX IF NOT EXISTS idx_observations_spacing_status ON observations(spacing_status)")
+                con.execute("CREATE INDEX IF NOT EXISTS idx_observations_body_spacing_time ON observations(body_id, target_type, review_status, timestamp_utc)")
             con.execute(
                 """
                 CREATE TABLE IF NOT EXISTS feedback_entries (
@@ -1414,6 +1459,18 @@ def auto_review_badge_class(status: str) -> str:
 
 
 templates.env.filters["auto_review_badge"] = auto_review_badge_class
+
+
+def spacing_badge_class(status: str) -> str:
+    return {
+        "ok": "badge-ok",
+        "too_early": "badge-warn",
+        "first_observation": "badge-new",
+        "unknown": "badge-muted",
+    }.get((status or "").lower(), "badge-muted")
+
+
+templates.env.filters["spacing_badge"] = spacing_badge_class
 
 
 def validate_new_password(password: str, confirm: str) -> Optional[str]:

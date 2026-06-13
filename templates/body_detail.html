@@ -188,6 +188,33 @@
       <li>Only enter heading if you are pointing directly at the centre of the sun. If unsure, leave it empty.</li>
     </ul>
   </div>
+  {% if observation_spacing %}
+    <div class="observation-spacing-box {% if observation_spacing.status == 'too_early' %}spacing-too-early{% else %}spacing-ok{% endif %}">
+      <b>Next useful observation</b>
+      {% if observation_spacing.status == 'too_early' %}
+        <p>Recommended after <b>{{ observation_spacing.next_recommended_utc|utc }}</b>.</p>
+      {% elif observation_spacing.status == 'ok' %}
+        <p><b>Useful now.</b> Enough spacing has passed since the nearest usable observation.</p>
+      {% elif observation_spacing.status == 'first_observation' %}
+        <p><b>Useful now.</b> This body has no previous non-rejected sun observation.</p>
+      {% else %}
+        <p>Spacing could not be estimated for this body yet.</p>
+      {% endif %}
+      <p class="muted">
+        Target spacing {{ observation_spacing.target_percent|num(1) }}% / {{ observation_spacing.target_degrees|num(1) }} deg
+        {% if observation_spacing.elapsed_degrees is not none %}
+          - spacing since nearest observation {{ observation_spacing.elapsed_percent|num(2) }}% / {{ observation_spacing.elapsed_degrees|num(1) }} deg
+        {% endif %}
+        {% if observation_spacing.recommended_wait_seconds is not none %}
+          - recommended minimum time between useful observations {{ observation_spacing.recommended_wait_seconds|duration }}
+        {% endif %}
+      </p>
+      {% if observation_spacing.recommendation_clamped == 'maximum' and observation_spacing.ideal_wait_seconds is not none %}
+        <p class="muted">Capped for practicality; ideal spacing would be {{ observation_spacing.ideal_wait_seconds|duration }}.</p>
+      {% endif %}
+      <p class="muted small-text">This is advisory only. Early submissions are still accepted, but they might be ignored during review or model fitting.</p>
+    </div>
+  {% endif %}
   <form method="post" action="/bodies/{{ body.id }}/observations" class="stack-form">
     <label>Commander / observer name
       <input required name="observer_name" minlength="2" maxlength="40" placeholder="CMDR or reviewer-recognizable name">

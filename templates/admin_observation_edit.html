@@ -71,6 +71,24 @@
 
 </section>
 <section class="card">
+  <h2>Observation spacing</h2>
+  {% if obs.spacing_status %}
+    <p><span class="badge {{ obs.spacing_status|spacing_badge }}">{{ obs.spacing_status }}</span>
+    {% if obs.spacing_reference_observation_id %}<span class="muted">nearest observation #{{ obs.spacing_reference_observation_id }}</span>{% endif %}</p>
+    <p>
+      {% if obs.spacing_elapsed_degrees is not none %}spacing {{ obs.spacing_elapsed_percent|num(2) }}% / {{ obs.spacing_elapsed_degrees|num(1) }} deg{% endif %}
+      {% if obs.spacing_target_degrees is not none %} / target {{ obs.spacing_target_percent|num(1) }}% / {{ obs.spacing_target_degrees|num(1) }} deg{% endif %}
+      {% if obs.spacing_recommended_wait_seconds is not none %} / recommended minimum time between useful observations {{ obs.spacing_recommended_wait_seconds|duration }}{% endif %}
+    </p>
+    {% if obs.spacing_next_recommended_utc %}<p class="muted">Recommended after {{ obs.spacing_next_recommended_utc|utc }}</p>{% endif %}
+    {% if obs.spacing_period_source %}<p class="muted">Period source: {{ obs.spacing_period_source }}</p>{% endif %}
+    <p class="muted">{{ obs.spacing_reason|dash }}</p>
+    <p class="muted">Checked {{ obs.spacing_checked_at_utc|utc }}</p>
+  {% else %}
+    <p class="muted">No spacing recommendation has been stored yet. Run automation analysis or save this observation to recalculate it.</p>
+  {% endif %}
+</section>
+<section class="card">
   <h2>Automation recommendation</h2>
   {% if obs.auto_review_status %}
     <p><span class="badge {{ obs.auto_review_status|auto_review_badge }}">{{ obs.auto_review_status }}</span>
