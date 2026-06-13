@@ -4,8 +4,8 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% block title %}Elite Day/Night Control{% endblock %}</title>
-  <link rel="stylesheet" href="/static/site.css">
-  <script defer src="/static/site.js"></script>
+  <link rel="stylesheet" href="/static/site.css?v={{ static_version|default('dev') }}">
+  <script defer src="/static/site.js?v={{ static_version|default('dev') }}"></script>
 </head>
 <body>
 <header class="topbar admin-topbar">

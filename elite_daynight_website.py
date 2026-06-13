@@ -48,6 +48,7 @@ PASSWORD_HASH_ITERATIONS = int(os.environ.get("ELITE_DAYNIGHT_PASSWORD_HASH_ITER
 DB_WRITE_RETRIES = int(os.environ.get("ELITE_DAYNIGHT_DB_WRITE_RETRIES", "5"))
 DB_WRITE_RETRY_BASE_SECONDS = float(os.environ.get("ELITE_DAYNIGHT_DB_WRITE_RETRY_BASE_SECONDS", "0.08"))
 WEB_WRITE_LOCK = threading.RLock()
+BASE_DIR = os.path.dirname(__file__)
 
 
 def env_bool(name: str, default: bool = True) -> bool:
@@ -58,16 +59,31 @@ def env_bool(name: str, default: bool = True) -> bool:
 
 
 PUBLIC_POI_SUBMISSIONS_ENABLED = env_bool("ELITE_DAYNIGHT_PUBLIC_POI_SUBMISSIONS_ENABLED", True)
+WEBSITE_VERSION = "0.219"
+
+
+def static_asset_version() -> str:
+    override = os.environ.get("ELITE_DAYNIGHT_STATIC_VERSION")
+    if override:
+        return override
+    try:
+        css_mtime = os.path.getmtime(os.path.join(BASE_DIR, "static", "site.css"))
+        js_mtime = os.path.getmtime(os.path.join(BASE_DIR, "static", "site.js"))
+        return f"{WEBSITE_VERSION}-{int(max(css_mtime, js_mtime))}"
+    except OSError:
+        return WEBSITE_VERSION
+
+
+STATIC_VERSION = static_asset_version()
 
 app = FastAPI(
     title="Elite Dangerous Day/Night Calculator Website",
-    version="0.219",
+    version=WEBSITE_VERSION,
     docs_url=None,
     redoc_url=None,
     openapi_url=None,
 )
 
-BASE_DIR = os.path.dirname(__file__)
 app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET, same_site="lax", https_only=False)
 app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), name="static")
 templates = Jinja2Templates(directory=os.path.join(BASE_DIR, "templates"))
@@ -183,6 +199,7 @@ def render(request: Request, template: str, context: Dict[str, Any], status_code
         "admin_role": request.session.get("admin_role", ""),
         "is_super_admin": request.session.get("admin_role") == "super",
         "public_poi_submissions_enabled": PUBLIC_POI_SUBMISSIONS_ENABLED,
+        "static_version": STATIC_VERSION,
     }
     base.update(context)
 
