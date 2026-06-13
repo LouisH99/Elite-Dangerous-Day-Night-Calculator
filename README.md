@@ -1,12 +1,12 @@
 # Elite Dangerous Day/Night Calculator
 
-Current package version: **V0.218**.
+Current package version: **V0.219**.
 
 A community tool for predicting local daylight, sunrise, sunset, and sun elevation on planets and moons in **Elite Dangerous**.
 
 The project lets players add systems/bodies, submit sun observations, review submitted data, fit a prediction model, and use saved Points of Interest (POIs) to quickly check local light conditions.
 
-> **Project status:** early community tool, currently around `V0.218`.
+> **Project status:** early community tool, currently around `V0.219`.
 >
 > **Transparency note:** this is a **vibe-coded / AI-assisted project**. A large part of the design, code structure, debugging, and documentation was created with help from ChatGPT. The model, outputs, and implementation should be treated as experimental and should be validated with real observations.
 
@@ -47,6 +47,7 @@ Players can help by submitting surface observations and feedback. Reviewers can 
 - Submit observations for review
 - Submit POIs for review, if public POI submissions are enabled
 - Submit bug reports and feature ideas through the feedback form
+- See an advisory next-useful-observation time before submitting another sun observation
 - Try a provisional model when unreviewed observations exist
 - Beginner-friendly help text for new users
 - Public read-only prediction API at `/public/api/v1/prediction`
@@ -84,6 +85,7 @@ PUBLIC_API.md
 - Filter observations by system, body, submitter, and status
 - View residuals next to observations
 - View automation shadow-review recommendations for submitted observations
+- View observation-spacing recommendations and early-submission warnings
 - Batch-analyse observations for would-approve / candidate / needs-check recommendations
 - Manage POIs
 - Review public feedback with type/status filters and internal notes
@@ -162,6 +164,9 @@ ELITE_DAYNIGHT_PUBLIC_REFIT_COOLDOWN=60
 ELITE_DAYNIGHT_ADMIN_FIT_REFRESH_SECONDS=5
 ELITE_DAYNIGHT_AUTOMATION_MODE=shadow
 ELITE_DAYNIGHT_AUTOMATION_BATCH_LIMIT=200
+ELITE_DAYNIGHT_OBSERVATION_SPACING_TARGET_FRACTION=0.05
+ELITE_DAYNIGHT_OBSERVATION_SPACING_MIN_WAIT_HOURS=6
+ELITE_DAYNIGHT_OBSERVATION_SPACING_MAX_WAIT_HOURS=168
 ELITE_DAYNIGHT_POI_TRANSITION_CACHE_ENABLED=1
 ELITE_DAYNIGHT_POI_CACHE_NORMAL_LOOKAHEAD_HOURS=72
 ELITE_DAYNIGHT_POI_CACHE_PREFETCH_HOURS=24
@@ -173,7 +178,9 @@ ELITE_DAYNIGHT_POI_CACHE_MAX_EXTENDED_HOURS=720
 ELITE_DAYNIGHT_POI_CACHE_MAX_CROSSINGS=512
 ```
 
-The private API run scripts set automation, performance, and POI cache defaults if the variables are not already defined.
+The private API run scripts set automation, observation-spacing, performance, and POI cache defaults if the variables are not already defined.
+
+`ELITE_DAYNIGHT_OBSERVATION_SPACING_TARGET_FRACTION=0.05` means the advisory waits for 5% of the relevant day/rotation/orbit period, equivalent to about 18 degrees of movement. The min/max wait settings clamp that recommendation so unusual long-period bodies remain practical.
 
 To disable public POI submissions:
 
