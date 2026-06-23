@@ -138,8 +138,10 @@
                 <p><span class="badge {{ o.auto_review_status|auto_review_badge }}">{{ o.auto_review_status }}</span>
                 {% if o.auto_review_model_id %}<span class="muted">model #{{ o.auto_review_model_id }}</span>{% endif %}</p>
                 <p>
-                  {% if o.auto_review_residual_altitude_deg is not none %}residual {{ o.auto_review_residual_altitude_deg|num(3) }}°{% endif %}
-                  {% if o.auto_review_threshold_deg is not none %} / threshold {{ o.auto_review_threshold_deg|num(2) }}°{% endif %}
+                  {% if o.auto_review_residual_altitude_deg is not none %}alt residual {{ o.auto_review_residual_altitude_deg|num(3) }}°{% endif %}
+                  {% if o.auto_review_threshold_deg is not none %} / alt threshold {{ o.auto_review_threshold_deg|num(2) }}°{% endif %}
+                  {% if o.auto_review_residual_heading_deg is not none %} / head residual {{ o.auto_review_residual_heading_deg|num(3) }}°{% endif %}
+                  {% if o.auto_review_heading_threshold_deg is not none %} / head threshold {{ o.auto_review_heading_threshold_deg|num(2) }}°{% endif %}
                   {% if o.auto_review_confidence_score is not none %} / confidence {{ o.auto_review_confidence_score|num(0) }}%{% endif %}
                 </p>
                 <p class="muted">{{ o.auto_review_reason|dash }}</p>

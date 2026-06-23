@@ -148,10 +148,29 @@
       {% if prediction.model_confidence.note %}<br><span class="muted">{{ prediction.model_confidence.note }}</span>{% endif %}
     </p>
   {% endif %}
-  {% if prediction.horizon_mode and prediction.horizon_mode != "normal" %}<p class="notice"><b>Horizon status:</b> {{ prediction.horizon_message }}{% if prediction.cycle_min_sun_altitude_deg is not none %}<br><span class="muted">Checked min/max sun altitude: {{ prediction.cycle_min_sun_altitude_deg|num(2) }}° / {{ prediction.cycle_max_sun_altitude_deg|num(2) }}°</span>{% endif %}</p>{% endif %}
+  {% if prediction.horizon_mode and prediction.horizon_mode != "normal" %}<p class="notice"><b>Horizon status:</b> {{ prediction.horizon_message }}{% if prediction.cycle_min_sun_altitude_deg is not none %}<br><span class="muted">Checked min/max sun elevation: {{ prediction.cycle_min_sun_altitude_deg|num(2) }}° / {{ prediction.cycle_max_sun_altitude_deg|num(2) }}°</span>{% endif %}</p>{% endif %}
   <div class="result-grid">
-    <div><span>Sun altitude</span><strong>{{ prediction.sun_altitude_deg|num(2) }}°</strong><em>{{ prediction.sun_altitude_trend }}</em></div>
+    <div><span>Sun elevation</span><strong>{{ prediction.sun_altitude_deg|num(2) }}°</strong><em>{{ prediction.sun_altitude_trend }}</em></div>
     <div><span>Sun heading</span><strong>{{ prediction.sun_heading_deg|num(2) }}°</strong></div>
+    {% if prediction.sun_peak %}
+      <div><span>Highest sun elevation</span>
+        {% if prediction.sun_peak.status == 'unknown' %}
+          <strong>unknown</strong>
+        {% else %}
+          <strong>{{ prediction.sun_peak.elevation_deg|num(2) }}°</strong>
+          <em>
+            {% if prediction.sun_peak.status == 'already_passed' %}
+              already passed
+            {% elif prediction.sun_peak.status == 'near_peak' %}
+              near maximum
+            {% else %}
+              {{ prediction.sun_peak.seconds_from_target|duration }}
+            {% endif %}
+            {% if prediction.sun_peak.heading_deg is not none %} · heading {{ prediction.sun_peak.heading_deg|num(1) }}°{% endif %}
+          </em>
+        {% endif %}
+      </div>
+    {% endif %}
     <div><span>Next sunrise</span><strong>{{ prediction.next_sunrise_utc|utc }}</strong><em>{{ prediction.next_sunrise_seconds|duration }}</em></div>
     <div><span>Next sunset</span><strong>{{ prediction.next_sunset_utc|utc }}</strong><em>{{ prediction.next_sunset_seconds|duration }}</em></div>
     <div><span>Sunlight duration</span><strong>{{ prediction.sunlight_duration_sec|duration }}</strong></div>
@@ -217,7 +236,7 @@
   {% endif %}
   <form method="post" action="/bodies/{{ body.id }}/observations" class="stack-form">
     <label>Commander / observer name
-      <input required name="observer_name" minlength="2" maxlength="40" placeholder="CMDR or reviewer-recognizable name">
+      <input required name="observer_name" minlength="2" maxlength="40" placeholder="CMDR or reviewer-recognizable name" data-observer-name-memory="1">
     </label>
     <label>UTC observation time
       <input required id="observation-time" name="timestamp_utc" value="{{ target_time }}" data-live-utc-time="1" placeholder="2026-06-02 18 or 2026-06-02 18:00">
@@ -232,8 +251,9 @@
     <label>Longitude
       <input required name="lon" inputmode="decimal" value="{{ lon }}" placeholder="+12.345678 or -12.345678">
     </label>
-    <label>Sun altitude / elevation °
+    <label>Sun elevation °
       <input required name="elevation" inputmode="decimal" placeholder="+34.0 or -10.5">
+      <small class="field-help">Enter the vertical sun angle shown in the in-game HUD.</small>
     </label>
     <label>Sun heading optional
       <input name="heading" inputmode="decimal" placeholder="+336 or leave empty if unsure">

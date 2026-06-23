@@ -1,6 +1,6 @@
 # Elite Dangerous Day/Night Calculator Public API v1
 
-The public API is a read-only prediction API. It is intended for tools that want to know the local day/night state, sun altitude, next sunrise/sunset, and model confidence for a known body coordinate, saved POI, or Razz Racing race key.
+The public API is a read-only prediction API. It is intended for tools that want to know the local day/night state, sun elevation, next sunrise/sunset, and model confidence for a known body coordinate, saved POI, or Razz Racing race key.
 
 It is not a general system/body information API. For full planetary data, use specialist sources such as Spansh or EDSM.
 
@@ -172,10 +172,18 @@ Example shape:
   "prediction": {
     "time_utc": "2026-06-04T12:00:00Z",
     "sun_altitude_deg": 23.41,
+    "sun_elevation_deg": 23.41,
     "sun_heading_deg": 145.2,
     "is_day": true,
     "state": "day",
     "sun_motion": "rising",
+    "sun_peak": {
+      "status": "upcoming",
+      "time_utc": "2026-06-04T15:20:00Z",
+      "seconds_from_target": 12000.0,
+      "elevation_deg": 41.2,
+      "heading_deg": 182.4
+    },
     "next_sunrise_utc": "2026-06-05T01:20:00Z",
     "next_sunset_utc": "2026-06-04T18:44:00Z",
     "sunlight_duration_seconds": 21600.0,
@@ -204,7 +212,11 @@ Example shape:
 
 `target.body_id` and `target.poi_id` are local IDs from this Day/Night Calculator database. `poi_id` is `null` for manual system/body/coordinate predictions and set for POI or race-key predictions.
 
-`prediction.cache_hit` is `true` only when a saved POI/race-key prediction reused an existing POI transition cache. It is `false` for manual coordinate predictions, cache misses, refreshes, or disabled cache. Current sun altitude and heading are always calculated live; the cache only reuses stored horizon-transition searches.
+`prediction.sun_altitude_deg` is kept for compatibility. `prediction.sun_elevation_deg` is the same value using the public UI wording.
+
+`prediction.sun_peak` is present during local day and is `null` at night. If the current daylight maximum has already passed, `status` is `already_passed` and the current elevation/heading are returned.
+
+`prediction.cache_hit` is `true` only when a saved POI/race-key prediction reused an existing POI transition cache. It is `false` for manual coordinate predictions, cache misses, refreshes, or disabled cache. Current sun elevation and heading are always calculated live; the cache only reuses stored horizon-transition searches.
 
 `model_confidence.note` is intentionally a single short note. It is empty when the model is healthy. When the model needs attention, it gives one short reason such as:
 
@@ -232,6 +244,54 @@ model_mode=provisional
 ```
 
 A provisional model may include unreviewed observations. Public tools should normally use the approved model unless they intentionally want provisional data.
+
+---
+
+## All-races day/night endpoint
+
+```text
+GET /public/api/v1/races/daynight
+```
+
+Returns the current day/night state for approved public Razz Racing POIs whose body has an active approved model.
+
+Optional query parameters:
+
+```text
+time
+prediction_hours=72
+limit=5000
+```
+
+Example response:
+
+```json
+{
+  "api_version": "v1",
+  "updated": "2026-06-09T08:26:00Z",
+  "time_utc": "2026-06-09T08:26:00Z",
+  "prediction_hours": 72.0,
+  "count": 1,
+  "results": [
+    {
+      "race_key": "RICK RAZZAFRAG-TURNERSHIP02",
+      "name": "Turner Metallics Low Altitude",
+      "system_name": "Alioth",
+      "body_name": "Alioth 4 a",
+      "poi_id": 43,
+      "state": "day",
+      "until": "2026-06-09T10:00:49Z",
+      "seconds_until": 5649.0,
+      "sun_elevation_deg": 23.41,
+      "sun_heading_deg": 145.2,
+      "updated": "2026-06-09T08:26:00Z",
+      "cache_hit": true
+    }
+  ]
+}
+```
+
+Races without an active approved model are omitted from this endpoint until a reviewed model exists.
 
 ---
 

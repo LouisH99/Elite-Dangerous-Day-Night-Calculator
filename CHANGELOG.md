@@ -1,3 +1,21 @@
+## V0.222
+
+- Added an API-side daily race POI transition-cache refresh worker for approved public Razz Racing POIs.
+- Added race-cache refresh environment defaults to the private API run scripts.
+- Daily race refresh state and summaries are stored in `schema_meta`.
+- Shadow automation now checks submitted sun heading as well as sun elevation when heading is present, preventing heading-only mismatches from being suggested as auto-approved.
+
+## V0.221
+
+- Added `/public/api/v1/races/daynight` for current day/night state across approved public Razz Racing race POIs.
+- Race status rows include day/night state, next transition time, current sun elevation/heading, and cache hit status. Races without an active approved model are omitted.
+
+## V0.220
+
+- Added browser-local commander/observer name memory for public observation submissions.
+- Added current-day highest sun elevation prediction data and a body-page result tile.
+- Updated public wording from sun altitude/elevation mixes to clearer sun elevation wording while keeping API field compatibility.
+
 ## V0.219
 
 - Added advisory observation-spacing recommendations using a configurable default target of 5% of the relevant day/rotation/orbit period.

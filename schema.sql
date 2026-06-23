@@ -133,7 +133,7 @@ CREATE TABLE observations (
             review_status TEXT NOT NULL DEFAULT 'new',
             created_at_utc TEXT NOT NULL,
             updated_at_utc TEXT NOT NULL
-        , auto_review_status TEXT, auto_review_reason TEXT, auto_review_model_id INTEGER REFERENCES fits(id) ON DELETE SET NULL, auto_review_residual_altitude_deg REAL, auto_review_threshold_deg REAL, auto_review_confidence_score REAL, auto_reviewed_at_utc TEXT);;
+        , auto_review_status TEXT, auto_review_reason TEXT, auto_review_model_id INTEGER REFERENCES fits(id) ON DELETE SET NULL, auto_review_residual_altitude_deg REAL, auto_review_threshold_deg REAL, auto_review_residual_heading_deg REAL, auto_review_heading_threshold_deg REAL, auto_review_confidence_score REAL, auto_reviewed_at_utc TEXT);;
 CREATE TABLE prediction_cache (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             body_id INTEGER NOT NULL REFERENCES bodies(id) ON DELETE CASCADE,

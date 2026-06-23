@@ -1042,6 +1042,105 @@ def predict_alt_az(model: FittedModel, t: datetime, lat_deg: float, lon_deg: flo
     return alt, az
 
 
+def daylight_sun_peak(
+    model: FittedModel,
+    target_time: datetime,
+    lat_deg: float,
+    lon_deg: float,
+    current_altitude_deg: float,
+    current_heading_deg: float,
+    sun_altitude_trend: str,
+    next_sunset: Optional[datetime],
+) -> Optional[Dict[str, Any]]:
+    if current_altitude_deg <= 0.0:
+        return None
+
+    trend = (sun_altitude_trend or "").strip().lower()
+    if "falling" in trend:
+        return {
+            "status": "already_passed",
+            "time_utc": format_utc(target_time),
+            "seconds_from_target": 0.0,
+            "elevation_deg": float(current_altitude_deg),
+            "heading_deg": float(current_heading_deg),
+        }
+    if "level" in trend:
+        return {
+            "status": "near_peak",
+            "time_utc": format_utc(target_time),
+            "seconds_from_target": 0.0,
+            "elevation_deg": float(current_altitude_deg),
+            "heading_deg": float(current_heading_deg),
+        }
+    if next_sunset is None:
+        return {
+            "status": "unknown",
+            "time_utc": None,
+            "seconds_from_target": None,
+            "elevation_deg": None,
+            "heading_deg": None,
+        }
+
+    total_seconds = (next_sunset - target_time).total_seconds()
+    if total_seconds <= 0.0:
+        return {
+            "status": "already_passed",
+            "time_utc": format_utc(target_time),
+            "seconds_from_target": 0.0,
+            "elevation_deg": float(current_altitude_deg),
+            "heading_deg": float(current_heading_deg),
+        }
+
+    hours = total_seconds / 3600.0
+    intervals = int(_clamp_float(max(24.0, hours * 4.0), 24.0, 160.0))
+    samples: List[Tuple[float, float]] = []
+    for i in range(intervals + 1):
+        offset = total_seconds * (float(i) / float(intervals))
+        alt, _az = model.predict(target_time + timedelta(seconds=offset), lat_deg, lon_deg)
+        samples.append((offset, alt))
+
+    best_index = max(range(len(samples)), key=lambda idx: samples[idx][1])
+    if best_index == 0:
+        peak_time = target_time
+    else:
+        lo = samples[max(0, best_index - 1)][0]
+        hi = samples[min(len(samples) - 1, best_index + 1)][0]
+        if hi <= lo:
+            peak_time = target_time + timedelta(seconds=samples[best_index][0])
+        else:
+            # Golden-section search on the best coarse bracket.  The sun
+            # altitude over one daylight arc is expected to be locally unimodal.
+            gr = (math.sqrt(5.0) - 1.0) / 2.0
+            x1 = hi - gr * (hi - lo)
+            x2 = lo + gr * (hi - lo)
+            y1 = model.predict(target_time + timedelta(seconds=x1), lat_deg, lon_deg)[0]
+            y2 = model.predict(target_time + timedelta(seconds=x2), lat_deg, lon_deg)[0]
+            for _ in range(32):
+                if y1 < y2:
+                    lo = x1
+                    x1 = x2
+                    y1 = y2
+                    x2 = lo + gr * (hi - lo)
+                    y2 = model.predict(target_time + timedelta(seconds=x2), lat_deg, lon_deg)[0]
+                else:
+                    hi = x2
+                    x2 = x1
+                    y2 = y1
+                    x1 = hi - gr * (hi - lo)
+                    y1 = model.predict(target_time + timedelta(seconds=x1), lat_deg, lon_deg)[0]
+            peak_time = target_time + timedelta(seconds=(lo + hi) / 2.0)
+
+    peak_alt, peak_heading = model.predict(peak_time, lat_deg, lon_deg)
+    seconds_from_target = max(0.0, (peak_time - target_time).total_seconds())
+    return {
+        "status": "near_peak" if seconds_from_target <= 300.0 else "upcoming",
+        "time_utc": format_utc(peak_time),
+        "seconds_from_target": float(seconds_from_target),
+        "elevation_deg": float(peak_alt),
+        "heading_deg": float(peak_heading),
+    }
+
+
 def make_model(
     body: Dict[str, Any],
     params: Tuple[float, float, float, float],
@@ -2338,6 +2437,7 @@ def calculate_prediction(
     cached_crossings: Optional[List[Tuple[datetime, str]]] = None,
     cached_crossing_search_hours: Optional[float] = None,
     cached_search_meta: Optional[Dict[str, Any]] = None,
+    include_sun_peak: bool = True,
 ) -> Dict[str, Any]:
     """Return a JSON-serialisable prediction for a body/lat/lon/time.
 
@@ -2400,6 +2500,7 @@ def calculate_prediction(
     daylight_summary = daylight_cycle_summary(cycle_crossings)
     next_sunrise = next((t for t, kind in cycle_crossings if kind == "rise"), None)
     next_sunset = next((t for t, kind in cycle_crossings if kind == "set"), None)
+    sun_peak = daylight_sun_peak(model, target_time, lat, lon, alt, az, sun_altitude_trend, next_sunset) if include_sun_peak else None
 
     radius = star_angular_radius_deg(system, model.body, target_time) if system else None
     visual_disc_crossings: List[Dict[str, Any]] = []
@@ -2443,6 +2544,7 @@ def calculate_prediction(
         "sun_heading_deg": float(az),
         "sun_altitude_trend": sun_altitude_trend,
         "sun_altitude_rate_deg_per_min": float(sun_altitude_rate_deg_per_min),
+        "sun_peak": sun_peak,
         "centre_state": "DAY" if alt > 0 else "NIGHT",
         "next_sunrise_utc": None if next_sunrise is None else format_utc(next_sunrise),
         "next_sunrise_seconds": None if next_sunrise is None else float((next_sunrise - target_time).total_seconds()),

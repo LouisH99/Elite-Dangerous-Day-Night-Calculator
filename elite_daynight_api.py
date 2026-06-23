@@ -85,6 +85,9 @@ POI_CACHE_EXTENDED_REFRESH_MARGIN_HOURS = env_float("ELITE_DAYNIGHT_POI_CACHE_EX
 POI_CACHE_MAX_AGE_HOURS = env_float("ELITE_DAYNIGHT_POI_CACHE_MAX_AGE_HOURS", 24.0, 0.0, 8760.0)
 POI_CACHE_MAX_EXTENDED_HOURS = env_float("ELITE_DAYNIGHT_POI_CACHE_MAX_EXTENDED_HOURS", model.DEFAULT_MAX_EXTENDED_PREDICTION_HOURS, 1.0, 8760.0)
 POI_CACHE_MAX_CROSSINGS = env_int("ELITE_DAYNIGHT_POI_CACHE_MAX_CROSSINGS", 512, 8, 5000)
+RACE_CACHE_DAILY_REFRESH_ENABLED = env_bool("ELITE_DAYNIGHT_RACE_CACHE_DAILY_REFRESH_ENABLED", True)
+RACE_CACHE_DAILY_REFRESH_UTC_HOUR = env_int("ELITE_DAYNIGHT_RACE_CACHE_DAILY_REFRESH_UTC_HOUR", 4, 0, 23)
+RACE_CACHE_DAILY_REFRESH_MAX_PER_RUN = env_int("ELITE_DAYNIGHT_RACE_CACHE_DAILY_REFRESH_MAX_PER_RUN", 1000, 1, 10000)
 # V0.208 automation is deliberately conservative.  In shadow mode it only
 # calculates and stores recommendations; it never changes review_status.
 AUTOMATION_MODE = os.environ.get("ELITE_DAYNIGHT_AUTOMATION_MODE", "shadow").strip().lower()
@@ -107,6 +110,8 @@ PROVISIONAL_FIT_QUEUE: "queue.Queue[tuple[int, int, str]]" = queue.Queue()
 PROVISIONAL_JOB_LOCK = threading.RLock()
 PROVISIONAL_JOB_STATE: Dict[int, Dict[str, Any]] = {}
 PROVISIONAL_WORKER_STARTED = False
+RACE_CACHE_REFRESH_LOCK = threading.RLock()
+RACE_CACHE_REFRESH_WORKER_STARTED = False
 
 ALLOWED_REVIEW = {"new", "approved", "rejected", "needs_check", "corrected"}
 ALLOWED_OBSERVATIONS = {"sunrise", "sunset", "horizon", "rise", "set", "elevation", "altitude", "sun_altitude", "alt", "day", "night"}
@@ -116,7 +121,7 @@ ALLOWED_FEEDBACK_STATUS = {"new", "seen", "planned", "done", "closed"}
 
 app = FastAPI(
     title="Elite Dangerous Day/Night Calculator API",
-    version="0.219",
+    version="0.222",
     description="Local-first API for systems, bodies, observations, fitting and prediction.",
 )
 
@@ -134,6 +139,7 @@ app.add_middleware(
 def startup_database_hardening() -> None:
     initialize_database_runtime()
     start_provisional_fit_worker()
+    start_race_cache_daily_refresh_worker()
 
 
 # ------------------------------ request models ------------------------------
@@ -454,6 +460,10 @@ def ensure_runtime_migrations(con: sqlite3.Connection) -> None:
         con.execute("ALTER TABLE observations ADD COLUMN auto_review_residual_altitude_deg REAL")
     if "auto_review_threshold_deg" not in obs_cols:
         con.execute("ALTER TABLE observations ADD COLUMN auto_review_threshold_deg REAL")
+    if "auto_review_residual_heading_deg" not in obs_cols:
+        con.execute("ALTER TABLE observations ADD COLUMN auto_review_residual_heading_deg REAL")
+    if "auto_review_heading_threshold_deg" not in obs_cols:
+        con.execute("ALTER TABLE observations ADD COLUMN auto_review_heading_threshold_deg REAL")
     if "auto_review_confidence_score" not in obs_cols:
         con.execute("ALTER TABLE observations ADD COLUMN auto_review_confidence_score REAL")
     if "auto_reviewed_at_utc" not in obs_cols:
@@ -777,6 +787,8 @@ def observation_public_dict(row: sqlite3.Row) -> Dict[str, Any]:
         "auto_review_model_id",
         "auto_review_residual_altitude_deg",
         "auto_review_threshold_deg",
+        "auto_review_residual_heading_deg",
+        "auto_review_heading_threshold_deg",
         "auto_review_confidence_score",
         "auto_reviewed_at_utc",
         "spacing_status",
@@ -1121,6 +1133,8 @@ def get_or_refresh_poi_transition_cache(
     prediction_hours: float,
     fallback_transitions: int,
     max_extended_hours: float,
+    force_refresh: bool = False,
+    refresh_reason_override: Optional[str] = None,
 ) -> tuple[Optional[List[tuple[Any, str]]], Optional[float], Optional[Dict[str, Any]], Dict[str, Any]]:
     if not POI_TRANSITION_CACHE_ENABLED:
         return None, None, None, {"status": "disabled", "enabled": False}
@@ -1132,7 +1146,7 @@ def get_or_refresh_poi_transition_cache(
     threshold_deg = 0.0
     row = poi_transition_cache_lookup(con, poi_id, body_id, int(fit_id), model_mode, lat, lon, threshold_deg)
     refresh_reason = "miss"
-    if row is not None:
+    if row is not None and not force_refresh:
         usable, reason = poi_transition_cache_is_usable(row, target_dt, prediction_hours, max_extended_hours)
         soft_reason = poi_transition_cache_soft_refresh_reason(row, target_dt, prediction_hours) if usable else None
         if usable and soft_reason is None:
@@ -1156,6 +1170,8 @@ def get_or_refresh_poi_transition_cache(
                 },
             )
         refresh_reason = soft_reason or reason
+    elif row is not None:
+        refresh_reason = refresh_reason_override or "force_refresh"
 
     payload = build_poi_transition_cache_payload(
         fitted,
@@ -1214,6 +1230,25 @@ def automation_threshold_for_quality(quality: str, predicted_altitude: Optional[
     # Horizon observations are very sensitive to tiny time/location differences.
     if predicted_altitude is not None and abs(float(predicted_altitude)) < 3.0:
         threshold += 0.5
+    return float(threshold)
+
+
+def automation_heading_threshold_for_quality(quality: str, predicted_altitude: Optional[float]) -> float:
+    q = (quality or "medium").strip().lower()
+    if q == "high":
+        threshold = 8.0
+    elif q == "low":
+        threshold = 20.0
+    else:
+        threshold = 12.0
+    # Close to overhead, compass heading is less stable for a tiny pointing
+    # change, so keep the rule conservative but still catch very large misses.
+    if predicted_altitude is not None:
+        abs_alt = abs(float(predicted_altitude))
+        if abs_alt >= 85.0:
+            threshold += 25.0
+        elif abs_alt >= 75.0:
+            threshold += 12.0
     return float(threshold)
 
 
@@ -1564,6 +1599,8 @@ def evaluate_observation_automation(
         "auto_review_model_id": None,
         "auto_review_residual_altitude_deg": None,
         "auto_review_threshold_deg": None,
+        "auto_review_residual_heading_deg": None,
+        "auto_review_heading_threshold_deg": None,
         "auto_review_confidence_score": None,
         "auto_reviewed_at_utc": now,
     }
@@ -1611,6 +1648,14 @@ def evaluate_observation_automation(
 
     residual = float(predicted_alt) - float(target_alt)
     threshold = automation_threshold_for_quality(str(row["quality"] or "medium"), predicted_alt)
+    submitted_heading = None if row["heading"] is None else float(row["heading"]) % 360.0
+    heading_residual = None
+    heading_threshold = None
+    abs_heading_residual = None
+    if submitted_heading is not None:
+        heading_residual = float(model.wrap180(float(predicted_heading) - submitted_heading))
+        heading_threshold = automation_heading_threshold_for_quality(str(row["quality"] or "medium"), predicted_alt)
+        abs_heading_residual = abs(heading_residual)
     confidence = model.model_confidence_dict(fitted, target_time=obs_dt, model_mode="approved", includes_unreviewed=False)
     confidence_score = float(confidence.get("score") or 0.0)
     sun_mode = str(confidence.get("sun_source_mode") or "")
@@ -1621,55 +1666,77 @@ def evaluate_observation_automation(
         "auto_review_model_id": int(fit_id),
         "auto_review_residual_altitude_deg": float(residual),
         "auto_review_threshold_deg": float(threshold),
+        "auto_review_residual_heading_deg": None if heading_residual is None else float(heading_residual),
+        "auto_review_heading_threshold_deg": None if heading_threshold is None else float(heading_threshold),
         "auto_review_confidence_score": confidence_score,
         "predicted_altitude_deg": float(predicted_alt),
         "submitted_altitude_deg": float(target_alt),
         "predicted_heading_deg": float(predicted_heading),
+        "submitted_heading_deg": None if submitted_heading is None else float(submitted_heading),
         "confidence_level": confidence.get("level"),
         "sun_source_mode": sun_mode,
         "sun_geometry_mode": geometry_mode,
     })
 
-    if sun_mode == "fallback" or "fallback" in geometry_mode.lower():
+    heading_ok = abs_heading_residual is None or (heading_threshold is not None and abs_heading_residual <= heading_threshold)
+    heading_note = ""
+    if abs_heading_residual is not None and heading_threshold is not None:
+        heading_note = f" Heading residual {abs_heading_residual:.2f}° <= threshold {heading_threshold:.2f}°."
+
+    if not heading_ok:
+        decision["auto_review_status"] = "needs_check"
+        if abs_residual <= threshold:
+            decision["auto_review_reason"] = (
+                f"Altitude residual {abs_residual:.2f}° is within threshold {threshold:.2f}°, "
+                f"but heading residual {abs_heading_residual:.2f}° exceeds threshold {heading_threshold:.2f}° "
+                f"against reviewed model #{fit_id}."
+            )
+        else:
+            decision["auto_review_reason"] = (
+                f"Altitude residual {abs_residual:.2f}° exceeds threshold {threshold:.2f}° and "
+                f"heading residual {abs_heading_residual:.2f}° exceeds threshold {heading_threshold:.2f}° "
+                f"against reviewed model #{fit_id}."
+            )
+    elif sun_mode == "fallback" or "fallback" in geometry_mode.lower():
         if abs_residual <= threshold:
             decision["auto_review_status"] = "auto_candidate"
             decision["auto_review_reason"] = (
                 f"Residual {abs_residual:.2f}° is within threshold {threshold:.2f}°, "
-                "but sun-source geometry is fallback/uncertain. Reviewer confirmation recommended."
+                f"but sun-source geometry is fallback/uncertain. Reviewer confirmation recommended.{heading_note}"
             )
         else:
             decision["auto_review_status"] = "needs_check"
             decision["auto_review_reason"] = (
-                f"Residual {abs_residual:.2f}° exceeds threshold {threshold:.2f}° and geometry is fallback/uncertain."
+                f"Residual {abs_residual:.2f}° exceeds threshold {threshold:.2f}° and geometry is fallback/uncertain.{heading_note}"
             )
     elif confidence_score < 65.0:
         if abs_residual <= threshold:
             decision["auto_review_status"] = "auto_candidate"
             decision["auto_review_reason"] = (
                 f"Residual {abs_residual:.2f}° is within threshold {threshold:.2f}°, "
-                f"but model confidence is only {confidence_score:.0f}%. Reviewer confirmation recommended."
+                f"but model confidence is only {confidence_score:.0f}%. Reviewer confirmation recommended.{heading_note}"
             )
         else:
             decision["auto_review_status"] = "needs_check"
             decision["auto_review_reason"] = (
-                f"Residual {abs_residual:.2f}° exceeds threshold {threshold:.2f}°; model confidence is {confidence_score:.0f}%."
+                f"Residual {abs_residual:.2f}° exceeds threshold {threshold:.2f}°; model confidence is {confidence_score:.0f}%.{heading_note}"
             )
     elif abs_residual <= threshold and confidence_score >= 85.0:
         decision["auto_review_status"] = "shadow_auto_approve"
         decision["auto_review_reason"] = (
             f"Would auto-approve in active mode: residual {abs_residual:.2f}° <= threshold {threshold:.2f}° "
-            f"against high-confidence reviewed model #{fit_id} ({confidence_score:.0f}%)."
+            f"against high-confidence reviewed model #{fit_id} ({confidence_score:.0f}%).{heading_note}"
         )
     elif abs_residual <= threshold:
         decision["auto_review_status"] = "auto_candidate"
         decision["auto_review_reason"] = (
             f"Residual {abs_residual:.2f}° <= threshold {threshold:.2f}° against reviewed model #{fit_id}. "
-            f"Model confidence {confidence_score:.0f}%; reviewer confirmation recommended."
+            f"Model confidence {confidence_score:.0f}%; reviewer confirmation recommended.{heading_note}"
         )
     else:
         decision["auto_review_status"] = "needs_check"
         decision["auto_review_reason"] = (
-            f"Residual {abs_residual:.2f}° exceeds threshold {threshold:.2f}° against reviewed model #{fit_id}."
+            f"Residual {abs_residual:.2f}° exceeds threshold {threshold:.2f}° against reviewed model #{fit_id}.{heading_note}"
         )
 
     if persist:
@@ -1691,6 +1758,8 @@ def _store_observation_automation_decision(
                auto_review_model_id = ?,
                auto_review_residual_altitude_deg = ?,
                auto_review_threshold_deg = ?,
+               auto_review_residual_heading_deg = ?,
+               auto_review_heading_threshold_deg = ?,
                auto_review_confidence_score = ?,
                auto_reviewed_at_utc = ?
          WHERE id = ?
@@ -1701,6 +1770,8 @@ def _store_observation_automation_decision(
             decision.get("auto_review_model_id"),
             decision.get("auto_review_residual_altitude_deg"),
             decision.get("auto_review_threshold_deg"),
+            decision.get("auto_review_residual_heading_deg"),
+            decision.get("auto_review_heading_threshold_deg"),
             decision.get("auto_review_confidence_score"),
             decision.get("auto_reviewed_at_utc") or dbmod.utc_now(),
             int(old_row["id"]),
@@ -2091,13 +2162,210 @@ def start_provisional_fit_worker() -> None:
         PROVISIONAL_WORKER_STARTED = True
 
 
+def schema_meta_get(con: sqlite3.Connection, key: str) -> Optional[str]:
+    row = con.execute("SELECT value FROM schema_meta WHERE key = ?", (key,)).fetchone()
+    return None if row is None else str(row["value"])
+
+
+def schema_meta_set(con: sqlite3.Connection, key: str, value: Any) -> None:
+    con.execute("INSERT OR REPLACE INTO schema_meta(key, value) VALUES (?, ?)", (key, str(value)))
+
+
+def list_approved_public_race_pois(con: sqlite3.Connection, limit: int) -> List[sqlite3.Row]:
+    return con.execute(
+        """
+        SELECT p.*, p.name AS poi_name, b.name AS body_name, s.name AS system_name
+          FROM body_pois p
+          JOIN bodies b ON b.id = p.body_id
+          JOIN systems s ON s.id = b.system_id
+         WHERE p.is_public = 1
+           AND p.review_status = 'approved'
+           AND COALESCE(p.source_id, '') <> ''
+           AND (
+                p.source = 'razz_racing_api'
+                OR lower(COALESCE(p.source_label, '')) LIKE '%razz%'
+                OR lower(COALESCE(p.source, '')) LIKE '%racing%'
+           )
+           AND EXISTS (
+                SELECT 1
+                  FROM fits f
+                 WHERE f.body_id = p.body_id
+                   AND f.fit_mode = 'approved'
+                   AND f.fit_status = 'ok'
+                   AND f.is_active = 1
+           )
+         ORDER BY lower(p.source_id), lower(p.name), p.id
+         LIMIT ?
+        """,
+        (int(limit),),
+    ).fetchall()
+
+
+def cache_refreshed_date_utc(row: Optional[sqlite3.Row]) -> Optional[str]:
+    if row is None:
+        return None
+    try:
+        return model.parse_utc(str(row["refreshed_at_utc"])).date().isoformat()
+    except Exception:
+        return None
+
+
+def refresh_approved_race_poi_caches(*, force: bool = False, actor: str = "race-cache-daily") -> Dict[str, Any]:
+    now_dt = model.parse_utc(dbmod.utc_now())
+    today = now_dt.date().isoformat()
+    started_at = model.format_utc(now_dt)
+    max_per_run = int(RACE_CACHE_DAILY_REFRESH_MAX_PER_RUN)
+
+    with RACE_CACHE_REFRESH_LOCK:
+        con = connect()
+        try:
+            last_day = schema_meta_get(con, "race_cache_daily_refresh_date_utc")
+            if not force and last_day == today:
+                return {
+                    "status": "skipped",
+                    "reason": "already_refreshed_today",
+                    "date_utc": today,
+                    "last_refresh_date_utc": last_day,
+                }
+            if not force and int(now_dt.hour) < int(RACE_CACHE_DAILY_REFRESH_UTC_HOUR):
+                return {
+                    "status": "waiting",
+                    "reason": "before_configured_utc_hour",
+                    "date_utc": today,
+                    "refresh_utc_hour": int(RACE_CACHE_DAILY_REFRESH_UTC_HOUR),
+                }
+            begin_write_transaction(con)
+            schema_meta_set(con, "race_cache_daily_refresh_started_at_utc", started_at)
+            schema_meta_set(con, "race_cache_daily_refresh_status", "running")
+            con.commit()
+        finally:
+            con.close()
+
+        con = connect()
+        refreshed = 0
+        already_today = 0
+        no_model = 0
+        error_count = 0
+        errors: List[Dict[str, Any]] = []
+        truncated = False
+        total_races = 0
+        processed = 0
+        try:
+            race_rows = list_approved_public_race_pois(con, max_per_run + 1)
+            total_races = len(race_rows)
+            for race_row in race_rows:
+                if processed >= max_per_run:
+                    truncated = True
+                    break
+                try:
+                    _system, fitted, fit_id = dbmod.model_from_active_fit(con, int(race_row["body_id"]), fit_mode="approved")
+                    existing = poi_transition_cache_lookup(
+                        con,
+                        int(race_row["id"]),
+                        int(race_row["body_id"]),
+                        int(fit_id),
+                        "approved",
+                        float(race_row["lat"]),
+                        float(race_row["lon"]),
+                        0.0,
+                    )
+                    if cache_refreshed_date_utc(existing) == today:
+                        already_today += 1
+                        continue
+                    processed += 1
+                    get_or_refresh_poi_transition_cache(
+                        con,
+                        race_row,
+                        fitted,
+                        int(fit_id),
+                        "approved",
+                        now_dt,
+                        POI_CACHE_NORMAL_LOOKAHEAD_HOURS,
+                        model.DEFAULT_MIN_FALLBACK_TRANSITIONS,
+                        POI_CACHE_MAX_EXTENDED_HOURS,
+                        force_refresh=True,
+                        refresh_reason_override="daily_race_cache_refresh",
+                    )
+                    refreshed += 1
+                except Exception as exc:
+                    try:
+                        if con.in_transaction:
+                            con.rollback()
+                    except Exception:
+                        pass
+                    processed += 1
+                    message = str(exc)
+                    if "No active approved fit" in message or "No active" in message:
+                        no_model += 1
+                    else:
+                        error_count += 1
+                        if len(errors) < 20:
+                            errors.append({
+                                "poi_id": int(race_row["id"]),
+                                "race_key": str(race_row["source_id"] or ""),
+                                "error": message[:500],
+                            })
+        finally:
+            con.close()
+
+        finished_at = dbmod.utc_now()
+        summary = {
+            "status": "done",
+            "date_utc": today,
+            "started_at_utc": started_at,
+            "finished_at_utc": finished_at,
+            "total_races_seen": int(total_races),
+            "max_per_run": int(max_per_run),
+            "processed": int(processed),
+            "refreshed": int(refreshed),
+            "already_today": int(already_today),
+            "no_approved_model": int(no_model),
+            "error_count": int(error_count),
+            "errors": errors,
+            "truncated": bool(truncated),
+            "actor": actor,
+        }
+        con = connect()
+        try:
+            begin_write_transaction(con)
+            schema_meta_set(con, "race_cache_daily_refresh_date_utc", today)
+            schema_meta_set(con, "race_cache_daily_refresh_finished_at_utc", finished_at)
+            schema_meta_set(con, "race_cache_daily_refresh_status", "done")
+            schema_meta_set(con, "race_cache_daily_refresh_summary_json", dbmod.json_dumps(summary))
+            con.commit()
+        finally:
+            con.close()
+        return summary
+
+
+def race_cache_daily_refresh_worker() -> None:
+    while True:
+        try:
+            refresh_approved_race_poi_caches(force=False)
+        except Exception:
+            pass
+        time.sleep(15 * 60)
+
+
+def start_race_cache_daily_refresh_worker() -> None:
+    global RACE_CACHE_REFRESH_WORKER_STARTED
+    if not RACE_CACHE_DAILY_REFRESH_ENABLED:
+        return
+    with RACE_CACHE_REFRESH_LOCK:
+        if RACE_CACHE_REFRESH_WORKER_STARTED:
+            return
+        t = threading.Thread(target=race_cache_daily_refresh_worker, name="race-cache-daily-refresh", daemon=True)
+        t.start()
+        RACE_CACHE_REFRESH_WORKER_STARTED = True
+
+
 # ------------------------------ endpoints ------------------------------
 
 @app.get("/")
 def root() -> Dict[str, Any]:
     return {
         "name": "Elite Dangerous Day/Night Calculator API",
-        "version": "0.219",
+        "version": "0.222",
         "db_path": DB_PATH,
         "docs": "/docs",
     }
@@ -2799,6 +3067,7 @@ def build_prediction_response(
     lat: Optional[float] = None,
     lon: Optional[float] = None,
     poi_id: Optional[int] = None,
+    include_sun_peak: bool = True,
 ) -> Dict[str, Any]:
     get_body_row_or_404(con, body_id)
     mode = (model_mode or "approved").strip().lower()
@@ -2853,6 +3122,7 @@ def build_prediction_response(
         cached_crossings=cached_crossings,
         cached_crossing_search_hours=cached_crossing_search_hours,
         cached_search_meta=cached_search_meta,
+        include_sun_peak=include_sun_peak,
     )
     prediction["model_mode"] = mode
     review_meta = fit_review_metadata(con, int(fit_id))
@@ -2889,6 +3159,7 @@ def predict(
     model_mode: str = "approved",
     fallback_transitions: int = Query(model.DEFAULT_MIN_FALLBACK_TRANSITIONS, ge=1, le=12),
     max_extended_hours: float = Query(model.DEFAULT_MAX_EXTENDED_PREDICTION_HOURS, ge=1.0, le=8760.0),
+    include_sun_peak: bool = Query(True),
 ) -> Dict[str, Any]:
     con = connect()
     try:
@@ -2903,6 +3174,7 @@ def predict(
             lat=lat,
             lon=lon,
             poi_id=poi_id,
+            include_sun_peak=include_sun_peak,
         )
     except HTTPException:
         raise
@@ -2920,6 +3192,7 @@ def predict_poi(
     model_mode: str = "approved",
     fallback_transitions: int = Query(model.DEFAULT_MIN_FALLBACK_TRANSITIONS, ge=1, le=12),
     max_extended_hours: float = Query(model.DEFAULT_MAX_EXTENDED_PREDICTION_HOURS, ge=1.0, le=8760.0),
+    include_sun_peak: bool = Query(True),
 ) -> Dict[str, Any]:
     con = connect()
     try:
@@ -2933,6 +3206,7 @@ def predict_poi(
             fallback_transitions,
             max_extended_hours,
             poi_id=int(poi_id),
+            include_sun_peak=include_sun_peak,
         )
     except HTTPException:
         raise
@@ -3563,7 +3837,10 @@ def list_observations(
             if automation_filter == "unanalysed":
                 clauses.append("(o.auto_review_status IS NULL OR o.auto_review_status = '')")
             elif automation_filter == "large_residual":
-                clauses.append("o.auto_review_residual_altitude_deg IS NOT NULL AND abs(o.auto_review_residual_altitude_deg) > COALESCE(o.auto_review_threshold_deg, 3.0)")
+                clauses.append(
+                    "((o.auto_review_residual_altitude_deg IS NOT NULL AND abs(o.auto_review_residual_altitude_deg) > COALESCE(o.auto_review_threshold_deg, 3.0)) "
+                    "OR (o.auto_review_residual_heading_deg IS NOT NULL AND abs(o.auto_review_residual_heading_deg) > COALESCE(o.auto_review_heading_threshold_deg, 12.0)))"
+                )
             else:
                 clauses.append("o.auto_review_status = ?")
                 params.append(automation_filter)

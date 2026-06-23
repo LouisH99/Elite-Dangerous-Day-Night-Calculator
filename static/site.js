@@ -118,13 +118,35 @@ function drawSunCanvas() {
   ctx.textAlign = 'center';
   ctx.textBaseline = 'alphabetic';
   const rate = Number(p.sun_altitude_rate_deg_per_min || 0);
-  ctx.fillText(`Sun altitude ${alt.toFixed(2)}° · ${trend || 'trend unknown'} (${rate.toFixed(4)}°/min)`, w / 2, h - 20);
+  ctx.fillText(`Sun elevation ${alt.toFixed(2)}° · ${trend || 'trend unknown'} (${rate.toFixed(4)}°/min)`, w / 2, h - 20);
 }
 
 document.addEventListener('DOMContentLoaded', () => {
   updateCountdown();
   drawSunCanvas();
 });
+
+function setupObserverNameMemory() {
+  const key = 'elite_daynight_observer_name';
+  const inputs = document.querySelectorAll('[data-observer-name-memory="1"]');
+  inputs.forEach((input) => {
+    try {
+      const saved = localStorage.getItem(key);
+      if (saved && !input.value.trim()) input.value = saved;
+      function save() {
+        const value = input.value.trim();
+        if (value) localStorage.setItem(key, value);
+        else localStorage.removeItem(key);
+      }
+      input.addEventListener('input', save);
+      input.addEventListener('change', save);
+      const form = input.closest('form');
+      if (form) form.addEventListener('submit', save);
+    } catch {
+      // Browsers can disable localStorage; the form still works normally.
+    }
+  });
+}
 
 function formatUtcNowForInput() {
   return new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
@@ -149,6 +171,7 @@ function setupLiveObservationTime() {
 }
 
 document.addEventListener('DOMContentLoaded', () => {
+  setupObserverNameMemory();
   setupLiveObservationTime();
 });
 

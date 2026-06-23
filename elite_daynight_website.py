@@ -18,7 +18,7 @@ import hmac
 import base64
 
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from urllib.parse import urlencode, quote
 
 import httpx
@@ -59,7 +59,7 @@ def env_bool(name: str, default: bool = True) -> bool:
 
 
 PUBLIC_POI_SUBMISSIONS_ENABLED = env_bool("ELITE_DAYNIGHT_PUBLIC_POI_SUBMISSIONS_ENABLED", True)
-WEBSITE_VERSION = "0.219"
+WEBSITE_VERSION = "0.222"
 
 
 def static_asset_version() -> str:
@@ -306,6 +306,42 @@ def public_match_summary(row: sqlite3.Row) -> Dict[str, Any]:
     }
 
 
+def public_list_approved_race_pois(limit: int = 5000) -> List[Dict[str, Any]]:
+    con = public_db_connect()
+    try:
+        rows = con.execute(
+            """
+            SELECT p.*, p.name AS poi_name, b.name AS body_name, b.id AS body_pk,
+                   s.name AS system_name, s.id AS system_pk
+              FROM body_pois p
+              JOIN bodies b ON b.id = p.body_id
+              JOIN systems s ON s.id = b.system_id
+             WHERE p.is_public = 1
+               AND p.review_status = 'approved'
+               AND COALESCE(p.source_id, '') <> ''
+                AND (
+                     p.source = 'razz_racing_api'
+                     OR lower(COALESCE(p.source_label, '')) LIKE '%razz%'
+                     OR lower(COALESCE(p.source, '')) LIKE '%racing%'
+                )
+                AND EXISTS (
+                    SELECT 1
+                      FROM fits f
+                     WHERE f.body_id = p.body_id
+                       AND f.fit_mode = 'approved'
+                       AND f.fit_status = 'ok'
+                       AND f.is_active = 1
+                )
+             ORDER BY lower(p.source_id), lower(p.name), p.id
+             LIMIT ?
+            """,
+            (int(limit),),
+        ).fetchall()
+        return [public_row_dict(row) for row in rows]
+    finally:
+        con.close()
+
+
 def public_resolve_body(system_name: str, body_name_value: str) -> tuple[Optional[Dict[str, Any]], Optional[JSONResponse]]:
     con = public_db_connect()
     try:
@@ -479,6 +515,15 @@ def public_observation_need(conf: Dict[str, Any]) -> Dict[str, Any]:
     return {"needs_observations": bool(needs), "level": level}
 
 
+def public_prediction_error_code(detail: str) -> str:
+    text = str(detail or "").lower()
+    if "no active approved fit" in text or "no active" in text:
+        return "no_reviewed_model"
+    if "timestamp" in text or "time" in text:
+        return "invalid_time"
+    return "prediction_failed"
+
+
 def parse_signed_float(value: Any, field_name: str, min_value: Optional[float] = None, max_value: Optional[float] = None) -> float:
     text = str(value if value is not None else "").strip().replace(",", ".")
     if not text:
@@ -635,10 +680,12 @@ async def public_api_prediction(
         "prediction": {
             "time_utc": prediction.get("target_time_utc"),
             "sun_altitude_deg": prediction.get("sun_altitude_deg"),
+            "sun_elevation_deg": prediction.get("sun_altitude_deg"),
             "sun_heading_deg": prediction.get("sun_heading_deg"),
             "is_day": str(prediction.get("centre_state") or "").upper() == "DAY",
             "state": str(prediction.get("centre_state") or "").lower(),
             "sun_motion": prediction.get("sun_altitude_trend"),
+            "sun_peak": prediction.get("sun_peak"),
             "next_sunrise_utc": prediction.get("next_sunrise_utc"),
             "next_sunset_utc": prediction.get("next_sunset_utc"),
             "sunlight_duration_seconds": prediction.get("sunlight_duration_sec"),
@@ -650,6 +697,88 @@ async def public_api_prediction(
         "warnings": warnings,
     }
     return response
+
+
+@app.get("/public/api/v1/races/daynight")
+async def public_api_races_daynight(
+    time: str = Query(""),
+    prediction_hours: float = Query(72.0, ge=1.0, le=168.0),
+    limit: int = Query(5000, ge=1, le=10000),
+) -> Dict[str, Any]:
+    target_time = time.strip() or now_utc_iso()
+    races = public_list_approved_race_pois(limit)
+    results: List[Dict[str, Any]] = []
+    updated_values: List[str] = []
+    for race in races:
+        race_key = str(race.get("source_id") or "")
+        base = {
+            "race_key": race_key,
+            "name": race.get("poi_name") or race.get("name"),
+            "system_name": race.get("system_name"),
+            "body_name": race.get("body_name"),
+            "poi_id": int(race["id"]),
+        }
+        try:
+            prediction = await api_request(
+                "GET",
+                f"/api/bodies/{int(race['body_id'])}/prediction",
+                params={
+                    "time": target_time,
+                    "prediction_hours": float(prediction_hours),
+                    "model_mode": "approved",
+                    "poi_id": int(race["id"]),
+                    "include_sun_peak": False,
+                },
+            )
+            state = str(prediction.get("centre_state") or "").lower()
+            if state == "day":
+                until = prediction.get("next_sunset_utc")
+                seconds_until = prediction.get("next_sunset_seconds")
+            elif state == "night":
+                until = prediction.get("next_sunrise_utc")
+                seconds_until = prediction.get("next_sunrise_seconds")
+            else:
+                until = None
+                seconds_until = None
+            cache_info = prediction.get("poi_transition_cache") or {}
+            updated = cache_info.get("refreshed_at_utc") or prediction.get("target_time_utc") or target_time
+            updated_values.append(str(updated))
+            results.append({
+                **base,
+                "state": state or "unknown",
+                "until": until,
+                "seconds_until": seconds_until,
+                "sun_elevation_deg": prediction.get("sun_altitude_deg"),
+                "sun_heading_deg": prediction.get("sun_heading_deg"),
+                "updated": updated,
+                "cache_hit": str(cache_info.get("status") or "").lower() == "hit",
+            })
+        except ApiError as exc:
+            error_code = public_prediction_error_code(exc.detail)
+            if error_code == "no_reviewed_model":
+                continue
+            updated = now_utc_iso()
+            updated_values.append(updated)
+            results.append({
+                **base,
+                "state": "unknown",
+                "until": None,
+                "seconds_until": None,
+                "sun_elevation_deg": None,
+                "sun_heading_deg": None,
+                "updated": updated,
+                "cache_hit": False,
+                "error_code": error_code,
+                "error_message": exc.detail,
+            })
+    return {
+        "api_version": PUBLIC_API_VERSION,
+        "updated": max(updated_values) if updated_values else target_time,
+        "time_utc": target_time,
+        "prediction_hours": float(prediction_hours),
+        "count": len(results),
+        "results": results,
+    }
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request) -> HTMLResponse:
@@ -1085,7 +1214,7 @@ async def submit_observation(
     try:
         lat_value = parse_signed_float(lat, "Latitude", -90.0, 90.0)
         lon_value = parse_signed_float(lon, "Longitude", -180.0, 180.0)
-        elevation_value = parse_signed_float(elevation, "Sun altitude / elevation", -90.0, 90.0)
+        elevation_value = parse_signed_float(elevation, "Sun elevation", -90.0, 90.0)
         heading_value = None
         if str(heading).strip():
             heading_value = parse_signed_float(heading, "Sun heading", 0.0, 359.99)
@@ -1983,7 +2112,7 @@ async def admin_edit_observation_submit(
         lon_value = parse_signed_float(lon, "Longitude", -180.0, 180.0)
         elevation_value = None
         if elevation.strip():
-            elevation_value = parse_signed_float(elevation, "Sun altitude / elevation", -90.0, 90.0)
+            elevation_value = parse_signed_float(elevation, "Sun elevation", -90.0, 90.0)
         heading_value = None
         if heading.strip():
             heading_value = parse_signed_float(heading, "Sun heading", 0.0, 359.999)

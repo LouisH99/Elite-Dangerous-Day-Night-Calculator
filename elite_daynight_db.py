@@ -1517,6 +1517,10 @@ def ensure_automation_columns(con: sqlite3.Connection) -> None:
         con.execute("ALTER TABLE observations ADD COLUMN auto_review_residual_altitude_deg REAL")
     if "auto_review_threshold_deg" not in obs_cols:
         con.execute("ALTER TABLE observations ADD COLUMN auto_review_threshold_deg REAL")
+    if "auto_review_residual_heading_deg" not in obs_cols:
+        con.execute("ALTER TABLE observations ADD COLUMN auto_review_residual_heading_deg REAL")
+    if "auto_review_heading_threshold_deg" not in obs_cols:
+        con.execute("ALTER TABLE observations ADD COLUMN auto_review_heading_threshold_deg REAL")
     if "auto_review_confidence_score" not in obs_cols:
         con.execute("ALTER TABLE observations ADD COLUMN auto_review_confidence_score REAL")
     if "auto_reviewed_at_utc" not in obs_cols:
