@@ -17,7 +17,7 @@ import hashlib
 import hmac
 import base64
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlencode, quote
 
@@ -59,7 +59,8 @@ def env_bool(name: str, default: bool = True) -> bool:
 
 
 PUBLIC_POI_SUBMISSIONS_ENABLED = env_bool("ELITE_DAYNIGHT_PUBLIC_POI_SUBMISSIONS_ENABLED", True)
-WEBSITE_VERSION = "0.222"
+WEBSITE_VERSION = "0.223"
+RACE_STATUS_INTERVAL_WINDOW_HOURS = 36.0
 
 
 def static_asset_version() -> str:
@@ -524,6 +525,81 @@ def public_prediction_error_code(detail: str) -> str:
     return "prediction_failed"
 
 
+def parse_api_utc(value: Any) -> Optional[datetime]:
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        try:
+            dt = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+        except Exception:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).replace(microsecond=0)
+
+
+def format_api_utc(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def race_status_interval_state(crossing_kind: str) -> Optional[str]:
+    kind = (crossing_kind or "").strip().lower()
+    if kind == "rise":
+        return "day"
+    if kind == "set":
+        return "night"
+    return None
+
+
+def race_status_upcoming_intervals(prediction: Dict[str, Any], window_hours: float = RACE_STATUS_INTERVAL_WINDOW_HOURS) -> List[Dict[str, Any]]:
+    target_dt = parse_api_utc(prediction.get("target_time_utc"))
+    if target_dt is None:
+        return []
+
+    crossings: List[Dict[str, Any]] = []
+    for row in prediction.get("centre_horizon_crossings") or []:
+        if not isinstance(row, dict):
+            continue
+        state = race_status_interval_state(str(row.get("kind") or ""))
+        cross_dt = parse_api_utc(row.get("time_utc"))
+        if state is None or cross_dt is None:
+            continue
+        seconds_from = row.get("seconds_from_target")
+        try:
+            seconds_from_value = float(seconds_from)
+        except Exception:
+            seconds_from_value = float((cross_dt - target_dt).total_seconds())
+        if seconds_from_value < -1.0:
+            continue
+        crossings.append({
+            "state": state,
+            "time_utc": cross_dt,
+            "seconds_from": seconds_from_value,
+        })
+    crossings.sort(key=lambda item: item["time_utc"])
+
+    cutoff_dt = target_dt + timedelta(hours=float(window_hours))
+    intervals: List[Dict[str, Any]] = []
+    for index, crossing in enumerate(crossings):
+        start_dt = crossing["time_utc"]
+        if start_dt > cutoff_dt and intervals:
+            break
+        end_dt = crossings[index + 1]["time_utc"] if index + 1 < len(crossings) else None
+        seconds_until = None if end_dt is None else float((end_dt - target_dt).total_seconds())
+        intervals.append({
+            "state": crossing["state"],
+            "from": format_api_utc(start_dt),
+            "until": None if end_dt is None else format_api_utc(end_dt),
+            "seconds_from": float(crossing["seconds_from"]),
+            "seconds_until": seconds_until,
+        })
+        if start_dt > cutoff_dt:
+            break
+    return intervals
+
+
 def parse_signed_float(value: Any, field_name: str, min_value: Optional[float] = None, max_value: Optional[float] = None) -> float:
     text = str(value if value is not None else "").strip().replace(",", ".")
     if not text:
@@ -706,6 +782,7 @@ async def public_api_races_daynight(
     limit: int = Query(5000, ge=1, le=10000),
 ) -> Dict[str, Any]:
     target_time = time.strip() or now_utc_iso()
+    effective_prediction_hours = max(float(prediction_hours), RACE_STATUS_INTERVAL_WINDOW_HOURS)
     races = public_list_approved_race_pois(limit)
     results: List[Dict[str, Any]] = []
     updated_values: List[str] = []
@@ -724,7 +801,7 @@ async def public_api_races_daynight(
                 f"/api/bodies/{int(race['body_id'])}/prediction",
                 params={
                     "time": target_time,
-                    "prediction_hours": float(prediction_hours),
+                    "prediction_hours": effective_prediction_hours,
                     "model_mode": "approved",
                     "poi_id": int(race["id"]),
                     "include_sun_peak": False,
@@ -752,6 +829,7 @@ async def public_api_races_daynight(
                 "sun_heading_deg": prediction.get("sun_heading_deg"),
                 "updated": updated,
                 "cache_hit": str(cache_info.get("status") or "").lower() == "hit",
+                "upcoming_intervals": race_status_upcoming_intervals(prediction, RACE_STATUS_INTERVAL_WINDOW_HOURS),
             })
         except ApiError as exc:
             error_code = public_prediction_error_code(exc.detail)
@@ -768,6 +846,7 @@ async def public_api_races_daynight(
                 "sun_heading_deg": None,
                 "updated": updated,
                 "cache_hit": False,
+                "upcoming_intervals": [],
                 "error_code": error_code,
                 "error_message": exc.detail,
             })
@@ -776,6 +855,7 @@ async def public_api_races_daynight(
         "updated": max(updated_values) if updated_values else target_time,
         "time_utc": target_time,
         "prediction_hours": float(prediction_hours),
+        "pass_window_hours": float(RACE_STATUS_INTERVAL_WINDOW_HOURS),
         "count": len(results),
         "results": results,
     }

@@ -263,6 +263,8 @@ prediction_hours=72
 limit=5000
 ```
 
+`upcoming_intervals` always uses a fixed 36 hour window. The current interval is still represented by `state`, `until`, and `seconds_until`; `upcoming_intervals` starts at the next transition.
+
 Example response:
 
 ```json
@@ -271,6 +273,7 @@ Example response:
   "updated": "2026-06-09T08:26:00Z",
   "time_utc": "2026-06-09T08:26:00Z",
   "prediction_hours": 72.0,
+  "pass_window_hours": 36.0,
   "count": 1,
   "results": [
     {
@@ -285,13 +288,30 @@ Example response:
       "sun_elevation_deg": 23.41,
       "sun_heading_deg": 145.2,
       "updated": "2026-06-09T08:26:00Z",
-      "cache_hit": true
+      "cache_hit": true,
+      "upcoming_intervals": [
+        {
+          "state": "night",
+          "from": "2026-06-09T10:00:49Z",
+          "until": "2026-06-09T10:42:12Z",
+          "seconds_from": 5649.0,
+          "seconds_until": 8172.0
+        },
+        {
+          "state": "day",
+          "from": "2026-06-09T10:42:12Z",
+          "until": "2026-06-09T11:24:03Z",
+          "seconds_from": 8172.0,
+          "seconds_until": 10683.0
+        }
+      ]
     }
   ]
 }
 ```
 
 Races without an active approved model are omitted from this endpoint until a reviewed model exists.
+If no following interval starts within 36 hours, the next available following interval is included when the model/cache has found one.
 
 ---
 

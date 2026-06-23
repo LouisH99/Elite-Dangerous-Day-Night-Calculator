@@ -121,7 +121,7 @@ ALLOWED_FEEDBACK_STATUS = {"new", "seen", "planned", "done", "closed"}
 
 app = FastAPI(
     title="Elite Dangerous Day/Night Calculator API",
-    version="0.222",
+    version="0.223",
     description="Local-first API for systems, bodies, observations, fitting and prediction.",
 )
 
@@ -2365,7 +2365,7 @@ def start_race_cache_daily_refresh_worker() -> None:
 def root() -> Dict[str, Any]:
     return {
         "name": "Elite Dangerous Day/Night Calculator API",
-        "version": "0.222",
+        "version": "0.223",
         "db_path": DB_PATH,
         "docs": "/docs",
     }

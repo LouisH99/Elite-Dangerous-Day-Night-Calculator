@@ -1,3 +1,8 @@
+## V0.223
+
+- Added `upcoming_intervals` to `/public/api/v1/races/daynight`, giving following day/night intervals for the next 36 hours while keeping the current state fields unchanged.
+- Added `pass_window_hours` response metadata for the race status interval window.
+
 ## V0.222
 
 - Added an API-side daily race POI transition-cache refresh worker for approved public Razz Racing POIs.
