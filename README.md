@@ -1,12 +1,12 @@
 # Elite Dangerous Day/Night Calculator
 
-Current package version: **V0.219**.
+Current package version: **V0.222**.
 
 A community tool for predicting local daylight, sunrise, sunset, and sun elevation on planets and moons in **Elite Dangerous**.
 
 The project lets players add systems/bodies, submit sun observations, review submitted data, fit a prediction model, and use saved Points of Interest (POIs) to quickly check local light conditions.
 
-> **Project status:** early community tool, currently around `V0.219`.
+> **Project status:** early community tool, currently around `V0.222`.
 >
 > **Transparency note:** this is a **vibe-coded / AI-assisted project**. A large part of the design, code structure, debugging, and documentation was created with help from ChatGPT. The model, outputs, and implementation should be treated as experimental and should be validated with real observations.
 
@@ -16,9 +16,10 @@ The project lets players add systems/bodies, submit sun observations, review sub
 
 For a selected planet or moon, the website can show:
 
-- current local sun altitude
+- current local sun elevation
 - day/night state at a latitude and longitude
 - next sunrise and sunset
+- highest sun elevation for the current daylight period
 - sunlight duration and day period when available
 - a 2D local sun elevation view
 - whether the sun is rising or falling
@@ -51,6 +52,7 @@ Players can help by submitting surface observations and feedback. Reviewers can 
 - Try a provisional model when unreviewed observations exist
 - Beginner-friendly help text for new users
 - Public read-only prediction API at `/public/api/v1/prediction`
+- Public all-races day/night API at `/public/api/v1/races/daynight` for races with active approved models
 - Prediction lookup by system/body/coordinates, public POI name, or Razz Racing race key
 - Cache-aware POI predictions reuse stored sunrise/sunset transition searches while recalculating current sun position live
 
@@ -62,6 +64,7 @@ Main endpoint:
 
 ```text
 /public/api/v1/prediction
+/public/api/v1/races/daynight
 ```
 
 Supported lookup modes:
@@ -70,7 +73,7 @@ Supported lookup modes:
 - public approved POI name
 - Razz Racing race key such as `RAZZAFRAG03`
 
-The API returns prediction data, model confidence, a short model note when attention is needed, and a needs-observations flag. Full usage examples are in:
+The API returns prediction data, model confidence, a short model note when attention is needed, a needs-observations flag, and a race status list for approved public Razz Racing POIs. Full usage examples are in:
 
 ```text
 PUBLIC_API.md
@@ -176,9 +179,12 @@ ELITE_DAYNIGHT_POI_CACHE_EXTENDED_REFRESH_MARGIN_HOURS=336
 ELITE_DAYNIGHT_POI_CACHE_MAX_AGE_HOURS=24
 ELITE_DAYNIGHT_POI_CACHE_MAX_EXTENDED_HOURS=720
 ELITE_DAYNIGHT_POI_CACHE_MAX_CROSSINGS=512
+ELITE_DAYNIGHT_RACE_CACHE_DAILY_REFRESH_ENABLED=1
+ELITE_DAYNIGHT_RACE_CACHE_DAILY_REFRESH_UTC_HOUR=4
+ELITE_DAYNIGHT_RACE_CACHE_DAILY_REFRESH_MAX_PER_RUN=1000
 ```
 
-The private API run scripts set automation, observation-spacing, performance, and POI cache defaults if the variables are not already defined.
+The private API run scripts set automation, observation-spacing, performance, POI cache, and daily race-cache defaults if the variables are not already defined.
 
 `ELITE_DAYNIGHT_OBSERVATION_SPACING_TARGET_FRACTION=0.05` means the advisory waits for 5% of the relevant day/rotation/orbit period, equivalent to about 18 degrees of movement. The min/max wait settings clamp that recommendation so unusual long-period bodies remain practical.
 
@@ -236,7 +242,7 @@ A useful sun observation normally contains:
 - body being observed
 - UTC observation time
 - latitude and longitude from the in-game surface HUD
-- sun altitude / elevation
+- sun elevation
 - optional sun heading
 - quality estimate
 
@@ -244,8 +250,8 @@ Recommended measuring method:
 
 1. Target the sun in-game.
 2. Aim as closely as possible at the centre of the targeted sun marker.
-3. Read the elevation / altitude value from the HUD.
-4. Submit that value as the sun altitude.
+3. Read the elevation value from the HUD.
+4. Submit that value as the sun elevation.
 
 Altitude meaning:
 
@@ -309,24 +315,24 @@ For each imported body, the database stores compact model-relevant fields such a
 Each observation gives the model:
 
 ```text
-time + latitude + longitude + measured sun altitude
+time + latitude + longitude + measured sun elevation
 ```
 
 Optionally it can also include sun heading.
 
-The model converts the latitude/longitude into a local surface direction and compares the predicted sun vector against the measured sun altitude.
+The model converts the latitude/longitude into a local surface direction and compares the predicted sun vector against the measured sun elevation.
 
 ### 3. Fitting
 
-The fitter searches for model parameters that minimize the residuals between observed and predicted sun altitude.
+The fitter searches for model parameters that minimize the residuals between observed and predicted sun elevation.
 
 Residual example:
 
 ```text
-altitude residual = predicted sun altitude - submitted sun altitude
+altitude residual = predicted sun elevation - submitted sun elevation
 ```
 
-Heading residuals can also be calculated when heading observations are present, but heading is treated more carefully because it is usually less reliable than altitude.
+Heading residuals can also be calculated when heading observations are present, but heading is treated more carefully because it is usually less reliable than elevation.
 
 Observation quality affects weight:
 
@@ -380,18 +386,19 @@ For moons, the model now uses recursive parent/body positions where possible, so
 
 ### 5. Prediction
 
-After fitting, the model can predict sun altitude at a requested time and location. It scans forward to find horizon crossings:
+After fitting, the model can predict sun elevation at a requested time and location. It scans forward to find horizon crossings:
 
 ```text
-sun altitude crosses 0° upward   → sunrise
-sun altitude crosses 0° downward → sunset
+sun elevation crosses 0° upward   → sunrise
+sun elevation crosses 0° downward → sunset
 ```
 
 The website first uses the selected prediction window. If there is no day/night change in that window, the model searches farther ahead up to 30 days and shows the next fallback transition(s). If the selected window does not contain a complete day/night cycle, the same extended search is used to calculate sunlight duration and day period when possible.
 
 The website then displays:
 
-- current sun altitude
+- current sun elevation
+- highest sun elevation during the current daylight period
 - whether it is day or night
 - whether the sun is rising or falling
 - next sunrise/sunset
