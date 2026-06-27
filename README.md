@@ -1,12 +1,12 @@
 # Elite Dangerous Day/Night Calculator
 
-Current package version: **V0.223**.
+Current package version: **V0.224**.
 
 A community tool for predicting local daylight, sunrise, sunset, and sun elevation on planets and moons in **Elite Dangerous**.
 
 The project lets players add systems/bodies, submit sun observations, review submitted data, fit a prediction model, and use saved Points of Interest (POIs) to quickly check local light conditions.
 
-> **Project status:** early community tool, currently around `V0.223`.
+> **Project status:** early community tool, currently around `V0.224`.
 >
 > **Transparency note:** this is a **vibe-coded / AI-assisted project**. A large part of the design, code structure, debugging, and documentation was created with help from ChatGPT. The model, outputs, and implementation should be treated as experimental and should be validated with real observations.
 
@@ -43,7 +43,7 @@ Players can help by submitting surface observations and feedback. Reviewers can 
 - Import systems/bodies from Spansh
 - View predictable bodies only
 - Predict day/night for manual coordinates
-- Enter prediction times as full ISO timestamps or shorter UTC values like `2026-06-02 18`
+- Enter prediction times as full ISO timestamps or shorter UTC values like `2026-06-02 18`, or keep the prediction time live
 - Select POIs on a body page
 - Submit observations for review
 - Submit POIs for review, if public POI submissions are enabled
@@ -93,6 +93,7 @@ PUBLIC_API.md
 - Manage POIs
 - Review public feedback with type/status filters and internal notes
 - Import Razz Racing race starts as POIs from the hidden control area
+- Razz Racing import skips Horizons trials
 - Refit reviewed and provisional models separately
 - Reviewer accounts can queue reviewed/provisional refits without super-admin account-management permissions
 - View audit log
