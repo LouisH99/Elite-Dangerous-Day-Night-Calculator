@@ -1,3 +1,10 @@
+## V0.224
+
+- Added a default-on live UTC prediction-time checkbox on body pages, so prediction windows and POI clicks can stay current.
+- Manual prediction times are preserved for POI/model links when live UTC time is disabled.
+- Updated the local sun elevation tile to show the next sunrise/sunset countdown, UTC date, and UTC time on separate lines.
+- Razz Racing preview/import now skips Horizons trials before fetching race detail data.
+
 ## V0.223
 
 - Added `upcoming_intervals` to `/public/api/v1/races/daynight`, giving following day/night intervals for the next 36 hours while keeping the current state fields unchanged.

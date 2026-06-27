@@ -121,7 +121,7 @@ ALLOWED_FEEDBACK_STATUS = {"new", "seen", "planned", "done", "closed"}
 
 app = FastAPI(
     title="Elite Dangerous Day/Night Calculator API",
-    version="0.223",
+    version="0.224",
     description="Local-first API for systems, bodies, observations, fitting and prediction.",
 )
 
@@ -2365,7 +2365,7 @@ def start_race_cache_daily_refresh_worker() -> None:
 def root() -> Dict[str, Any]:
     return {
         "name": "Elite Dangerous Day/Night Calculator API",
-        "version": "0.223",
+        "version": "0.224",
         "db_path": DB_PATH,
         "docs": "/docs",
     }
@@ -3337,11 +3337,14 @@ def fetch_razz_racing_list(limit: int = 200) -> List[Dict[str, Any]]:
     for idx, entry in enumerate(data[:limit]):
         if not isinstance(entry, list) or len(entry) < 3:
             continue
+        platform = str(entry[7]).strip().upper() if len(entry) > 7 and entry[7] is not None else ""
         races.append({
             "key": str(entry[0]),
             "name": str(entry[1]) if len(entry) > 1 else str(entry[0]),
             "system_name": str(entry[2]) if len(entry) > 2 else "",
             "coords_xyz": str(entry[4]) if len(entry) > 4 else "",
+            "platform": platform,
+            "is_horizons": platform == "HORIZONS",
             "raw_index": idx,
         })
     return races
@@ -3404,6 +3407,15 @@ def build_razz_preview(limit: int = 200) -> List[Dict[str, Any]]:
     previews: List[Dict[str, Any]] = []
     for race in fetch_razz_racing_list(limit):
         item = dict(race)
+        if race.get("is_horizons"):
+            item.update({
+                "surface_start": False,
+                "reason": "Horizons race skipped",
+                "description": "",
+                "source_url": "",
+            })
+            previews.append(item)
+            continue
         try:
             detail = fetch_razz_race_detail(race["key"])
             parsed = parse_razz_start_waypoint(detail.get("waypoints", ""), race.get("system_name", ""))

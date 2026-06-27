@@ -46,13 +46,13 @@
         {% if model_mode == 'provisional' %}
           <div class="warn provisional-box">
             <b>Provisional model:</b> this prediction includes unreviewed observations.
-            <p><a class="button small" href="/bodies/{{ body.id }}?time={{ target_time }}&prediction_hours={{ prediction_hours }}{% if lat != '' and lon != '' %}&lat={{ lat }}&lon={{ lon }}{% endif %}">Use reviewed model</a></p>
+            <p><a class="button small" data-live-prediction-link="1" href="/bodies/{{ body.id }}?time={{ target_time }}&prediction_hours={{ prediction_hours }}&live_prediction_time={{ 1 if live_prediction_time else 0 }}{% if lat != '' and lon != '' %}&lat={{ lat }}&lon={{ lon }}{% endif %}">Use reviewed model</a></p>
           </div>
         {% elif pending_obs > 0 %}
           <div class="notice provisional-box">
             <b>{{ pending_obs }}</b> unreviewed observation{{ '' if pending_obs == 1 else 's' }} waiting for this body.
             {% if provisional_status and provisional_status.ready %}
-              <p><a class="button small" href="/bodies/{{ body.id }}?time={{ target_time }}&prediction_hours={{ prediction_hours }}{% if lat != '' and lon != '' %}&lat={{ lat }}&lon={{ lon }}{% endif %}&model_mode=provisional">View provisional model</a></p>
+              <p><a class="button small" data-live-prediction-link="1" href="/bodies/{{ body.id }}?time={{ target_time }}&prediction_hours={{ prediction_hours }}&live_prediction_time={{ 1 if live_prediction_time else 0 }}{% if lat != '' and lon != '' %}&lat={{ lat }}&lon={{ lon }}{% endif %}&model_mode=provisional">View provisional model</a></p>
               <small class="field-help">The provisional model is ready and includes approved + unreviewed observations. The normal page still uses reviewed data by default.</small>
             {% elif provisional_status and provisional_status.latest_job and provisional_status.latest_job.status in ['queued', 'running'] %}
               <p><b>Provisional model is being prepared in the background.</b></p>
@@ -64,6 +64,7 @@
                 <input type="hidden" name="lon" value="{{ lon }}">
                 <input type="hidden" name="target_time" value="{{ target_time }}">
                 <input type="hidden" name="prediction_hours" value="{{ prediction_hours }}">
+                <input type="hidden" name="live_prediction_time" value="{{ 1 if live_prediction_time else 0 }}">
                 <button type="submit" class="small">Queue provisional model again</button>
               </form>
             {% else %}
@@ -89,9 +90,14 @@
             <input required name="lon" inputmode="decimal" value="{{ lon }}" placeholder="+12.345678 or -12.345678">
           </label>
           <label>UTC time
-            <input required name="time" value="{{ target_time }}" placeholder="2026-06-02 18 or 2026-06-02 18:00">
+            <input required id="prediction-time" name="time" value="{{ target_time }}" placeholder="2026-06-02 18 or 2026-06-02 18:00">
             <small class="field-help">You can enter a full ISO time or a shorter UTC time like <code>2026-06-02 18</code> or <code>2026-06-02 18:00</code>.</small>
           </label>
+          <input type="hidden" name="live_prediction_time_explicit" value="1">
+          <label class="check inline-check">
+            <input type="checkbox" id="live-prediction-time" name="live_prediction_time" value="1" {% if live_prediction_time %}checked{% endif %}> Use live UTC time
+          </label>
+          <small class="field-help">When enabled, the prediction time updates every second. Disable it to calculate a fixed/manual UTC time.</small>
           <label>Prediction window hours
             <input name="prediction_hours" type="number" step="1" min="1" max="168" value="{{ prediction_hours }}">
           </label>
@@ -104,9 +110,12 @@
         <h2>Local sun elevation</h2>
         {% if prediction %}
           <canvas id="sunCanvas" width="420" height="280" data-prediction='{{ prediction_json }}'></canvas>
+          <div class="sun-readout">
+            Sun elevation {{ prediction.sun_altitude_deg|num(2) }}&deg; &middot; {{ prediction.sun_altitude_trend }}{% if prediction.sun_altitude_rate_deg_per_min is not none %} ({{ prediction.sun_altitude_rate_deg_per_min|num(4) }}&deg;/min){% endif %}
+          </div>
           <div class="state-pill {{ prediction.centre_state|lower }}">{{ prediction.centre_state }}</div>
           <div class="sun-trend trend-{{ prediction.sun_altitude_trend|replace(' ', '-') }}">
-            Sun is {{ prediction.sun_altitude_trend }}{% if prediction.sun_altitude_rate_deg_per_min is not none %} · {{ prediction.sun_altitude_rate_deg_per_min|num(4) }}°/min{% endif %}
+            Sun is {{ prediction.sun_altitude_trend }}{% if prediction.sun_altitude_rate_deg_per_min is not none %} &middot; {{ prediction.sun_altitude_rate_deg_per_min|num(4) }}&deg;/min{% endif %}
           </div>
           <div id="countdown" class="countdown" data-prediction='{{ prediction_json }}'>Loading timer…</div>
         {% else %}
@@ -121,7 +130,7 @@
     {% if pois %}
       <div class="poi-list">
         {% for p in pois %}
-          <a class="poi-item {% if selected_poi and selected_poi.id == p.id %}active{% endif %}" href="/bodies/{{ body.id }}?poi={{ p.id }}&time={{ target_time }}&prediction_hours={{ prediction_hours }}{% if model_mode == 'provisional' %}&model_mode=provisional{% endif %}">
+          <a class="poi-item {% if selected_poi and selected_poi.id == p.id %}active{% endif %}" data-live-prediction-link="1" href="/bodies/{{ body.id }}?poi={{ p.id }}&time={{ target_time }}&prediction_hours={{ prediction_hours }}&live_prediction_time={{ 1 if live_prediction_time else 0 }}{% if model_mode == 'provisional' %}&model_mode=provisional{% endif %}">
             <strong>{{ p.name }}</strong>
             <span>{{ p.lat|num(5) }}, {{ p.lon|num(5) }}</span>
             {% if p.description %}<em>has description</em>{% endif %}

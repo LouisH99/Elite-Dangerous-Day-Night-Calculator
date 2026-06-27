@@ -102,11 +102,32 @@ button.primary, .button.primary { background: linear-gradient(135deg, #2681c9, #
 .stack-form label.check { display: flex; align-items: center; gap: 0.5rem; }
 .stack-form label.check input { width: auto; }
 .visual-card { text-align: center; position: relative; }
-#sunCanvas { max-width: 100%; height: auto; display: block; margin: 0.5rem auto; }
-.state-pill { display: inline-block; border-radius: 999px; padding: 0.4rem 0.85rem; font-weight: 800; letter-spacing: 0.04em; }
+#sunCanvas { max-width: 100%; height: auto; display: block; margin: 0.5rem auto 0.75rem; }
+.sun-readout {
+  color: var(--muted);
+  font-size: 0.95rem;
+  font-weight: 700;
+  margin: 0.2rem 0 0.8rem;
+}
+.state-pill { display: inline-block; border-radius: 999px; padding: 0.4rem 0.85rem; font-weight: 800; letter-spacing: 0.04em; margin-bottom: 0.75rem; }
 .state-pill.day { background: rgba(255,211,124,0.15); color: #ffe4a9; border: 1px solid rgba(255,211,124,0.35); }
 .state-pill.night { background: rgba(124,199,255,0.12); color: #b7e1ff; border: 1px solid rgba(124,199,255,0.28); }
-.countdown { font-size: 1.15rem; font-weight: 700; margin-top: 0.75rem; }
+.sun-trend {
+  font-size: 1.02rem;
+  font-weight: 800;
+  margin-bottom: 0.75rem;
+}
+.trend-rising { color: var(--ok); }
+.trend-falling { color: var(--warn); }
+.countdown {
+  font-size: 1.12rem;
+  font-weight: 800;
+  line-height: 1.25;
+  margin-top: 0.75rem;
+}
+.countdown-main { color: var(--text); }
+.countdown-date, .countdown-time { color: #ffffff; font-size: 1.2rem; }
+.countdown-detail { color: var(--text); }
 .empty-visual { min-height: 220px; display: grid; place-items: center; color: var(--muted); border: 1px dashed var(--line); border-radius: 16px; }
 pre { white-space: pre-wrap; background: #080d16; border: 1px solid var(--line); border-radius: 14px; padding: 1rem; overflow-x: auto; }
 code { background: rgba(255,255,255,0.08); padding: 0.1rem 0.3rem; border-radius: 6px; }

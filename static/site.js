@@ -10,6 +10,51 @@ function fmtDuration(seconds) {
 function parsePrediction(el) {
   try { return JSON.parse(el.dataset.prediction || '{}'); } catch { return {}; }
 }
+function formatUtcParts(value) {
+  const d = new Date(value || '');
+  if (isNaN(d.getTime())) return null;
+  return {
+    date: `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`,
+    time: `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`,
+  };
+}
+function setCountdownInterval(el, eventName, seconds, targetUtc) {
+  const parts = formatUtcParts(targetUtc);
+  el.replaceChildren();
+  const main = document.createElement('div');
+  main.className = 'countdown-main';
+  main.textContent = `Next ${eventName} in: ${fmtDuration(seconds)}`;
+  el.appendChild(main);
+  if (parts) {
+    const date = document.createElement('div');
+    date.className = 'countdown-date';
+    date.textContent = parts.date;
+    const time = document.createElement('div');
+    time.className = 'countdown-time';
+    time.textContent = parts.time;
+    el.appendChild(date);
+    el.appendChild(time);
+  }
+}
+function setCountdownMessage(el, message) {
+  el.replaceChildren();
+  const text = String(message || '').trim();
+  if (!text) {
+    el.textContent = 'Next transition unknown';
+    return;
+  }
+  const parts = text.split(';').map((part) => part.trim()).filter(Boolean);
+  const main = document.createElement('div');
+  main.className = 'countdown-main';
+  main.textContent = parts.shift() || text;
+  el.appendChild(main);
+  if (parts.length) {
+    const detail = document.createElement('div');
+    detail.className = 'countdown-detail';
+    detail.textContent = parts.join('; ');
+    el.appendChild(detail);
+  }
+}
 function updateCountdown() {
   const el = document.getElementById('countdown');
   if (!el) return;
@@ -19,13 +64,13 @@ function updateCountdown() {
   const base = state === 'DAY' ? p.next_sunset_seconds : p.next_sunrise_seconds;
   const targetUtc = state === 'DAY' ? p.next_sunset_utc : p.next_sunrise_utc;
   if (base === null || base === undefined) {
-    el.textContent = p.horizon_message || `Next ${eventName}: unknown`;
+    setCountdownMessage(el, p.horizon_message || `Next ${eventName}: unknown`);
     return;
   }
   const started = Date.now();
   function tick() {
     const elapsed = (Date.now() - started) / 1000;
-    el.textContent = `Next ${eventName}: ${fmtDuration(base - elapsed)} · ${targetUtc}`;
+    setCountdownInterval(el, eventName, base - elapsed, targetUtc);
   }
   tick();
   setInterval(tick, 1000);
@@ -112,13 +157,6 @@ function drawSunCanvas() {
   ctx.textBaseline = 'middle';
   ctx.fillText(arrow, x + 46, y + dy * 0.75);
 
-  // caption
-  ctx.fillStyle = '#e8eef8';
-  ctx.font = '15px system-ui, sans-serif';
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'alphabetic';
-  const rate = Number(p.sun_altitude_rate_deg_per_min || 0);
-  ctx.fillText(`Sun elevation ${alt.toFixed(2)}° · ${trend || 'trend unknown'} (${rate.toFixed(4)}°/min)`, w / 2, h - 20);
 }
 
 document.addEventListener('DOMContentLoaded', () => {
@@ -151,28 +189,57 @@ function setupObserverNameMemory() {
 function formatUtcNowForInput() {
   return new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
 }
-function setupLiveObservationTime() {
-  const input = document.getElementById('observation-time');
-  const check = document.getElementById('live-observation-time');
+function setupLiveTimeInput(inputId, checkId) {
+  const input = document.getElementById(inputId);
+  const check = document.getElementById(checkId);
   if (!input || !check) return;
   let timer = null;
+  function updatePredictionLinks() {
+    if (checkId !== 'live-prediction-time') return;
+    document.querySelectorAll('[data-live-prediction-link="1"]').forEach((link) => {
+      try {
+        const url = new URL(link.href, window.location.href);
+        url.searchParams.set('time', input.value);
+        url.searchParams.set('live_prediction_time', check.checked ? '1' : '0');
+        link.href = url.toString();
+      } catch {
+        // Keep the original link if URL parsing fails.
+      }
+    });
+  }
   function applyState() {
     if (check.checked) {
       input.readOnly = true;
       input.value = formatUtcNowForInput();
-      if (!timer) timer = setInterval(() => { input.value = formatUtcNowForInput(); }, 1000);
+      updatePredictionLinks();
+      if (!timer) {
+        timer = setInterval(() => {
+          input.value = formatUtcNowForInput();
+          updatePredictionLinks();
+        }, 1000);
+      }
     } else {
       input.readOnly = false;
       if (timer) { clearInterval(timer); timer = null; }
+      updatePredictionLinks();
     }
   }
   check.addEventListener('change', applyState);
+  input.addEventListener('input', updatePredictionLinks);
+  input.addEventListener('change', updatePredictionLinks);
   applyState();
+}
+function setupLiveObservationTime() {
+  setupLiveTimeInput('observation-time', 'live-observation-time');
+}
+function setupLivePredictionTime() {
+  setupLiveTimeInput('prediction-time', 'live-prediction-time');
 }
 
 document.addEventListener('DOMContentLoaded', () => {
   setupObserverNameMemory();
   setupLiveObservationTime();
+  setupLivePredictionTime();
 });
 
 function initSystemAutocomplete() {

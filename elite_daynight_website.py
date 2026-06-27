@@ -59,7 +59,7 @@ def env_bool(name: str, default: bool = True) -> bool:
 
 
 PUBLIC_POI_SUBMISSIONS_ENABLED = env_bool("ELITE_DAYNIGHT_PUBLIC_POI_SUBMISSIONS_ENABLED", True)
-WEBSITE_VERSION = "0.223"
+WEBSITE_VERSION = "0.224"
 RACE_STATUS_INTERVAL_WINDOW_HOURS = 36.0
 
 
@@ -1183,6 +1183,8 @@ async def body_detail(
     lon: Optional[str] = Query(None),
     time: str = Query(""),
     prediction_hours: str = Query("72.0"),
+    live_prediction_time: str = Query(""),
+    live_prediction_time_explicit: str = Query(""),
     poi: Optional[int] = Query(None),
     model_mode: str = Query("approved"),
 ) -> HTMLResponse:
@@ -1234,7 +1236,11 @@ async def body_detail(
         fit = await api_request("GET", f"/api/bodies/{body_id}/fit", params={"include_residuals": False, "model_mode": model_mode})
     except ApiError as exc:
         fit_error = exc.detail
-    target_time = time.strip() or now_utc_iso()
+    live_prediction = query_flag(
+        live_prediction_time,
+        default=False if query_flag(live_prediction_time_explicit) else True,
+    )
+    target_time = now_utc_iso() if live_prediction else (time.strip() or now_utc_iso())
     observation_spacing = None
     try:
         observation_spacing = await api_request(
@@ -1267,6 +1273,7 @@ async def body_detail(
             "lon": "" if lon_value is None else lon_value,
             "target_time": target_time,
             "prediction_hours": prediction_hours_value,
+            "live_prediction_time": live_prediction,
             "pois": pois,
             "selected_poi": selected_poi,
             "model_mode": model_mode,
@@ -1331,6 +1338,7 @@ async def public_provisional_refit(
     lon: str = Form(""),
     target_time: str = Form(""),
     prediction_hours: str = Form("72"),
+    live_prediction_time: str = Form(""),
 ) -> RedirectResponse:
     """Compatibility route: queue provisional fitting in the background.
 
@@ -1347,6 +1355,7 @@ async def public_provisional_refit(
         query["time"] = target_time.strip()
     if prediction_hours.strip():
         query["prediction_hours"] = prediction_hours.strip()
+    query["live_prediction_time"] = "1" if query_flag(live_prediction_time) else "0"
 
     try:
         result = await api_request("POST", f"/api/bodies/{body_id}/provisional/ensure", params={"reason": "public_request"})
