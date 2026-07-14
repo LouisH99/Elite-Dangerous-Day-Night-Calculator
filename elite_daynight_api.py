@@ -88,6 +88,9 @@ POI_CACHE_MAX_CROSSINGS = env_int("ELITE_DAYNIGHT_POI_CACHE_MAX_CROSSINGS", 512,
 RACE_CACHE_DAILY_REFRESH_ENABLED = env_bool("ELITE_DAYNIGHT_RACE_CACHE_DAILY_REFRESH_ENABLED", True)
 RACE_CACHE_DAILY_REFRESH_UTC_HOUR = env_int("ELITE_DAYNIGHT_RACE_CACHE_DAILY_REFRESH_UTC_HOUR", 4, 0, 23)
 RACE_CACHE_DAILY_REFRESH_MAX_PER_RUN = env_int("ELITE_DAYNIGHT_RACE_CACHE_DAILY_REFRESH_MAX_PER_RUN", 1000, 1, 10000)
+RAZZ_AUTO_IMPORT_ENABLED = env_bool("ELITE_DAYNIGHT_RAZZ_AUTO_IMPORT_ENABLED", True)
+RAZZ_AUTO_IMPORT_LIMIT = env_int("ELITE_DAYNIGHT_RAZZ_AUTO_IMPORT_LIMIT", 1000, 1, 10000)
+RAZZ_AUTO_IMPORT_MISSING_SYSTEMS = env_bool("ELITE_DAYNIGHT_RAZZ_AUTO_IMPORT_MISSING_SYSTEMS", True)
 # V0.208 automation is deliberately conservative.  In shadow mode it only
 # calculates and stores recommendations; it never changes review_status.
 AUTOMATION_MODE = os.environ.get("ELITE_DAYNIGHT_AUTOMATION_MODE", "shadow").strip().lower()
@@ -121,7 +124,7 @@ ALLOWED_FEEDBACK_STATUS = {"new", "seen", "planned", "done", "closed"}
 
 app = FastAPI(
     title="Elite Dangerous Day/Night Calculator API",
-    version="0.224",
+    version="0.225",
     description="Local-first API for systems, bodies, observations, fitting and prediction.",
 )
 
@@ -2241,6 +2244,50 @@ def refresh_approved_race_poi_caches(*, force: bool = False, actor: str = "race-
         finally:
             con.close()
 
+        auto_import_summary: Dict[str, Any] = {
+            "status": "disabled",
+            "enabled": bool(RAZZ_AUTO_IMPORT_ENABLED),
+            "date_utc": today,
+        }
+        if RAZZ_AUTO_IMPORT_ENABLED:
+            auto_started_at = dbmod.utc_now()
+            auto_import_summary = {
+                "status": "running",
+                "enabled": True,
+                "date_utc": today,
+                "started_at_utc": auto_started_at,
+                "limit": int(RAZZ_AUTO_IMPORT_LIMIT),
+                "import_missing_systems": bool(RAZZ_AUTO_IMPORT_MISSING_SYSTEMS),
+            }
+            try:
+                import_result = import_razz_racing_pois(
+                    limit=int(RAZZ_AUTO_IMPORT_LIMIT),
+                    import_missing_systems=bool(RAZZ_AUTO_IMPORT_MISSING_SYSTEMS),
+                    review_status="approved",
+                    make_public=True,
+                    actor=actor,
+                )
+                auto_import_summary.update(import_result)
+                auto_import_summary["status"] = "done"
+                for list_key in ("imported", "skipped"):
+                    rows = list(auto_import_summary.pop(list_key, []) or [])
+                    auto_import_summary[f"{list_key}_sample"] = rows[:20]
+                    auto_import_summary[f"{list_key}_sample_truncated"] = len(rows) > 20
+            except Exception as exc:
+                auto_import_summary["status"] = "failed"
+                auto_import_summary["error"] = str(exc)[:500]
+            auto_import_summary["finished_at_utc"] = dbmod.utc_now()
+            con = connect()
+            try:
+                begin_write_transaction(con)
+                schema_meta_set(con, "razz_auto_import_date_utc", today)
+                schema_meta_set(con, "razz_auto_import_finished_at_utc", auto_import_summary["finished_at_utc"])
+                schema_meta_set(con, "razz_auto_import_status", auto_import_summary["status"])
+                schema_meta_set(con, "razz_auto_import_summary_json", dbmod.json_dumps(auto_import_summary))
+                con.commit()
+            finally:
+                con.close()
+
         con = connect()
         refreshed = 0
         already_today = 0
@@ -2324,6 +2371,7 @@ def refresh_approved_race_poi_caches(*, force: bool = False, actor: str = "race-
             "errors": errors,
             "truncated": bool(truncated),
             "actor": actor,
+            "auto_import": auto_import_summary,
         }
         con = connect()
         try:
@@ -2365,7 +2413,7 @@ def start_race_cache_daily_refresh_worker() -> None:
 def root() -> Dict[str, Any]:
     return {
         "name": "Elite Dangerous Day/Night Calculator API",
-        "version": "0.224",
+        "version": "0.225",
         "db_path": DB_PATH,
         "docs": "/docs",
     }
@@ -3488,9 +3536,15 @@ def admin_racing_preview(limit: int = Query(25, ge=1, le=200)) -> Dict[str, Any]
     return {"source": "razz_racing_api", "count": len(items), "results": items}
 
 
-@app.post("/api/admin/racing/import")
-def admin_racing_import(req: RacingImportRequest) -> Dict[str, Any]:
-    previews = build_razz_preview(req.limit)
+def import_razz_racing_pois(
+    *,
+    limit: int,
+    import_missing_systems: bool,
+    review_status: str,
+    make_public: bool,
+    actor: str,
+) -> Dict[str, Any]:
+    previews = build_razz_preview(limit)
     imported: List[Dict[str, Any]] = []
     skipped: List[Dict[str, Any]] = []
     for race in previews:
@@ -3507,7 +3561,7 @@ def admin_racing_import(req: RacingImportRequest) -> Dict[str, Any]:
             body_id = find_body_by_names(con, system_name, body_name)
         finally:
             con.close()
-        if body_id is None and req.import_missing_systems:
+        if body_id is None and import_missing_systems:
             try:
                 _, body_id, matched = dbmod.import_spansh_system(DB_PATH, system_name, body_name, None, fetch_body_details=True)
                 body_name = matched
@@ -3528,13 +3582,36 @@ def admin_racing_import(req: RacingImportRequest) -> Dict[str, Any]:
             con = connect_write()
             try:
                 con.execute("UPDATE bodies SET tracked_for_prediction = 1, updated_at_utc = ? WHERE id = ?", (dbmod.utc_now(), body_id))
-                poi_id = upsert_razz_poi_for_body(con, body_id, race, req.review_status, req.make_public, req.actor)
-                insert_audit(con, "poi", poi_id, "api_import_razz_racing", None, {"race_key": race.get("key"), "race_name": race.get("name"), "body_id": body_id}, req.actor)
+                poi_id = upsert_razz_poi_for_body(con, body_id, race, review_status, make_public, actor)
+                insert_audit(con, "poi", poi_id, "api_import_razz_racing", None, {"race_key": race.get("key"), "race_name": race.get("name"), "body_id": body_id}, actor)
                 con.commit()
             finally:
                 con.close()
         imported.append({"key": race.get("key"), "name": race.get("name"), "system_name": system_name, "body_name": body_name, "poi_id": poi_id})
-    return {"imported_count": len(imported), "skipped_count": len(skipped), "imported": imported, "skipped": skipped}
+    horizons_skipped = sum(1 for row in skipped if str(row.get("reason") or "").lower().startswith("horizons"))
+    return {
+        "source": "razz_racing_api",
+        "limit": int(limit),
+        "review_status": review_status,
+        "make_public": bool(make_public),
+        "import_missing_systems": bool(import_missing_systems),
+        "imported_count": len(imported),
+        "skipped_count": len(skipped),
+        "horizons_skipped": int(horizons_skipped),
+        "imported": imported,
+        "skipped": skipped,
+    }
+
+
+@app.post("/api/admin/racing/import")
+def admin_racing_import(req: RacingImportRequest) -> Dict[str, Any]:
+    return import_razz_racing_pois(
+        limit=req.limit,
+        import_missing_systems=req.import_missing_systems,
+        review_status=req.review_status,
+        make_public=req.make_public,
+        actor=req.actor,
+    )
 
 
 @app.post("/api/feedback")

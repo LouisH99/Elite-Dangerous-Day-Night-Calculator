@@ -1,3 +1,10 @@
+## V0.225
+
+- Added daily Razz Racing POI auto-import before the race cache refresh runs.
+- Auto-imported Razz Racing POIs are approved and public by default, with missing systems/bodies imported from Spansh when enabled.
+- Added `ELITE_DAYNIGHT_RAZZ_AUTO_IMPORT_ENABLED`, `ELITE_DAYNIGHT_RAZZ_AUTO_IMPORT_LIMIT`, and `ELITE_DAYNIGHT_RAZZ_AUTO_IMPORT_MISSING_SYSTEMS`.
+- Stored the latest auto-import status and summary in `schema_meta`.
+
 ## V0.224
 
 - Added a default-on live UTC prediction-time checkbox on body pages, so prediction windows and POI clicks can stay current.
