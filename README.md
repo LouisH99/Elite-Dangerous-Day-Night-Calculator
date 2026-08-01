@@ -1,12 +1,12 @@
 # Elite Dangerous Day/Night Calculator
 
-Current package version: **V0.225**.
+Current package version: **V0.226**.
 
 A community tool for predicting local daylight, sunrise, sunset, and sun elevation on planets and moons in **Elite Dangerous**.
 
 The project lets players add systems/bodies, submit sun observations, review submitted data, fit a prediction model, and use saved Points of Interest (POIs) to quickly check local light conditions.
 
-> **Project status:** early community tool, currently around `V0.225`.
+> **Project status:** early community tool, currently around `V0.226`.
 >
 > **Transparency note:** this is a **vibe-coded / AI-assisted project**. A large part of the design, code structure, debugging, and documentation was created with help from ChatGPT. The model, outputs, and implementation should be treated as experimental and should be validated with real observations.
 
@@ -181,6 +181,7 @@ ELITE_DAYNIGHT_POI_CACHE_EXTENDED_REFRESH_MARGIN_HOURS=336
 ELITE_DAYNIGHT_POI_CACHE_MAX_AGE_HOURS=24
 ELITE_DAYNIGHT_POI_CACHE_MAX_EXTENDED_HOURS=720
 ELITE_DAYNIGHT_POI_CACHE_MAX_CROSSINGS=512
+ELITE_DAYNIGHT_PREDICTION_CACHE_ENABLED=0
 ELITE_DAYNIGHT_RACE_CACHE_DAILY_REFRESH_ENABLED=1
 ELITE_DAYNIGHT_RACE_CACHE_DAILY_REFRESH_UTC_HOUR=4
 ELITE_DAYNIGHT_RACE_CACHE_DAILY_REFRESH_MAX_PER_RUN=1000
@@ -190,6 +191,16 @@ ELITE_DAYNIGHT_RAZZ_AUTO_IMPORT_MISSING_SYSTEMS=1
 ```
 
 The private API run scripts set automation, observation-spacing, performance, POI cache, daily race-cache, and Razz auto-import defaults if the variables are not already defined.
+
+`ELITE_DAYNIGHT_PREDICTION_CACHE_ENABLED=0` disables the legacy full-prediction JSON cache. This is separate from the POI transition cache used for public POI/race predictions.
+
+To clean an oversized legacy prediction cache, stop the API and website first, then run:
+
+```powershell
+.\venv\Scripts\python.exe .\maintenance_clean_prediction_cache.py --apply --vacuum
+```
+
+Without `--apply`, the script only prints current cache/database size stats. Use `--db path\to\elite_daynight.db` if the database is not at the default location.
 
 `ELITE_DAYNIGHT_OBSERVATION_SPACING_TARGET_FRACTION=0.05` means the advisory waits for 5% of the relevant day/rotation/orbit period, equivalent to about 18 degrees of movement. The min/max wait settings clamp that recommendation so unusual long-period bodies remain practical.
 
