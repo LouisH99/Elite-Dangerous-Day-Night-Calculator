@@ -144,6 +144,8 @@ CREATE TABLE prediction_cache (
             prediction_json TEXT NOT NULL,
             created_at_utc TEXT NOT NULL
         );;
+CREATE INDEX IF NOT EXISTS idx_prediction_cache_created ON prediction_cache(created_at_utc);;
+CREATE INDEX IF NOT EXISTS idx_prediction_cache_fit_created ON prediction_cache(fit_id, created_at_utc);;
 CREATE TABLE poi_transition_cache (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             poi_id INTEGER NOT NULL,

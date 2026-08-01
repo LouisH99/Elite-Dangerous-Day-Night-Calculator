@@ -85,6 +85,7 @@ POI_CACHE_EXTENDED_REFRESH_MARGIN_HOURS = env_float("ELITE_DAYNIGHT_POI_CACHE_EX
 POI_CACHE_MAX_AGE_HOURS = env_float("ELITE_DAYNIGHT_POI_CACHE_MAX_AGE_HOURS", 24.0, 0.0, 8760.0)
 POI_CACHE_MAX_EXTENDED_HOURS = env_float("ELITE_DAYNIGHT_POI_CACHE_MAX_EXTENDED_HOURS", model.DEFAULT_MAX_EXTENDED_PREDICTION_HOURS, 1.0, 8760.0)
 POI_CACHE_MAX_CROSSINGS = env_int("ELITE_DAYNIGHT_POI_CACHE_MAX_CROSSINGS", 512, 8, 5000)
+PREDICTION_CACHE_ENABLED = env_bool("ELITE_DAYNIGHT_PREDICTION_CACHE_ENABLED", False)
 RACE_CACHE_DAILY_REFRESH_ENABLED = env_bool("ELITE_DAYNIGHT_RACE_CACHE_DAILY_REFRESH_ENABLED", True)
 RACE_CACHE_DAILY_REFRESH_UTC_HOUR = env_int("ELITE_DAYNIGHT_RACE_CACHE_DAILY_REFRESH_UTC_HOUR", 4, 0, 23)
 RACE_CACHE_DAILY_REFRESH_MAX_PER_RUN = env_int("ELITE_DAYNIGHT_RACE_CACHE_DAILY_REFRESH_MAX_PER_RUN", 1000, 1, 10000)
@@ -124,7 +125,7 @@ ALLOWED_FEEDBACK_STATUS = {"new", "seen", "planned", "done", "closed"}
 
 app = FastAPI(
     title="Elite Dangerous Day/Night Calculator API",
-    version="0.225",
+    version="0.226",
     description="Local-first API for systems, bodies, observations, fitting and prediction.",
 )
 
@@ -577,6 +578,8 @@ def ensure_runtime_migrations(con: sqlite3.Connection) -> None:
     con.execute("CREATE INDEX IF NOT EXISTS idx_poi_transition_cache_lookup ON poi_transition_cache(poi_id, fit_id, model_mode, cache_version)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_poi_transition_cache_body_fit ON poi_transition_cache(body_id, fit_id)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_poi_transition_cache_checked ON poi_transition_cache(checked_until_utc)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_prediction_cache_created ON prediction_cache(created_at_utc)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_prediction_cache_fit_created ON prediction_cache(fit_id, created_at_utc)")
     con.execute(
         """
         CREATE TABLE IF NOT EXISTS feedback_entries (
@@ -2413,7 +2416,7 @@ def start_race_cache_daily_refresh_worker() -> None:
 def root() -> Dict[str, Any]:
     return {
         "name": "Elite Dangerous Day/Night Calculator API",
-        "version": "0.225",
+        "version": "0.226",
         "db_path": DB_PATH,
         "docs": "/docs",
     }
@@ -3116,6 +3119,7 @@ def build_prediction_response(
     lon: Optional[float] = None,
     poi_id: Optional[int] = None,
     include_sun_peak: bool = True,
+    persist_prediction_cache: bool = True,
 ) -> Dict[str, Any]:
     get_body_row_or_404(con, body_id)
     mode = (model_mode or "approved").strip().lower()
@@ -3185,13 +3189,16 @@ def build_prediction_response(
     if poi_row is not None:
         prediction["poi_id"] = int(poi_row["id"])
         prediction["poi_name"] = str(poi_row["name"])
-    with WRITE_LOCK:
-        begin_write_transaction(con)
-        con.execute(
-            "INSERT INTO prediction_cache(body_id, fit_id, lat, lon, target_time_utc, prediction_json, created_at_utc) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (body_id, fit_id, float(lat), float(lon), prediction["target_time_utc"], dbmod.json_dumps(prediction), dbmod.utc_now()),
-        )
-        con.commit()
+    if PREDICTION_CACHE_ENABLED and persist_prediction_cache:
+        with WRITE_LOCK:
+            begin_write_transaction(con)
+            con.execute(
+                "INSERT INTO prediction_cache(body_id, fit_id, lat, lon, target_time_utc, prediction_json, created_at_utc) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (body_id, fit_id, float(lat), float(lon), prediction["target_time_utc"], dbmod.json_dumps(prediction), dbmod.utc_now()),
+            )
+            con.commit()
+    prediction["prediction_cache_enabled"] = bool(PREDICTION_CACHE_ENABLED)
+    prediction["prediction_cache_persisted"] = bool(PREDICTION_CACHE_ENABLED and persist_prediction_cache)
     prediction["fit_id"] = fit_id
     return prediction
 
@@ -3208,6 +3215,7 @@ def predict(
     fallback_transitions: int = Query(model.DEFAULT_MIN_FALLBACK_TRANSITIONS, ge=1, le=12),
     max_extended_hours: float = Query(model.DEFAULT_MAX_EXTENDED_PREDICTION_HOURS, ge=1.0, le=8760.0),
     include_sun_peak: bool = Query(True),
+    persist_prediction_cache: bool = Query(True),
 ) -> Dict[str, Any]:
     con = connect()
     try:
@@ -3223,6 +3231,7 @@ def predict(
             lon=lon,
             poi_id=poi_id,
             include_sun_peak=include_sun_peak,
+            persist_prediction_cache=persist_prediction_cache,
         )
     except HTTPException:
         raise

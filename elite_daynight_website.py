@@ -59,7 +59,7 @@ def env_bool(name: str, default: bool = True) -> bool:
 
 
 PUBLIC_POI_SUBMISSIONS_ENABLED = env_bool("ELITE_DAYNIGHT_PUBLIC_POI_SUBMISSIONS_ENABLED", True)
-WEBSITE_VERSION = "0.225"
+WEBSITE_VERSION = "0.226"
 RACE_STATUS_INTERVAL_WINDOW_HOURS = 36.0
 
 
@@ -805,6 +805,7 @@ async def public_api_races_daynight(
                     "model_mode": "approved",
                     "poi_id": int(race["id"]),
                     "include_sun_peak": False,
+                    "persist_prediction_cache": False,
                 },
             )
             state = str(prediction.get("centre_state") or "").lower()

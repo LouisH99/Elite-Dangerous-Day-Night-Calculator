@@ -1,3 +1,11 @@
+## V0.226
+
+- Disabled the legacy full prediction JSON cache by default with `ELITE_DAYNIGHT_PREDICTION_CACHE_ENABLED=0`.
+- Added an offline `maintenance_clean_prediction_cache.py` script for deleting legacy prediction-cache rows and optionally running `VACUUM`.
+- Added prediction-cache cleanup indexes.
+- Public all-races day/night predictions no longer persist full prediction-cache rows.
+- Documented that the prediction cache is separate from the POI transition cache.
+
 ## V0.225
 
 - Added daily Razz Racing POI auto-import before the race cache refresh runs.
