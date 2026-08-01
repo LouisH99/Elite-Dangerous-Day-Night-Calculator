@@ -414,6 +414,21 @@ def _body_axial_tilt_degrees(body: Dict[str, Any]) -> Optional[float]:
     return None
 
 
+def _body_surface_gravity_ms2(body: Dict[str, Any]) -> Optional[float]:
+    """Return surface gravity in m/s2 from Journal-like or Spansh-like body data."""
+    direct = get_any(body, "SurfaceGravity", "gravity_ms2", default=None)
+    if direct not in (None, ""):
+        return parse_optional_float(direct)
+    raw = body.get("rawSpanshBody") or {}
+    if isinstance(raw, dict) and raw.get("gravity") not in (None, ""):
+        value = parse_optional_float(raw.get("gravity"))
+        return None if value is None else value * STANDARD_GRAVITY
+    if body.get("gravity") not in (None, ""):
+        value = parse_optional_float(body.get("gravity"))
+        return None if value is None else value * STANDARD_GRAVITY
+    return None
+
+
 def _set_if_value(d: Dict[str, Any], key: str, value: Any) -> None:
     if value not in (None, ""):
         d[key] = value
@@ -1238,7 +1253,7 @@ def import_system_json(db_path: str, json_path: str) -> int:
                 as_bool_int(get_any(b, "TidalLock", "IsTidallyLocked", default=raw.get("is_rotational_period_tidally_locked"))),
                 parse_optional_float(get_any(b, "Radius", default=raw.get("radius"))),
                 parse_optional_float(get_any(b, "MassEM", default=raw.get("earth_masses"))),
-                parse_optional_float(get_any(b, "SurfaceGravity", default=raw.get("gravity"))),
+                _body_surface_gravity_ms2(b),
                 parse_optional_float(get_any(b, "DistanceFromArrivalLS", default=raw.get("distance_to_arrival"))),
                 parse_optional_float(get_any(b, "SurfaceTemperature", default=raw.get("surface_temperature"))),
                 parse_optional_float(get_any(b, "SurfacePressure", default=raw.get("surface_pressure"))),

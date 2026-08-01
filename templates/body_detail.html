@@ -13,7 +13,7 @@
     <span>Landable: <b>{{ 'yes' if body.is_landable else 'no' }}</b></span>
     <span>Tidally locked: <b>{{ 'yes' if body.is_tidally_locked else 'no' }}</b></span>
     <span>Radius: <b>{{ body.radius_m|num(0) }} m</b></span>
-    <span>Gravity: <b>{{ body.gravity_ms2|num(3) }} m/s²</b></span>
+    <span>Gravity: <b>{{ body.gravity_ms2|gravity_g|num(3) }} g</b></span>
     <span>Rotation: <b>{{ body.rotation_period_s|duration }}</b></span>
     <span>Orbit: <b>{{ body.orbital_period_s|duration }}</b></span>
   </div>

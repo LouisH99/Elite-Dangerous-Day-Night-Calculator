@@ -61,6 +61,7 @@ def env_bool(name: str, default: bool = True) -> bool:
 PUBLIC_POI_SUBMISSIONS_ENABLED = env_bool("ELITE_DAYNIGHT_PUBLIC_POI_SUBMISSIONS_ENABLED", True)
 WEBSITE_VERSION = "0.226"
 RACE_STATUS_INTERVAL_WINDOW_HOURS = 36.0
+STANDARD_GRAVITY_MS2 = 9.80665
 
 
 def static_asset_version() -> str:
@@ -121,6 +122,15 @@ def short_num(value: Any, digits: int = 3) -> str:
         return str(value)
 
 
+def gravity_ms2_to_g(value: Any) -> Optional[float]:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value) / STANDARD_GRAVITY_MS2
+    except Exception:
+        return None
+
+
 def readable_utc(value: Any) -> str:
     """Display UTC timestamps in a human-friendly form while keeping ISO internally."""
     if value is None or value == "":
@@ -150,6 +160,7 @@ def readable_utc(value: Any) -> str:
 templates.env.filters["duration"] = fmt_seconds
 templates.env.filters["dash"] = none_dash
 templates.env.filters["num"] = short_num
+templates.env.filters["gravity_g"] = gravity_ms2_to_g
 templates.env.filters["utc"] = readable_utc
 
 

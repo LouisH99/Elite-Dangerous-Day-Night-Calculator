@@ -5,6 +5,7 @@
 - Added prediction-cache cleanup indexes.
 - Public all-races day/night predictions no longer persist full prediction-cache rows.
 - Documented that the prediction cache is separate from the POI transition cache.
+- Fixed website gravity display to show Elite-style `g` units while keeping database/API values stored as `gravity_ms2`.
 
 ## V0.225
 

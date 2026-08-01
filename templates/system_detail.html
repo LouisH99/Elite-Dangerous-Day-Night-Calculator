@@ -12,7 +12,7 @@
   {% if bodies %}
   <div class="table-wrap">
     <table>
-      <thead><tr><th>Body</th><th>Type</th><th>Observations</th><th>Status</th><th>Landable</th><th>Gravity</th><th>Rotation</th><th>Orbit</th><th></th></tr></thead>
+      <thead><tr><th>Body</th><th>Type</th><th>Observations</th><th>Status</th><th>Landable</th><th>Gravity (g)</th><th>Rotation</th><th>Orbit</th><th></th></tr></thead>
       <tbody>
       {% for b in bodies %}
         <tr>
@@ -21,7 +21,7 @@
           <td>{{ b.observations or 0 }}</td>
           <td>{% if b.observations and b.observations > 0 %}{% if b.active_fit_id %}<span class="badge badge-ok">predictable</span>{% else %}<span class="badge badge-warn">needs fit</span>{% endif %}{% else %}<span class="badge badge-warn">missing observations</span>{% endif %}</td>
           <td>{{ 'yes' if b.is_landable else 'no' }}</td>
-          <td>{{ b.gravity_ms2|num(3) }}</td>
+          <td>{{ b.gravity_ms2|gravity_g|num(3) }}</td>
           <td>{{ b.rotation_period_s|duration }}</td>
           <td>{{ b.orbital_period_s|duration }}</td>
           <td><a href="/bodies/{{ b.id }}">Open</a></td>
